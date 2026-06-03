@@ -29,11 +29,15 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 TOOLCHAIN=stable
-ARGS=()
+ARGS=()       # cargo args, before any `--`
+PROG=()       # program args, from `--` onward (for `./x run ... -- prog args`)
+SAWDD=0
 for a in "$@"; do
+  if [ "$SAWDD" = 1 ]; then PROG+=("$a"); continue; fi
   case "$a" in
     --stable)  TOOLCHAIN=stable ;;
     --nightly) TOOLCHAIN=nightly ;;
+    --)        SAWDD=1; PROG+=("$a") ;;   # keep the `--`; cargo flags go before it
     *)         ARGS+=("$a") ;;
   esac
 done
@@ -73,4 +77,4 @@ export "CARGO_TARGET_${ENVTRIPLE}_LINKER=$LLD"
 export "CARGO_TARGET_${ENVTRIPLE}_RUSTFLAGS=$FLAGS"
 
 set -x
-exec rustup run "$TOOLCHAIN" cargo "${ARGS[@]}" --target "$TARGET" "${EXTRA[@]}"
+exec rustup run "$TOOLCHAIN" cargo "${ARGS[@]}" --target "$TARGET" "${EXTRA[@]}" "${PROG[@]}"
