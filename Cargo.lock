@@ -26,3 +26,10 @@ version = "0.1.0"
 dependencies = [
  "fullrust",
 ]
+
+[[package]]
+name = "panic-demo"
+version = "0.1.0"
+dependencies = [
+ "fullrust",
+]

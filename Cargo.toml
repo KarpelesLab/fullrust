@@ -5,6 +5,7 @@ members = [
     "examples/hello",
     "examples/args",
     "examples/alloc-demo",
+    "examples/panic-demo",
 ]
 
 # panic=abort is mandatory: it removes the unwinding landing pads that would

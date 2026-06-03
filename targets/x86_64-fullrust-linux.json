@@ -1,0 +1,29 @@
+{
+  "llvm-target": "x86_64-unknown-linux-gnu",
+  "arch": "x86_64",
+  "cpu": "x86-64",
+  "data-layout": "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
+  "os": "linux",
+  "vendor": "fullrust",
+  "env": "",
+  "target-family": ["unix"],
+  "target-pointer-width": 64,
+  "max-atomic-width": 64,
+
+  "executables": true,
+  "dynamic-linking": false,
+  "crt-static-allows-dylibs": false,
+  "crt-static-default": true,
+  "crt-static-respected": true,
+  "static-position-independent-executables": false,
+  "position-independent-executables": false,
+  "relocation-model": "static",
+  "panic-strategy": "abort",
+  "default-uwtable": false,
+  "has-thread-local": false,
+
+  "linker-flavor": "ld",
+  "linker": "rust-lld",
+  "linker-is-gnu": true,
+  "stack-probes": { "kind": "inline" }
+}
