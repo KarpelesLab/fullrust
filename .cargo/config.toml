@@ -1,0 +1,19 @@
+# Common build wiring for libc-free, fully-static pure-Rust binaries.
+#
+# The linker itself (rust-lld, invoked as `ld.lld` so its driver selects GNU
+# mode) is machine-specific, so it is injected by the `./x` wrapper via
+# CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER rather than hardcoded here.
+
+[build]
+target = "x86_64-unknown-linux-gnu"
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    # Position-dependent code: no PIE, no dynamic relocations, no interpreter.
+    "-C", "relocation-model=static",
+    # Drive the linker as a raw `ld`, not through a C compiler (`cc`) — no
+    # crt0, no -lc, no C toolchain involved at all.
+    "-C", "linker-flavor=ld",
+    # Produce a fully static ELF (no PT_INTERP, no .dynamic).
+    "-C", "link-args=-static",
+]

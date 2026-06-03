@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/fullrust",
+    "examples/hello",
+    "examples/args",
+    "examples/alloc-demo",
+]
+
+# panic=abort is mandatory: it removes the unwinding landing pads that would
+# otherwise reference _Unwind_Resume / rust_eh_personality. See README.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true
+strip = true
