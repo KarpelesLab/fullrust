@@ -43,6 +43,33 @@ fn main() {
         }
         Err(e) => println!("tcp connect error: {e}"),
     }
+
+    // Real threads: spawn 4, each returns a square; sum the joins.
+    use alloc::vec::Vec;
+    let handles: Vec<_> = (1u64..=4)
+        .map(|i| fullrust_std::thread::spawn(move || i * i))
+        .collect();
+    let sum: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+    println!("threads: sum of squares 1..=4 = {sum} (expect 30)");
+
+    // Shared counter across threads via Arc<Mutex<_>>.
+    use alloc::sync::Arc;
+    use fullrust_std::sync::Mutex;
+    let counter = Arc::new(Mutex::new(0u64));
+    let ts: Vec<_> = (0..8)
+        .map(|_| {
+            let c = counter.clone();
+            fullrust_std::thread::spawn(move || {
+                for _ in 0..1000 {
+                    *c.lock().unwrap() += 1;
+                }
+            })
+        })
+        .collect();
+    for t in ts {
+        t.join().unwrap();
+    }
+    println!("threads: shared counter = {} (expect 8000)", *counter.lock().unwrap());
 }
 
 fullrust::entry!(main);

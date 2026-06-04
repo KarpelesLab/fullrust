@@ -57,6 +57,24 @@ pub mod nr {
 pub const AT_FDCWD: isize = -100;
 pub const AT_REMOVEDIR: usize = 0x200;
 
+/// `mmap` an anonymous private RW region for use as a thread stack.
+pub fn mmap_stack(size: usize) -> Option<*mut u8> {
+    // PROT_READ|PROT_WRITE = 3, MAP_PRIVATE|MAP_ANONYMOUS = 0x22, fd = -1.
+    let ret = unsafe { syscall6(nr::MMAP, 0, size, 3, 0x22, usize::MAX, 0) };
+    match r(ret) {
+        Ok(p) => Some(p as *mut u8),
+        Err(_) => None,
+    }
+}
+
+/// `munmap` a region previously returned by [`mmap_stack`].
+///
+/// # Safety
+/// `addr`/`len` must describe a live mapping.
+pub unsafe fn munmap_raw(addr: *mut u8, len: usize) -> Result<usize, Errno> {
+    sc2(nr::MUNMAP, addr as usize, len)
+}
+
 /// Convert a raw syscall return into `Result`, mapping `-errno` to `Err`.
 #[inline]
 pub fn r(ret: usize) -> Result<usize, Errno> {
