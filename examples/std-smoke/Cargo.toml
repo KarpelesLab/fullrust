@@ -1,0 +1,8 @@
+[package]
+name = "std-smoke"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fullrust = { path = "../../crates/fullrust" }
+fullrust-std = { path = "../../crates/fullrust-std" }

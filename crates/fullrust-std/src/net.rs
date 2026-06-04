@@ -90,6 +90,21 @@ impl Ipv6Addr {
     }
 }
 
+impl IpAddr {
+    pub fn is_ipv4(&self) -> bool {
+        matches!(self, IpAddr::V4(_))
+    }
+    pub fn is_ipv6(&self) -> bool {
+        matches!(self, IpAddr::V6(_))
+    }
+    pub fn is_loopback(&self) -> bool {
+        match self {
+            IpAddr::V4(a) => a.is_loopback(),
+            IpAddr::V6(a) => a.octets() == Ipv6Addr::LOCALHOST.octets(),
+        }
+    }
+}
+
 impl From<[u8; 16]> for Ipv6Addr {
     fn from(o: [u8; 16]) -> Ipv6Addr {
         Ipv6Addr { octets: o }
@@ -394,10 +409,8 @@ impl ToSocketAddrs for String {
 impl ToSocketAddrs for (&str, u16) {
     type Iter = alloc::vec::IntoIter<SocketAddr>;
     fn to_socket_addrs(&self) -> io::Result<Self::Iter> {
-        if let Ok(ip) = self.0.parse::<IpAddr>() {
-            return Ok(vec![SocketAddr::new(ip, self.1)].into_iter());
-        }
-        Err(io::Error::new(io::ErrorKind::Unsupported, "DNS resolution not yet implemented"))
+        let ips = dns::lookup_host(self.0)?;
+        Ok(ips.into_iter().map(|ip| SocketAddr::new(ip, self.1)).collect::<Vec<_>>().into_iter())
     }
 }
 impl<T: ToSocketAddrs + ?Sized> ToSocketAddrs for &T {
@@ -411,7 +424,173 @@ fn resolve_str(s: &str) -> io::Result<alloc::vec::IntoIter<SocketAddr>> {
     if let Ok(addr) = s.parse::<SocketAddr>() {
         return Ok(vec![addr].into_iter());
     }
-    Err(io::Error::new(io::ErrorKind::Unsupported, "DNS resolution not yet implemented"))
+    // "host:port" form — split off the port, resolve the host.
+    let (host, port) = if let Some(rest) = s.strip_prefix('[') {
+        let (h, p) = rest.split_once("]:").ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid socket address")
+        })?;
+        (h, p)
+    } else {
+        s.rsplit_once(':')
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing port"))?
+    };
+    let port: u16 = port
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid port"))?;
+    let ips = dns::lookup_host(host)?;
+    Ok(ips.into_iter().map(|ip| SocketAddr::new(ip, port)).collect::<Vec<_>>().into_iter())
+}
+
+/// Minimal hostname resolution: IP literal → `/etc/hosts` → DNS over UDP.
+mod dns {
+    use super::{IpAddr, Ipv4Addr, Ipv6Addr, UdpSocket};
+    use crate::io;
+    use crate::sys;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    pub fn lookup_host(host: &str) -> io::Result<Vec<IpAddr>> {
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            return Ok(vec![ip]);
+        }
+        if let Some(ips) = hosts_file(host) {
+            if !ips.is_empty() {
+                return Ok(ips);
+            }
+        }
+        let server = resolv_conf_nameserver()
+            .unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 53)));
+        let mut out = Vec::new();
+        // A (IPv4) then AAAA (IPv6).
+        if let Ok(mut v) = query(server, host, 1) {
+            out.append(&mut v);
+        }
+        if let Ok(mut v) = query(server, host, 28) {
+            out.append(&mut v);
+        }
+        if out.is_empty() {
+            Err(io::Error::new(io::ErrorKind::NotFound, "name resolution failed"))
+        } else {
+            Ok(out)
+        }
+    }
+
+    fn hosts_file(host: &str) -> Option<Vec<IpAddr>> {
+        let text = crate::fs::read_to_string("/etc/hosts").ok()?;
+        let mut out = Vec::new();
+        for line in text.lines() {
+            let line = line.split('#').next().unwrap_or("");
+            let mut it = line.split_whitespace();
+            let ip = match it.next() {
+                Some(ip) => ip,
+                None => continue,
+            };
+            if it.any(|name| name.eq_ignore_ascii_case(host)) {
+                if let Ok(ip) = ip.parse::<IpAddr>() {
+                    out.push(ip);
+                }
+            }
+        }
+        Some(out)
+    }
+
+    fn resolv_conf_nameserver() -> Option<IpAddr> {
+        let text = crate::fs::read_to_string("/etc/resolv.conf").ok()?;
+        for line in text.lines() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            if let Some(rest) = line.strip_prefix("nameserver") {
+                if let Ok(ip) = rest.trim().parse::<IpAddr>() {
+                    return Some(ip);
+                }
+            }
+        }
+        None
+    }
+
+    fn query(server: IpAddr, host: &str, qtype: u16) -> io::Result<Vec<IpAddr>> {
+        let mut id = [0u8; 2];
+        unsafe {
+            let _ = sys::sc3(sys::nr::GETRANDOM, id.as_mut_ptr() as usize, 2, 0);
+        }
+
+        let mut pkt: Vec<u8> = Vec::new();
+        pkt.extend_from_slice(&id);
+        pkt.extend_from_slice(&[0x01, 0x00]); // RD
+        pkt.extend_from_slice(&[0x00, 0x01]); // qdcount=1
+        pkt.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        for label in host.split('.') {
+            if label.is_empty() || label.len() > 63 {
+                continue;
+            }
+            pkt.push(label.len() as u8);
+            pkt.extend_from_slice(label.as_bytes());
+        }
+        pkt.push(0); // root
+        pkt.extend_from_slice(&qtype.to_be_bytes());
+        pkt.extend_from_slice(&[0x00, 0x01]); // class IN
+
+        let bind = if server.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+        let sock = UdpSocket::bind(bind)?;
+        sock.set_read_timeout(Some(crate::time::Duration::from_secs(5)))?;
+        sock.send_to(&pkt, super::SocketAddr::new(server, 53))?;
+
+        let mut buf = [0u8; 1500];
+        let n = sock.recv(&mut buf)?;
+        parse_answers(&buf[..n], qtype)
+    }
+
+    fn parse_answers(msg: &[u8], qtype: u16) -> io::Result<Vec<IpAddr>> {
+        let inval = || io::Error::new(io::ErrorKind::InvalidData, "bad DNS response");
+        if msg.len() < 12 {
+            return Err(inval());
+        }
+        let qd = u16::from_be_bytes([msg[4], msg[5]]) as usize;
+        let an = u16::from_be_bytes([msg[6], msg[7]]) as usize;
+        let mut pos = 12;
+        // Skip the question section.
+        for _ in 0..qd {
+            pos = skip_name(msg, pos).ok_or_else(inval)?;
+            pos += 4; // qtype + qclass
+        }
+        let mut out = Vec::new();
+        for _ in 0..an {
+            pos = skip_name(msg, pos).ok_or_else(inval)?;
+            if pos + 10 > msg.len() {
+                return Err(inval());
+            }
+            let rtype = u16::from_be_bytes([msg[pos], msg[pos + 1]]);
+            let rdlen = u16::from_be_bytes([msg[pos + 8], msg[pos + 9]]) as usize;
+            pos += 10;
+            if pos + rdlen > msg.len() {
+                return Err(inval());
+            }
+            if rtype == qtype && qtype == 1 && rdlen == 4 {
+                out.push(IpAddr::V4(Ipv4Addr::new(
+                    msg[pos], msg[pos + 1], msg[pos + 2], msg[pos + 3],
+                )));
+            } else if rtype == qtype && qtype == 28 && rdlen == 16 {
+                let mut o = [0u8; 16];
+                o.copy_from_slice(&msg[pos..pos + 16]);
+                out.push(IpAddr::V6(Ipv6Addr::from(o)));
+            }
+            pos += rdlen;
+        }
+        Ok(out)
+    }
+
+    // Returns the position just past a (possibly compressed) name.
+    fn skip_name(msg: &[u8], mut pos: usize) -> Option<usize> {
+        loop {
+            let len = *msg.get(pos)?;
+            if len & 0xC0 == 0xC0 {
+                return Some(pos + 2); // compression pointer ends the name
+            } else if len == 0 {
+                return Some(pos + 1);
+            } else {
+                pos += 1 + len as usize;
+            }
+        }
+    }
 }
 
 fn first_addr<A: ToSocketAddrs>(addr: A) -> io::Result<SocketAddr> {

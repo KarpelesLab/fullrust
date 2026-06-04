@@ -55,7 +55,7 @@ impl SystemTime {
     pub fn duration_since(&self, earlier: SystemTime) -> Result<Duration, SystemTimeError> {
         self.0
             .checked_sub(earlier.0)
-            .ok_or(SystemTimeError(earlier.0 - self.0))
+            .ok_or_else(|| SystemTimeError(earlier.0.saturating_sub(self.0)))
     }
 
     /// Duration since this instant of wall-clock time.
