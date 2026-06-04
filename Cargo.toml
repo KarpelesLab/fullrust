@@ -6,6 +6,7 @@ members = [
     "examples/args",
     "examples/alloc-demo",
     "examples/panic-demo",
+    "examples/purecrypto-sha256",
 ]
 
 # panic=abort is mandatory: it removes the unwinding landing pads that would

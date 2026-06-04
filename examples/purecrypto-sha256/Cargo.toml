@@ -1,0 +1,8 @@
+[package]
+name = "purecrypto-sha256"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fullrust = { path = "../../crates/fullrust" }
+purecrypto = { path = "../../../purecrypto", default-features = false, features = ["alloc", "hash"] }

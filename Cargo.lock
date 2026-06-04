@@ -33,3 +33,15 @@ version = "0.1.0"
 dependencies = [
  "fullrust",
 ]
+
+[[package]]
+name = "purecrypto"
+version = "0.6.1"
+
+[[package]]
+name = "purecrypto-sha256"
+version = "0.1.0"
+dependencies = [
+ "fullrust",
+ "purecrypto",
+]
