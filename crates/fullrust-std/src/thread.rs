@@ -148,6 +148,14 @@ pub struct AccessError;
 #[macro_export]
 macro_rules! thread_local {
     () => {};
+    // `const { ... }` initializer form (we just use the inner expression).
+    ($(#[$attr:meta])* $vis:vis static $name:ident: $t:ty = const { $init:expr }; $($rest:tt)*) => {
+        $(#[$attr])* $vis static $name: $crate::thread::LocalKey<$t> = {
+            fn __init() -> $t { $init }
+            $crate::thread::LocalKey::new(__init)
+        };
+        $crate::thread_local!($($rest)*);
+    };
     ($(#[$attr:meta])* $vis:vis static $name:ident: $t:ty = $init:expr; $($rest:tt)*) => {
         $(#[$attr])* $vis static $name: $crate::thread::LocalKey<$t> = {
             fn __init() -> $t { $init }

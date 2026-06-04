@@ -58,6 +58,14 @@ impl Ipv4Addr {
     pub fn is_loopback(&self) -> bool {
         self.octets[0] == 127
     }
+    pub fn is_unspecified(&self) -> bool {
+        self.octets == [0, 0, 0, 0]
+    }
+    /// Map this IPv4 address into the IPv4-mapped IPv6 space (`::ffff:a.b.c.d`).
+    pub fn to_ipv6_mapped(&self) -> Ipv6Addr {
+        let o = self.octets;
+        Ipv6Addr { octets: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, o[0], o[1], o[2], o[3]] }
+    }
 }
 
 impl Ipv6Addr {
@@ -753,7 +761,7 @@ impl UdpSocket {
                 buf.as_mut_ptr() as usize,
                 buf.len(),
                 0,
-                sa.as_ptr() as usize,
+                sa.as_mut_ptr() as usize,
                 &mut len as *mut _ as usize,
             )
         })?;

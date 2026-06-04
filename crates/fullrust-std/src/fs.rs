@@ -61,9 +61,13 @@ struct Stat {
 /// Metadata for a filesystem object.
 #[derive(Clone)]
 pub struct Metadata {
-    mode: u32,
-    size: u64,
-    mtime: (i64, i64),
+    pub(crate) mode: u32,
+    pub(crate) size: u64,
+    pub(crate) mtime: (i64, i64),
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    pub(crate) ino: u64,
+    pub(crate) nlink: u64,
 }
 
 /// File type query helper.
@@ -127,7 +131,15 @@ impl Permissions {
 }
 
 fn stat_to_meta(s: &Stat) -> Metadata {
-    Metadata { mode: s.st_mode, size: s.st_size as u64, mtime: (s.st_mtime, s.st_mtime_nsec) }
+    Metadata {
+        mode: s.st_mode,
+        size: s.st_size as u64,
+        mtime: (s.st_mtime, s.st_mtime_nsec),
+        uid: s.st_uid,
+        gid: s.st_gid,
+        ino: s.st_ino,
+        nlink: s.st_nlink,
+    }
 }
 
 /// An open file.
@@ -238,7 +250,7 @@ impl Drop for File {
 }
 
 /// Builder for opening files with custom flags.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct OpenOptions {
     read: bool,
     write: bool,
@@ -246,6 +258,23 @@ pub struct OpenOptions {
     truncate: bool,
     create: bool,
     create_new: bool,
+    pub(crate) mode: u32,
+    pub(crate) custom_flags: i32,
+}
+
+impl Default for OpenOptions {
+    fn default() -> OpenOptions {
+        OpenOptions {
+            read: false,
+            write: false,
+            append: false,
+            truncate: false,
+            create: false,
+            create_new: false,
+            mode: 0o666,
+            custom_flags: 0,
+        }
+    }
 }
 
 impl OpenOptions {
@@ -298,6 +327,7 @@ impl OpenOptions {
         if self.create_new {
             flags |= O_CREAT | O_EXCL;
         }
+        flags |= self.custom_flags as usize & 0o7777_7777;
         let c = cstr(&path)?;
         let fd = e(unsafe {
             sys::sc4(
@@ -305,7 +335,7 @@ impl OpenOptions {
                 sys::AT_FDCWD as usize,
                 c.as_ptr() as usize,
                 flags,
-                0o666,
+                self.mode as usize,
             )
         })?;
         Ok(File { fd: fd as RawFd })

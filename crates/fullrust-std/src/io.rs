@@ -565,12 +565,80 @@ pub fn stderr() -> Stderr {
     Stderr
 }
 
+/// Read one line (through the newline) directly from `fd`, one byte at a time
+/// so we never consume past the line (important for pipes).
+fn read_line_fd(fd: i32, out: &mut String) -> Result<usize> {
+    let mut bytes = Vec::new();
+    let mut b = [0u8; 1];
+    loop {
+        match fd_read(fd, &mut b)? {
+            0 => break,
+            _ => {
+                bytes.push(b[0]);
+                if b[0] == b'\n' {
+                    break;
+                }
+            }
+        }
+    }
+    let s = core::str::from_utf8(&bytes).map_err(|_| Error::from(ErrorKind::InvalidData))?;
+    out.push_str(s);
+    Ok(bytes.len())
+}
+
 impl Stdin {
     pub fn lock(&self) -> StdinLock {
         StdinLock
     }
     pub fn read_line(&self, buf: &mut String) -> Result<usize> {
-        BufReader::new(StdinLock).read_line(buf)
+        read_line_fd(0, buf)
+    }
+}
+impl StdinLock {
+    pub fn read_line(&mut self, buf: &mut String) -> Result<usize> {
+        read_line_fd(0, buf)
+    }
+}
+
+/// Query whether a stream refers to a terminal (`std::io::IsTerminal`).
+pub trait IsTerminal {
+    fn is_terminal(&self) -> bool;
+}
+
+fn isatty(fd: i32) -> bool {
+    // ioctl(fd, TCGETS, &termios) succeeds only for terminals.
+    let mut termios = [0u8; 64];
+    unsafe { sys::sc3(sys::nr::IOCTL, fd as usize, 0x5401, termios.as_mut_ptr() as usize).is_ok() }
+}
+
+impl IsTerminal for Stdin {
+    fn is_terminal(&self) -> bool {
+        isatty(0)
+    }
+}
+impl IsTerminal for StdinLock {
+    fn is_terminal(&self) -> bool {
+        isatty(0)
+    }
+}
+impl IsTerminal for Stdout {
+    fn is_terminal(&self) -> bool {
+        isatty(1)
+    }
+}
+impl IsTerminal for StdoutLock {
+    fn is_terminal(&self) -> bool {
+        isatty(1)
+    }
+}
+impl IsTerminal for Stderr {
+    fn is_terminal(&self) -> bool {
+        isatty(2)
+    }
+}
+impl IsTerminal for StderrLock {
+    fn is_terminal(&self) -> bool {
+        isatty(2)
     }
 }
 impl Stdout {

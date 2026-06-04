@@ -60,6 +60,10 @@ dependencies = [
 [[package]]
 name = "purecrypto"
 version = "0.6.1"
+dependencies = [
+ "fullrust",
+ "fullrust-std",
+]
 
 [[package]]
 name = "purecrypto-sha256"

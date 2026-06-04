@@ -18,6 +18,59 @@ pub mod unix {
         }
     }
 
+    pub mod fs {
+        //! Unix extensions for filesystem types.
+        use crate::fs::{Metadata, OpenOptions};
+
+        pub trait OpenOptionsExt {
+            fn mode(&mut self, mode: u32) -> &mut Self;
+            fn custom_flags(&mut self, flags: i32) -> &mut Self;
+        }
+        impl OpenOptionsExt for OpenOptions {
+            fn mode(&mut self, mode: u32) -> &mut Self {
+                self.mode = mode;
+                self
+            }
+            fn custom_flags(&mut self, flags: i32) -> &mut Self {
+                self.custom_flags = flags;
+                self
+            }
+        }
+
+        pub trait MetadataExt {
+            fn mode(&self) -> u32;
+            fn uid(&self) -> u32;
+            fn gid(&self) -> u32;
+            fn size(&self) -> u64;
+            fn ino(&self) -> u64;
+            fn nlink(&self) -> u64;
+            fn mtime(&self) -> i64;
+        }
+        impl MetadataExt for Metadata {
+            fn mode(&self) -> u32 {
+                self.mode
+            }
+            fn uid(&self) -> u32 {
+                self.uid
+            }
+            fn gid(&self) -> u32 {
+                self.gid
+            }
+            fn size(&self) -> u64 {
+                self.size
+            }
+            fn ino(&self) -> u64 {
+                self.ino
+            }
+            fn nlink(&self) -> u64 {
+                self.nlink
+            }
+            fn mtime(&self) -> i64 {
+                self.mtime.0
+            }
+        }
+    }
+
     pub mod ffi {
         use crate::ffi::{OsStr, OsString};
         use alloc::string::String;
