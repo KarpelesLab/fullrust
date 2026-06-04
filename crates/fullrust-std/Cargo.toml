@@ -1,0 +1,10 @@
+[package]
+name = "fullrust-std"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "A pure-Rust, libc-free std replacement backed by fullrust syscalls. Alias as `std` on the freestanding target."
+
+[dependencies]
+fullrust = { path = "../fullrust" }
+hashbrown = { version = "0.15", default-features = false, features = ["default-hasher"] }

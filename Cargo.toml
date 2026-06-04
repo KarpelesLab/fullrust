@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/fullrust",
+    "crates/fullrust-std",
     "examples/hello",
     "examples/args",
     "examples/alloc-demo",
