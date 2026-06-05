@@ -2,12 +2,15 @@
 
 **Fully-static, libc-free, pure-Rust Linux binaries.**
 
-`fullrust` is a small `no_std` runtime that lets you write ordinary-looking Rust
-programs — with `println!`, `Vec`, `String`, `format!`, command-line arguments
-and environment variables — and compile them into Linux ELF executables that
-link **no libc and no C runtime at all**. The program talks to the kernel
-directly through raw `syscall` instructions, and is linked with the
-Rust-bundled LLVM linker, so **no C toolchain is involved** in the build.
+`fullrust` is a `no_std` runtime plus its own standard library
+([`fullrust-std`](crates/fullrust-std/)) that let you write ordinary-looking Rust
+programs — with `println!`, `Vec`, `String`, `format!`, command-line arguments,
+files, threads and sockets — and compile them into Linux ELF executables that
+link **no libc and no C runtime at all**. Like the Go runtime, it talks to the
+kernel directly through raw `syscall` instructions (see
+[Why a standalone `std`](#why-a-standalone-std-the-go-no-cgo-model)), and is
+linked with the Rust-bundled LLVM linker, so **no C toolchain is involved** in
+the build.
 
 ```rust
 #![no_std]
@@ -97,6 +100,68 @@ subcommand and is what CI uses):
 
 Examples live in [`examples/`](examples/): `hello`, `args`, `alloc-demo`,
 `panic-demo`, `std-smoke`.
+
+---
+
+## Why a standalone `std` (the Go "no cgo" model)
+
+fullrust ships **its own standard library** — [`fullrust-std`](crates/fullrust-std/) —
+implemented directly on Linux syscalls, instead of reusing the platform libc or
+the upstream `std` that sits on top of it. This is the same architecture as the
+**Go runtime**: Go issues syscalls itself and only touches libc when you opt into
+cgo. fullrust is, in effect, *Rust with cgo off* — programs are written against
+fullrust's std, and the binary's only boundary to the outside world is the
+`syscall` instruction.
+
+There are three ways one could get a libc-free Rust, and we deliberately chose
+the first:
+
+1. **Own std (what fullrust does).** A bespoke standard library on raw syscalls.
+   Crates opt in (`#![no_std]` + the `std` alias; `cargo fullrust` drives the
+   build). Purest binaries, full control.
+2. **Port upstream `std`'s platform backend.** Add a freestanding `sys` backend
+   inside Rust's own `library/std` (as the SGX/UEFI/Hermit targets do) and
+   `build-std` the real std. Truly "it *is* `std`," but means maintaining a fork
+   of the standard library pinned to a nightly — large and perpetual.
+3. **A pure-Rust libc (the Eyra / `c-scape` model).** Keep the real `std` and
+   satisfy the libc symbols it calls with Rust implementations.
+
+### Why own std, and explicitly *not* a libc shim
+
+The deciding principle is **keeping Rust's guarantees end-to-end, all the way to
+the kernel.** Routing the standard library through a libc-shaped ABI (option 3)
+gives that up at a C-shaped wall in the middle of every OS interaction:
+
+- **Zero-cost abstraction survives only without the wall.** In own-std,
+  `io::Write::write` → `syscall` *inlines and monomorphizes end to end* — Rust's
+  signature zero-cost-abstraction property, intact on the hot path. An
+  `extern "C"` libc seam is **opaque to the optimizer**: it cannot be inlined or
+  specialized across, so you forfeit exactly that benefit at exactly the wrong
+  place.
+- **Rust types all the way down.** Our I/O returns `Result` / `Errno`; buffers
+  are slices with lengths; errors are values. A libc seam forces C shapes — raw
+  `*mut u8`, `c_int`, NUL-terminated strings, `struct stat`, and `errno` as a
+  thread-local int — with a double-translation tax on every call.
+- **A tiny `unsafe` surface instead of a vast one.** A pure-Rust libc is almost
+  entirely `unsafe`: it *implements* a raw-pointer ABI and must reproduce
+  glibc's quirks exactly — symbol versioning (`memcpy@GLIBC_2.14`), struct
+  layouts, `__errno_location`, the TLS model, `environ`, the `__libc_start_main`
+  handshake. Any subtle mismatch is undefined behavior. own-std's only `unsafe`
+  is the handful of `syscall` sites plus a few compiler-mandated leaf symbols
+  (`memcpy`, `_start`) — not an entire operating-system interface.
+
+A clarification, to be fair to option 3: the `std → libc` boundary *already
+exists* in normal Rust (std reaches glibc through `unsafe extern "C"`). So a libc
+shim would not add unsafe FFI to *your* code, and a plain `extern "C"` call into
+a Rust function is cheap (nothing like cgo's stack-switch cost). What you lose is
+narrower but real: **the optimizer goes blind at the seam, the API degrades to C
+shapes there, and you take on a large unsafe ABI layer to build and maintain.**
+For "the purest possible binaries" on code you control, that trade isn't worth
+it — so fullrust keeps Rust idioms and optimization unbroken from `main` down to
+the `syscall`, and accepts the one cost of the own-std model: like Go, programs
+target fullrust's std rather than running arbitrary upstream-`std` crates
+unmodified. (Pure `no_std + alloc` libraries from crates.io still work as-is;
+only crates that need OS services *through* `std` need to target fullrust's.)
 
 ---
 
@@ -253,6 +318,9 @@ crates/fullrust/         the runtime
   src/rt.rs                Termination, exit/abort
   src/prelude.rs           glob import for programs
   src/lib.rs               crate root + entry!() macro
+crates/fullrust-std/     the standard library (own-std, on syscalls)
+  src/{io,fs,net,time,env,process,thread,sync,...}.rs
+                           std-shaped modules backed by fullrust syscalls
 examples/                hello, args, alloc-demo, panic-demo, std-smoke
 crates/cargo-fullrust/   the `cargo fullrust` subcommand (+ the freestanding
                            target spec it and ./x both use)
@@ -266,13 +334,18 @@ x                        in-repo build wrapper (linker resolution + path selecti
 
 * **Linux + x86-64 only** today (the design isolates arch-specific code; see
   [Extending](#extending)).
-* **No threads, no TLS.** The allocator's lock and the single-threaded
-  assumption would need revisiting for `clone`-based threads.
+* **Threads work** (`clone`-backed, futex `join`), but the standard library is
+  still maturing toward production quality — current rough edges: `Mutex`/
+  `RwLock` are spinlocks rather than futex-blocking, `thread_local!` is a single
+  shared slot rather than real per-thread TLS, there's no `Condvar` or
+  `process::Command` yet, and the DNS resolver does plain DNS + `/etc/hosts`
+  (no NSS). These are being filled in.
 * **No dynamic linking, by design.** FFI into a `.so` cannot link.
 * **`panic = "abort"` is mandatory** — it's what lets us drop the unwinder.
 * The allocator is deliberately simple (no cross-class coalescing). It is
   correct and fine for typical workloads, not a general-purpose `malloc`.
-* Build through `./x`; a bare `cargo build` won't have the linker wiring.
+* Build through `cargo fullrust` (or `./x` in-repo); a bare `cargo build` won't
+  have the linker/target wiring.
 
 ## License
 
