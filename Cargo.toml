@@ -15,6 +15,9 @@ members = [
 # default set so `./x build` / `cargo fullrust build` (freestanding target) don't
 # try to build it for a libc-free target. Build it with `cargo build -p
 # cargo-fullrust` or install it with `cargo install cargo-fullrust`.
+# std-smoke is excluded: it uses thread_local! (needs nightly feature(thread_local),
+# injected by ./x --nightly) and does live network I/O, so it's a manual/nightly
+# example: `./x run --nightly -p std-smoke`.
 default-members = [
     "crates/fullrust",
     "crates/fullrust-std",
@@ -22,7 +25,6 @@ default-members = [
     "examples/args",
     "examples/alloc-demo",
     "examples/panic-demo",
-    "examples/std-smoke",
 ]
 
 # panic=abort is mandatory: it removes the unwinding landing pads that would

@@ -57,6 +57,7 @@ extern "C" fn _start() -> ! {
 
 unsafe extern "C" fn rt_entry(stack: *const usize) -> ! {
     let (argc, argv) = fullrust::env::init_from_stack(stack);
+    fullrust::tls::install_main(stack);
     let code = main(argc, argv);
     fullrust::rt::exit(code as i32)
 }

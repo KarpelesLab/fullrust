@@ -65,7 +65,7 @@ if [ "$TOOLCHAIN" = nightly ]; then
   ENVTRIPLE=X86_64_FULLRUST_LINUX
   # Most freestanding settings (relocation model, panic strategy, no unwind
   # tables) live in the target JSON, so only -static is needed here.
-  FLAGS="-C link-args=-static"
+  FLAGS="-C link-args=-static -Z crate-attr=feature(thread_local) -A unused_features"
   EXTRA=(-Z build-std=core,alloc,compiler_builtins -Z json-target-spec)
 else
   TARGET=x86_64-unknown-linux-gnu

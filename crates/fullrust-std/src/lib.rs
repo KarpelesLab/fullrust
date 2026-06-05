@@ -132,7 +132,7 @@ macro_rules! eprintln {
 // `format!`, …) as well as the common `alloc` types.
 pub mod prelude {
     pub mod v1 {
-        pub use crate::{eprint, eprintln, print, println};
+        pub use crate::{eprint, eprintln, print, println, thread_local};
         pub use alloc::borrow::ToOwned;
         pub use alloc::boxed::Box;
         pub use alloc::string::{String, ToString};

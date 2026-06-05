@@ -22,6 +22,7 @@ extern "C" {
 /// `stack` must be the initial stack pointer as supplied by the kernel.
 pub(crate) unsafe extern "C" fn rust_start(stack: *const usize) -> ! {
     let _ = env::init_from_stack(stack);
+    crate::tls::install_main(stack);
 
     let code = __fullrust_main();
     syscall::exit_group(code);

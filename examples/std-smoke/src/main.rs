@@ -7,6 +7,10 @@ extern crate fullrust_std;
 use fullrust_std::net::ToSocketAddrs;
 use fullrust_std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+fullrust_std::thread_local! {
+    static TLS: core::cell::Cell<u32> = core::cell::Cell::new(0);
+}
+
 fn main() {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(d) => println!("unix time = {} s", d.as_secs()),
@@ -96,6 +100,17 @@ fn main() {
     }
     worker.join().unwrap();
     println!("condvar: worker released after notify");
+
+    // Thread-local storage: each thread has its own TLS slot.
+    TLS.with(|c| c.set(100)); // main thread
+    let child_val = fullrust_std::thread::spawn(|| {
+        TLS.with(|c| c.set(7)); // child sets its own slot
+        TLS.with(|c| c.get())
+    })
+    .join()
+    .unwrap();
+    let main_val = TLS.with(|c| c.get());
+    println!("tls: main={main_val} child={child_val} (expect main=100 child=7)");
 }
 
 fullrust::entry!(main);

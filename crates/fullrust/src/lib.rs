@@ -73,6 +73,7 @@ pub mod io;
 pub mod prelude;
 pub mod rt;
 pub mod syscall;
+pub mod tls;
 
 mod allocator;
 mod intrinsics;

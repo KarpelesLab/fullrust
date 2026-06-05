@@ -436,12 +436,14 @@ x                        in-repo build wrapper (linker resolution + path selecti
 
 * **Linux + x86-64 only** today (the design isolates arch-specific code; see
   [Extending](#extending)).
-* **Threads work** (`clone`-backed, futex `join`), but the standard library is
-  still maturing toward production quality — current rough edges: `Mutex`/
-  `RwLock` are spinlocks rather than futex-blocking, `thread_local!` is a single
-  shared slot rather than real per-thread TLS, there's no `Condvar` or
-  `process::Command` yet, and the DNS resolver does plain DNS + `/etc/hosts`
-  (no NSS). These are being filled in.
+* **Threads are real**: `clone`-backed with per-thread stacks, futex-based
+  `Mutex`/`Condvar`/`RwLock`, and genuine per-thread TLS (`thread_local!` via
+  `#[thread_local]`, with the thread pointer set from the program's `PT_TLS`
+  image). `thread_local!` needs `feature(thread_local)`, which `cargo fullrust`
+  and `./x` inject automatically on the nightly paths (so the `--stable` path
+  doesn't support `thread_local!`). Still missing: `process::Command`
+  (spawning child processes), and TLS destructors don't run at thread exit.
+* The DNS resolver does plain DNS + `/etc/hosts` (no NSS).
 * **No dynamic linking, by design.** FFI into a `.so` cannot link.
 * **`panic = "abort"` is mandatory** — it's what lets us drop the unwinder.
 * The allocator is deliberately simple (no cross-class coalescing). It is

@@ -95,3 +95,47 @@ jobs:
           cargo fullrust build --runtime -p hello
           out=$(target/x86_64-fullrust-linux/debug/hello); echo "$out"
           test "$out" = "hello from libc-free rust"
+      - name: Threads + sync + TLS (zero-touch, unmodified crate)
+        run: |
+          export PATH="$PWD/target/debug:$PATH"
+          export FULLRUST_DEV_REPO="$PWD"
+          mkdir -p /tmp/thr/src
+          cat > /tmp/thr/Cargo.toml <<'EOF'
+          [package]
+          name = "thr"
+          version = "0.0.0"
+          edition = "2021"
+          EOF
+          cat > /tmp/thr/src/main.rs <<'EOF'
+          use std::cell::Cell;
+          use std::sync::{Arc, Condvar, Mutex};
+          use std::thread;
+          thread_local! { static N: Cell<u32> = Cell::new(0); }
+          fn main() {
+              // join + return values
+              let hs: Vec<_> = (1u64..=4).map(|i| thread::spawn(move || i * i)).collect();
+              assert_eq!(hs.into_iter().map(|h| h.join().unwrap()).sum::<u64>(), 30);
+              // Arc<Mutex> contention
+              let c = Arc::new(Mutex::new(0u64));
+              let ts: Vec<_> = (0..8).map(|_| { let c = c.clone();
+                  thread::spawn(move || for _ in 0..1000 { *c.lock().unwrap() += 1; }) }).collect();
+              for t in ts { t.join().unwrap(); }
+              assert_eq!(*c.lock().unwrap(), 8000);
+              // Condvar
+              let pair = Arc::new((Mutex::new(false), Condvar::new()));
+              let p2 = pair.clone();
+              let w = thread::spawn(move || { let (l, cv) = &*p2;
+                  let mut r = l.lock().unwrap(); while !*r { r = cv.wait(r).unwrap(); } });
+              { let (l, cv) = &*pair; *l.lock().unwrap() = true; cv.notify_one(); }
+              w.join().unwrap();
+              // per-thread TLS
+              N.with(|c| c.set(100));
+              let child = thread::spawn(|| { N.with(|c| c.set(7)); N.with(|c| c.get()) }).join().unwrap();
+              assert_eq!(N.with(|c| c.get()), 100);
+              assert_eq!(child, 7);
+              println!("threads+sync+tls OK");
+          }
+          EOF
+          ( cd /tmp/thr && cargo fullrust build --release )
+          out=$(/tmp/thr/target/x86_64-fullrust-linux/release/thr); echo "$out"
+          test "$out" = "threads+sync+tls OK"

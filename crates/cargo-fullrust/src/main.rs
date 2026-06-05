@@ -85,7 +85,7 @@ fn main() {
         if toolchain == "nightly" {
             cmd.env(
                 format!("CARGO_TARGET_{env_triple}_RUSTFLAGS"),
-                "-C link-args=-static",
+                "-C link-args=-static -Z crate-attr=feature(thread_local) -A unused_features",
             );
             extra.push("--target".into());
             extra.push(target_path.to_string_lossy().into_owned());
@@ -110,7 +110,10 @@ fn main() {
         let sysroot = ensure_sysroot(&host, &lld, &target_path);
         cmd.env(
             format!("CARGO_TARGET_{env_triple}_RUSTFLAGS"),
-            format!("--sysroot {} -C link-args=-static", sysroot.display()),
+            format!(
+                "--sysroot {} -C link-args=-static -Z crate-attr=feature(thread_local) -A unused_features",
+                sysroot.display()
+            ),
         );
         extra.push("--target".into());
         extra.push(target_path.to_string_lossy().into_owned());
@@ -137,9 +140,15 @@ fn ensure_sysroot(host: &str, lld: &Path, target_path: &Path) -> PathBuf {
     let key = sanitize(&format!("{}-{}", rv.trim(), VERSION));
     let base = cache_dir().join("sysroot").join(key);
     let sysroot = base.join("root");
-    if sysroot.join(".ok").exists() {
+    // In dev mode the crates come from a local path, so the cache key (rustc +
+    // version) can't see source changes — always rebuild.
+    let dev = std::env::var("FULLRUST_DEV_REPO")
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    if !dev && sysroot.join(".ok").exists() {
         return sysroot;
     }
+    let _ = std::fs::remove_dir_all(&base);
 
     eprintln!("cargo-fullrust: building the fullrust sysroot (one-time)...");
     // 1. Generate the std-crate project.

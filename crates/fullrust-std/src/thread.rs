@@ -47,6 +47,7 @@ const CLONE_FILES: usize = 0x400;
 const CLONE_SIGHAND: usize = 0x800;
 const CLONE_THREAD: usize = 0x10000;
 const CLONE_SYSVSEM: usize = 0x40000;
+const CLONE_SETTLS: usize = 0x0008_0000;
 const CLONE_PARENT_SETTID: usize = 0x0010_0000;
 const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
 
@@ -137,6 +138,8 @@ pub struct JoinHandle<T> {
     shared: Arc<Shared<T>>,
     stack: *mut u8,
     stack_size: usize,
+    tls_base: *mut u8,
+    tls_size: usize,
     inline: bool,
 }
 
@@ -155,6 +158,9 @@ impl<T> JoinHandle<T> {
             }
             unsafe {
                 let _ = sys::munmap_raw(self.stack, self.stack_size);
+                if !self.tls_base.is_null() {
+                    let _ = sys::munmap_raw(self.tls_base, self.tls_size);
+                }
             }
         }
         fence(Ordering::Acquire);
@@ -232,12 +238,19 @@ impl Builder {
         });
         let stack_size = self.stack_size.unwrap_or(STACK_SIZE);
 
-        // Allocate the child stack.
+        // Allocate the child stack and its own TLS block.
         let stack = match sys::mmap_stack(stack_size) {
             Some(p) => p,
             None => return run_inline(f, shared),
         };
         let top = stack.wrapping_add(stack_size);
+        let (tls_base, tls_size, tp) = unsafe { fullrust::tls::new_block() };
+        if tp == 0 {
+            unsafe {
+                let _ = sys::munmap_raw(stack, stack_size);
+            }
+            return run_inline(f, shared);
+        }
 
         let payload = Box::new(Payload {
             f,
@@ -251,13 +264,14 @@ impl Builder {
             | CLONE_SIGHAND
             | CLONE_THREAD
             | CLONE_SYSVSEM
+            | CLONE_SETTLS          // kernel sets the child's %fs to `tp` before it runs
             | CLONE_PARENT_SETTID   // kernel writes the tid into ctid *before clone returns*
             | CLONE_CHILD_CLEARTID; // and clears it (+ futex wake) when the thread exits
         let ctid = &shared.ctid as *const AtomicI32 as *mut i32;
 
         // Pass `ctid` as both parent-set-tid and child-clear-tid: it is nonzero
         // by the time `fr_clone` returns (no "already done" race in `join`), and
-        // becomes 0 when the thread exits.
+        // becomes 0 when the thread exits. `tp` is the new thread pointer.
         let tid = unsafe {
             fr_clone(
                 trampoline::<F, T>,
@@ -265,16 +279,17 @@ impl Builder {
                 flags,
                 arg,
                 ctid,
-                core::ptr::null_mut(),
+                tp as *mut u8,
                 ctid,
             )
         };
 
         if tid <= 0 {
-            // clone failed: reclaim the payload and stack, run inline.
+            // clone failed: reclaim the payload, stack and TLS, run inline.
             let payload = unsafe { *Box::from_raw(arg as *mut Payload<F, T>) };
             unsafe {
                 let _ = sys::munmap_raw(stack, stack_size);
+                let _ = sys::munmap_raw(tls_base, tls_size);
             }
             return run_inline(payload.f, shared);
         }
@@ -283,6 +298,8 @@ impl Builder {
             shared,
             stack,
             stack_size,
+            tls_base,
+            tls_size,
             inline: false,
         })
     }
@@ -300,38 +317,43 @@ where
         shared,
         stack: core::ptr::null_mut(),
         stack_size: 0,
+        tls_base: core::ptr::null_mut(),
+        tls_size: 0,
         inline: true,
     })
 }
 
-// ---- thread-local storage (single-slot shim) ----
+// ---- thread-local storage ----
 
-/// A thread-local key. In this shim it is a lazily initialized shared slot.
+/// A thread-local key. Backed by a real `#[thread_local]` slot (one per OS
+/// thread), lazily initialized on first access.
 pub struct LocalKey<T: 'static> {
+    // Returns the current thread's slot (a `#[thread_local]` static address).
+    get: unsafe fn() -> *mut Option<T>,
     init: fn() -> T,
-    slot: UnsafeCell<Option<T>>,
 }
 
+// Safe: the only fields are function pointers; the per-thread state lives in the
+// `#[thread_local]` slot reached through `get`.
 unsafe impl<T: 'static> Sync for LocalKey<T> {}
 
 impl<T: 'static> LocalKey<T> {
     #[doc(hidden)]
-    pub const fn new(init: fn() -> T) -> LocalKey<T> {
-        LocalKey {
-            init,
-            slot: UnsafeCell::new(None),
-        }
+    pub const fn new(get: unsafe fn() -> *mut Option<T>, init: fn() -> T) -> LocalKey<T> {
+        LocalKey { get, init }
     }
 
     pub fn with<F, R>(&'static self, f: F) -> R
     where
         F: FnOnce(&T) -> R,
     {
-        let slot = unsafe { &mut *self.slot.get() };
-        if slot.is_none() {
-            *slot = Some((self.init)());
+        unsafe {
+            let slot = (self.get)();
+            if (*slot).is_none() {
+                *slot = Some((self.init)());
+            }
+            f((*slot).as_ref().unwrap())
         }
-        f(slot.as_ref().unwrap())
     }
 
     pub fn try_with<F, R>(&'static self, f: F) -> Result<R, AccessError>
@@ -346,21 +368,24 @@ impl<T: 'static> LocalKey<T> {
 #[derive(Debug)]
 pub struct AccessError;
 
-/// Declare thread-local keys (single-slot shim semantics).
+/// Declare thread-local keys. Each key gets a real per-thread slot via
+/// `#[thread_local]` (the crate using this must enable `feature(thread_local)`;
+/// `cargo fullrust` injects it automatically).
 #[macro_export]
 macro_rules! thread_local {
     () => {};
     ($(#[$attr:meta])* $vis:vis static $name:ident: $t:ty = const { $init:expr }; $($rest:tt)*) => {
-        $(#[$attr])* $vis static $name: $crate::thread::LocalKey<$t> = {
-            fn __init() -> $t { $init }
-            $crate::thread::LocalKey::new(__init)
-        };
-        $crate::thread_local!($($rest)*);
+        $crate::thread_local!($(#[$attr])* $vis static $name: $t = $init; $($rest)*);
     };
     ($(#[$attr:meta])* $vis:vis static $name:ident: $t:ty = $init:expr; $($rest:tt)*) => {
         $(#[$attr])* $vis static $name: $crate::thread::LocalKey<$t> = {
+            #[thread_local]
+            static mut __VAL: ::core::option::Option<$t> = ::core::option::Option::None;
+            unsafe fn __get() -> *mut ::core::option::Option<$t> {
+                ::core::ptr::addr_of_mut!(__VAL)
+            }
             fn __init() -> $t { $init }
-            $crate::thread::LocalKey::new(__init)
+            $crate::thread::LocalKey::new(__get, __init)
         };
         $crate::thread_local!($($rest)*);
     };
