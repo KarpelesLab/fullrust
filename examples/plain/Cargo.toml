@@ -1,0 +1,9 @@
+[package]
+name = "plain"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# A completely ordinary Rust program: NO fullrust dependency, NO attributes.
+# It builds on the host as normal Rust, and via `cargo fullrust build` (zero-touch)
+# into a libc-free, fully-static binary.

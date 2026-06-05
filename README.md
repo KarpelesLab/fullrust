@@ -54,21 +54,56 @@ nightly toolchain with the `rust-src` component:
 rustup component add rust-src --toolchain nightly
 ```
 
-### Use it from any crate: `cargo fullrust`
+### Zero-touch: `cargo fullrust` on an unmodified crate
 
-Install the cargo subcommand once, then build any crate that uses the fullrust
-runtime as a libc-free static binary — no manual target, linker, or `-Z` flags:
+Install the subcommand once, then build a **completely ordinary** crate — plain
+`fn main`, `use std::…`, no dependency on fullrust, no attributes — into a
+libc-free static binary:
 
 ```console
-cargo install cargo-fullrust          # from crates.io (or: cargo install --path crates/cargo-fullrust)
-
-# in your crate:
-cargo fullrust build --release        # nightly build-std (default), smallest binaries
-cargo fullrust run -- arg1 arg2
-cargo fullrust --stable build         # precompiled core/alloc instead
+cargo install cargo-fullrust
+```
+```rust
+// src/main.rs — nothing fullrust-specific
+use std::collections::BTreeMap;
+fn main() {
+    let mut m = BTreeMap::new();
+    *m.entry("hi").or_insert(0) += 1;
+    println!("{m:?}");
+}
+```
+```console
+cargo fullrust build --release       # -> target/x86_64-fullrust-linux/release/<bin>
+cargo fullrust run -- arg1
 ```
 
-Your crate just needs the runtime and an entry point:
+How: `cargo fullrust` builds (and caches) a **sysroot whose `std` is fullrust's
+own standard library**, then compiles your crate against it. Your `use std::…`
+resolves to the syscall-backed std, and the binary links no libc. Needs a
+nightly toolchain with `rust-src`
+(`rustup component add rust-src --toolchain nightly`). Coverage is whatever
+[`fullrust-std`](crates/fullrust-std/) implements — gaps surface as ordinary
+"not found in `std`" errors as the stdlib grows.
+
+### GitHub Action
+
+Build static artifacts in CI with the reusable action (see
+[`action.yml`](action.yml)):
+
+```yaml
+- uses: KarpelesLab/fullrust@master
+  with:
+    working-directory: .       # your crate
+    args: --release
+- uses: actions/upload-artifact@v4
+  with:
+    path: target/x86_64-fullrust-linux/release/<your-bin>
+```
+
+### Explicit-runtime crates: `--runtime`
+
+If you'd rather opt in directly (smaller surface, works without the sysroot),
+write a `no_std` crate against the runtime and pass `--runtime`:
 
 ```toml
 [dependencies]
@@ -81,10 +116,10 @@ use fullrust::prelude::*;
 fn main() { println!("hello from libc-free rust"); }
 fullrust::entry!(main);
 ```
-
-The default path needs a nightly toolchain with `rust-src`
-(`rustup component add rust-src --toolchain nightly`); `--stable` needs nothing
-extra. See [Two build paths](#two-build-paths) for the trade-offs.
+```console
+cargo fullrust --runtime build --release   # build-std (nightly)
+cargo fullrust --stable build              # precompiled core/alloc, no nightly
+```
 
 ### Working inside this repo: `./x`
 

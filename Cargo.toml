@@ -9,6 +9,7 @@ members = [
     "examples/alloc-demo",
     "examples/panic-demo",
     "examples/std-smoke",
+    "examples/plain",
 ]
 # cargo-fullrust is a host tool (ordinary std binary); exclude it from the
 # default set so `./x build` / `cargo fullrust build` (freestanding target) don't

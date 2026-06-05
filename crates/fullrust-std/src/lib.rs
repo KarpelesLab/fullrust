@@ -126,15 +126,27 @@ macro_rules! eprintln {
     ($($arg:tt)*) => { $crate::io::_eprint(::core::format_args!("{}\n", ::core::format_args!($($arg)*))) };
 }
 
-// A `prelude` mirroring `std`'s, for files that relied on the std prelude.
+// A `prelude` mirroring `std`'s. The edition-named submodules (`rust_2021`,
+// `rust_2024`) are what the compiler auto-injects when this crate is used as the
+// sysroot `std`, so they must include the standard macros (`println!`, `vec!`,
+// `format!`, …) as well as the common `alloc` types.
 pub mod prelude {
     pub mod v1 {
+        pub use crate::{eprint, eprintln, print, println};
         pub use alloc::borrow::ToOwned;
         pub use alloc::boxed::Box;
         pub use alloc::string::{String, ToString};
         pub use alloc::vec::Vec;
         pub use alloc::{format, vec};
         pub use core::prelude::v1::*;
+    }
+    pub mod rust_2021 {
+        pub use crate::prelude::v1::*;
+        pub use core::prelude::rust_2021::*;
+    }
+    pub mod rust_2024 {
+        pub use crate::prelude::v1::*;
+        pub use core::prelude::rust_2024::*;
     }
     pub use v1::*;
 }

@@ -81,9 +81,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build the cargo subcommand (host tool)
         run: cargo build -p cargo-fullrust
-      - name: Use it to build an example, then run it
+      - name: Zero-touch — build an UNMODIFIED crate (plain fn main, no deps)
         run: |
           export PATH="$PWD/target/debug:$PATH"
-          cargo fullrust build -p hello
+          export FULLRUST_DEV_REPO="$PWD"   # sysroot uses the in-repo crates
+          cargo fullrust build -p plain
+          out=$(target/x86_64-fullrust-linux/debug/plain | head -1); echo "$out"
+          test "$out" = "brown: 1"
+          ldd target/x86_64-fullrust-linux/debug/plain 2>&1 | grep -q "not a dynamic executable"
+      - name: Runtime mode — explicit entry! crate still builds
+        run: |
+          export PATH="$PWD/target/debug:$PATH"
+          cargo fullrust build --runtime -p hello
           out=$(target/x86_64-fullrust-linux/debug/hello); echo "$out"
           test "$out" = "hello from libc-free rust"

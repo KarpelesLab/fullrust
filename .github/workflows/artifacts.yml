@@ -1,0 +1,51 @@
+name: Static artifacts (demo)
+
+# Demonstrates the reusable action (./action.yml): build an unmodified crate
+# into a pure libc-free static binary and upload it. Reference for users.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Create an unmodified demo crate
+        run: |
+          mkdir -p /tmp/demo/src
+          cat > /tmp/demo/Cargo.toml <<'EOF'
+          [package]
+          name = "demo"
+          version = "0.1.0"
+          edition = "2021"
+          EOF
+          cat > /tmp/demo/src/main.rs <<'EOF'
+          fn main() {
+              println!("a pure, libc-free static binary, built by a GitHub Action");
+          }
+          EOF
+
+      - name: Build it (zero-touch)
+        uses: ./
+        with:
+          working-directory: /tmp/demo
+          args: --release
+
+      - name: Show it is libc-free
+        run: |
+          BIN=/tmp/demo/target/x86_64-fullrust-linux/release/demo
+          file "$BIN"
+          ldd "$BIN" || true
+          "$BIN"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: demo-x86_64-fullrust-linux
+          path: /tmp/demo/target/x86_64-fullrust-linux/release/demo
+          if-no-files-found: error

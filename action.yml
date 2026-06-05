@@ -1,0 +1,45 @@
+name: "fullrust static build"
+description: "Build a Rust crate into a libc-free, fully-static binary with cargo-fullrust (no libc, no C toolchain)."
+branding:
+  icon: package
+  color: orange
+
+inputs:
+  args:
+    description: "Arguments passed to `cargo fullrust build` (e.g. `--release --bin myapp`)."
+    default: "--release"
+  working-directory:
+    description: "Directory containing the crate to build."
+    default: "."
+  mode:
+    description: "Build mode: `zero-touch` (default; unmodified crate) or `runtime` (crate uses #![no_std] + fullrust::entry!)."
+    default: "zero-touch"
+  version:
+    description: "cargo-fullrust version to install (default: latest on crates.io)."
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install nightly Rust + rust-src
+      uses: dtolnay/rust-toolchain@nightly
+      with:
+        components: rust-src
+
+    - name: Install cargo-fullrust
+      shell: bash
+      run: |
+        if [ -n "${{ inputs.version }}" ]; then
+          cargo install cargo-fullrust --version "${{ inputs.version }}" --locked
+        else
+          cargo install cargo-fullrust --locked || cargo install cargo-fullrust
+        fi
+
+    - name: Build static binary
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        flag=""
+        [ "${{ inputs.mode }}" = "runtime" ] && flag="--runtime"
+        cargo fullrust build $flag ${{ inputs.args }}
+        echo "Static binaries are under: target/x86_64-fullrust-linux/"
