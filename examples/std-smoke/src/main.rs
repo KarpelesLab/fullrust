@@ -77,6 +77,25 @@ fn main() {
         "threads: shared counter = {} (expect 8000)",
         *counter.lock().unwrap()
     );
+
+    // Condvar: a worker blocks until the main thread sets a flag and notifies.
+    use fullrust_std::sync::Condvar;
+    let pair = Arc::new((Mutex::new(false), Condvar::new()));
+    let p2 = pair.clone();
+    let worker = fullrust_std::thread::spawn(move || {
+        let (lock, cv) = &*p2;
+        let mut ready = lock.lock().unwrap();
+        while !*ready {
+            ready = cv.wait(ready).unwrap();
+        }
+    });
+    {
+        let (lock, cv) = &*pair;
+        *lock.lock().unwrap() = true;
+        cv.notify_one();
+    }
+    worker.join().unwrap();
+    println!("condvar: worker released after notify");
 }
 
 fullrust::entry!(main);

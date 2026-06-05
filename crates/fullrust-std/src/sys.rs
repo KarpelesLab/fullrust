@@ -75,6 +75,42 @@ pub unsafe fn munmap_raw(addr: *mut u8, len: usize) -> Result<usize, Errno> {
     sc2(nr::MUNMAP, addr as usize, len)
 }
 
+// ---- futex ----
+
+const FUTEX_WAIT_PRIVATE: usize = 128; // FUTEX_WAIT | FUTEX_PRIVATE_FLAG
+const FUTEX_WAKE_PRIVATE: usize = 129; // FUTEX_WAKE | FUTEX_PRIVATE_FLAG
+
+/// Block while `*addr == expected`, until woken (or a spurious wakeup).
+pub fn futex_wait(addr: &core::sync::atomic::AtomicU32, expected: u32) {
+    unsafe {
+        let _ = sc6(
+            nr::FUTEX,
+            addr as *const _ as usize,
+            FUTEX_WAIT_PRIVATE,
+            expected as usize,
+            0, // timeout = NULL (wait forever)
+            0,
+            0,
+        );
+    }
+}
+
+/// Wake up to `n` waiters blocked on `addr`. Returns the number woken.
+pub fn futex_wake(addr: &core::sync::atomic::AtomicU32, n: i32) -> usize {
+    unsafe {
+        sc6(
+            nr::FUTEX,
+            addr as *const _ as usize,
+            FUTEX_WAKE_PRIVATE,
+            n as usize,
+            0,
+            0,
+            0,
+        )
+        .unwrap_or(0)
+    }
+}
+
 /// Convert a raw syscall return into `Result`, mapping `-errno` to `Err`.
 #[inline]
 pub fn r(ret: usize) -> Result<usize, Errno> {

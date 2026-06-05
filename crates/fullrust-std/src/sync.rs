@@ -1,12 +1,13 @@
-//! Synchronization primitives: `Mutex`, `RwLock`, `Once`, `OnceLock`.
+//! Synchronization primitives: `Mutex`, `Condvar`, `RwLock`, `Once`, `OnceLock`.
 //!
-//! These use atomics with `sched_yield` backoff. fullrust programs are mostly
-//! single-threaded; the spin path is correct (Linux preempts) if contended.
+//! `Mutex`/`Condvar`/`RwLock` block via Linux `futex` (a short adaptive spin,
+//! then a real kernel wait) — the same design as `std`. `Once`/`OnceLock` use a
+//! light spin since they are typically uncontended.
 
 use crate::sys;
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering::*};
 
 #[inline]
 fn yield_now() {
@@ -46,10 +47,10 @@ pub enum TryLockError<T> {
     WouldBlock,
 }
 
-// ---- Mutex ----
+// ---- Mutex (futex, 3-state: 0 unlocked / 1 locked / 2 locked + waiters) ----
 
 pub struct Mutex<T: ?Sized> {
-    locked: AtomicUsize,
+    state: AtomicU32,
     data: UnsafeCell<T>,
 }
 
@@ -63,7 +64,7 @@ pub struct MutexGuard<'a, T: ?Sized + 'a> {
 impl<T> Mutex<T> {
     pub const fn new(t: T) -> Mutex<T> {
         Mutex {
-            locked: AtomicUsize::new(0),
+            state: AtomicU32::new(0),
             data: UnsafeCell::new(t),
         }
     }
@@ -73,22 +74,59 @@ impl<T> Mutex<T> {
 }
 
 impl<T: ?Sized> Mutex<T> {
-    pub fn lock(&self) -> LockResult<MutexGuard<'_, T>> {
-        while self
-            .locked
-            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            yield_now();
+    #[inline]
+    fn raw_lock(&self) {
+        if self.state.compare_exchange(0, 1, Acquire, Relaxed).is_err() {
+            self.lock_contended();
         }
+    }
+
+    #[cold]
+    fn lock_contended(&self) {
+        let mut state = self.spin();
+        if state == 0 {
+            match self.state.compare_exchange(0, 1, Acquire, Relaxed) {
+                Ok(_) => return,
+                Err(s) => state = s,
+            }
+        }
+        loop {
+            // Mark as "locked with waiters" and grab it if it was free.
+            if state != 2 && self.state.swap(2, Acquire) == 0 {
+                return;
+            }
+            sys::futex_wait(&self.state, 2);
+            state = self.spin();
+        }
+    }
+
+    fn spin(&self) -> u32 {
+        let mut spin = 100;
+        loop {
+            let state = self.state.load(Relaxed);
+            if state != 1 || spin == 0 {
+                return state;
+            }
+            core::hint::spin_loop();
+            spin -= 1;
+        }
+    }
+
+    /// # Safety: caller must hold the lock.
+    #[inline]
+    unsafe fn raw_unlock(&self) {
+        if self.state.swap(0, Release) == 2 {
+            sys::futex_wake(&self.state, 1);
+        }
+    }
+
+    pub fn lock(&self) -> LockResult<MutexGuard<'_, T>> {
+        self.raw_lock();
         Ok(MutexGuard { lock: self })
     }
 
     pub fn try_lock(&self) -> TryLockResult<MutexGuard<'_, T>> {
-        match self
-            .locked
-            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-        {
+        match self.state.compare_exchange(0, 1, Acquire, Relaxed) {
             Ok(_) => Ok(MutexGuard { lock: self }),
             Err(_) => Err(TryLockError::WouldBlock),
         }
@@ -112,7 +150,7 @@ impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
 }
 impl<T: ?Sized> Drop for MutexGuard<'_, T> {
     fn drop(&mut self) {
-        self.lock.locked.store(0, Ordering::Release);
+        unsafe { self.lock.raw_unlock() }
     }
 }
 
@@ -122,12 +160,71 @@ impl<T: Default> Default for Mutex<T> {
     }
 }
 
-// ---- RwLock ----
+// ---- Condvar (futex) ----
 
-const WRITER: usize = usize::MAX;
+pub struct Condvar {
+    // Incremented on every notify; waiters block on the old value.
+    futex: AtomicU32,
+}
+
+impl Condvar {
+    pub const fn new() -> Condvar {
+        Condvar {
+            futex: AtomicU32::new(0),
+        }
+    }
+
+    pub fn notify_one(&self) {
+        self.futex.fetch_add(1, Release);
+        sys::futex_wake(&self.futex, 1);
+    }
+
+    pub fn notify_all(&self) {
+        self.futex.fetch_add(1, Release);
+        sys::futex_wake(&self.futex, i32::MAX);
+    }
+
+    /// Atomically release `guard`'s mutex and block until notified, then
+    /// re-acquire and return the guard.
+    pub fn wait<'a, T: ?Sized>(&self, guard: MutexGuard<'a, T>) -> LockResult<MutexGuard<'a, T>> {
+        let mutex = guard.lock;
+        let value = self.futex.load(Relaxed);
+        // Release the mutex without running the guard's destructor twice.
+        core::mem::forget(guard);
+        unsafe { mutex.raw_unlock() };
+        sys::futex_wait(&self.futex, value);
+        mutex.raw_lock();
+        Ok(MutexGuard { lock: mutex })
+    }
+
+    /// `wait` in a loop until `condition` returns false.
+    pub fn wait_while<'a, T: ?Sized, F>(
+        &self,
+        mut guard: MutexGuard<'a, T>,
+        mut condition: F,
+    ) -> LockResult<MutexGuard<'a, T>>
+    where
+        F: FnMut(&mut T) -> bool,
+    {
+        while condition(&mut guard) {
+            guard = self.wait(guard)?;
+        }
+        Ok(guard)
+    }
+}
+
+impl Default for Condvar {
+    fn default() -> Self {
+        Condvar::new()
+    }
+}
+
+// ---- RwLock (futex): bit 31 = write-locked, low bits = reader count ----
+
+const WRITE_BIT: u32 = 1 << 31;
 
 pub struct RwLock<T: ?Sized> {
-    state: AtomicUsize, // 0 = free, WRITER = write-locked, n = n readers
+    state: AtomicU32,
     data: UnsafeCell<T>,
 }
 
@@ -144,7 +241,7 @@ pub struct RwLockWriteGuard<'a, T: ?Sized + 'a> {
 impl<T> RwLock<T> {
     pub const fn new(t: T) -> RwLock<T> {
         RwLock {
-            state: AtomicUsize::new(0),
+            state: AtomicU32::new(0),
             data: UnsafeCell::new(t),
         }
     }
@@ -156,28 +253,51 @@ impl<T> RwLock<T> {
 impl<T: ?Sized> RwLock<T> {
     pub fn read(&self) -> LockResult<RwLockReadGuard<'_, T>> {
         loop {
-            let s = self.state.load(Ordering::Relaxed);
-            if s != WRITER
-                && self
+            let s = self.state.load(Acquire);
+            if s & WRITE_BIT == 0 {
+                if self
                     .state
-                    .compare_exchange_weak(s, s + 1, Ordering::Acquire, Ordering::Relaxed)
+                    .compare_exchange_weak(s, s + 1, Acquire, Relaxed)
                     .is_ok()
-            {
-                return Ok(RwLockReadGuard { lock: self });
+                {
+                    return Ok(RwLockReadGuard { lock: self });
+                }
+            } else {
+                sys::futex_wait(&self.state, s);
             }
-            yield_now();
         }
     }
-    pub fn write(&self) -> LockResult<RwLockWriteGuard<'_, T>> {
-        while self
-            .state
-            .compare_exchange_weak(0, WRITER, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
+
+    pub fn try_read(&self) -> TryLockResult<RwLockReadGuard<'_, T>> {
+        let s = self.state.load(Acquire);
+        if s & WRITE_BIT == 0
+            && self
+                .state
+                .compare_exchange(s, s + 1, Acquire, Relaxed)
+                .is_ok()
         {
-            yield_now();
+            Ok(RwLockReadGuard { lock: self })
+        } else {
+            Err(TryLockError::WouldBlock)
         }
-        Ok(RwLockWriteGuard { lock: self })
     }
+
+    pub fn write(&self) -> LockResult<RwLockWriteGuard<'_, T>> {
+        loop {
+            match self.state.compare_exchange(0, WRITE_BIT, Acquire, Relaxed) {
+                Ok(_) => return Ok(RwLockWriteGuard { lock: self }),
+                Err(s) => sys::futex_wait(&self.state, s),
+            }
+        }
+    }
+
+    pub fn try_write(&self) -> TryLockResult<RwLockWriteGuard<'_, T>> {
+        match self.state.compare_exchange(0, WRITE_BIT, Acquire, Relaxed) {
+            Ok(_) => Ok(RwLockWriteGuard { lock: self }),
+            Err(_) => Err(TryLockError::WouldBlock),
+        }
+    }
+
     pub fn get_mut(&mut self) -> LockResult<&mut T> {
         Ok(unsafe { &mut *self.data.get() })
     }
@@ -191,7 +311,10 @@ impl<T: ?Sized> Deref for RwLockReadGuard<'_, T> {
 }
 impl<T: ?Sized> Drop for RwLockReadGuard<'_, T> {
     fn drop(&mut self) {
-        self.lock.state.fetch_sub(1, Ordering::Release);
+        // Last reader out wakes a waiting writer.
+        if self.lock.state.fetch_sub(1, Release) == 1 {
+            sys::futex_wake(&self.lock.state, i32::MAX);
+        }
     }
 }
 impl<T: ?Sized> Deref for RwLockWriteGuard<'_, T> {
@@ -207,7 +330,8 @@ impl<T: ?Sized> DerefMut for RwLockWriteGuard<'_, T> {
 }
 impl<T: ?Sized> Drop for RwLockWriteGuard<'_, T> {
     fn drop(&mut self) {
-        self.lock.state.store(0, Ordering::Release);
+        self.lock.state.store(0, Release);
+        sys::futex_wake(&self.lock.state, i32::MAX);
     }
 }
 
@@ -228,22 +352,20 @@ impl Once {
         }
     }
     pub fn is_completed(&self) -> bool {
-        self.state.load(Ordering::Acquire) == COMPLETE
+        self.state.load(Acquire) == COMPLETE
     }
     pub fn call_once<F: FnOnce()>(&self, f: F) {
-        if self.state.load(Ordering::Acquire) == COMPLETE {
+        if self.state.load(Acquire) == COMPLETE {
             return;
         }
         loop {
-            match self.state.compare_exchange(
-                INCOMPLETE,
-                RUNNING,
-                Ordering::Acquire,
-                Ordering::Acquire,
-            ) {
+            match self
+                .state
+                .compare_exchange(INCOMPLETE, RUNNING, Acquire, Acquire)
+            {
                 Ok(_) => {
                     f();
-                    self.state.store(COMPLETE, Ordering::Release);
+                    self.state.store(COMPLETE, Release);
                     return;
                 }
                 Err(COMPLETE) => return,

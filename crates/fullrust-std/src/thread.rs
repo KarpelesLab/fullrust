@@ -47,7 +47,7 @@ const CLONE_FILES: usize = 0x400;
 const CLONE_SIGHAND: usize = 0x800;
 const CLONE_THREAD: usize = 0x10000;
 const CLONE_SYSVSEM: usize = 0x40000;
-const CLONE_CHILD_SETTID: usize = 0x0100_0000;
+const CLONE_PARENT_SETTID: usize = 0x0010_0000;
 const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
 
 const STACK_SIZE: usize = 2 * 1024 * 1024;
@@ -251,17 +251,20 @@ impl Builder {
             | CLONE_SIGHAND
             | CLONE_THREAD
             | CLONE_SYSVSEM
-            | CLONE_CHILD_SETTID
-            | CLONE_CHILD_CLEARTID;
+            | CLONE_PARENT_SETTID   // kernel writes the tid into ctid *before clone returns*
+            | CLONE_CHILD_CLEARTID; // and clears it (+ futex wake) when the thread exits
         let ctid = &shared.ctid as *const AtomicI32 as *mut i32;
 
+        // Pass `ctid` as both parent-set-tid and child-clear-tid: it is nonzero
+        // by the time `fr_clone` returns (no "already done" race in `join`), and
+        // becomes 0 when the thread exits.
         let tid = unsafe {
             fr_clone(
                 trampoline::<F, T>,
                 top,
                 flags,
                 arg,
-                core::ptr::null_mut(),
+                ctid,
                 core::ptr::null_mut(),
                 ctid,
             )

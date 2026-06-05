@@ -38,7 +38,7 @@ pub use alloc::{borrow, boxed, fmt, format, rc, string, vec};
 pub mod sync {
     //! Synchronization primitives.
     pub use crate::sync_impl::{
-        Mutex, MutexGuard, Once, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        Condvar, Mutex, MutexGuard, Once, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
     };
     pub use alloc::sync::{Arc, Weak};
     pub use core::sync::atomic;
