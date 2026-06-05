@@ -44,21 +44,23 @@ jobs:
           ldd "$BIN" || true
           "$BIN"
 
-      - name: Stage a nicely-named asset
+      - name: Package as a .tar.gz
         run: |
-          install -D /tmp/demo/target/x86_64-fullrust-linux/release/demo \
-                     dist/demo-x86_64-linux-static
+          name="demo-x86_64-linux-static"
+          mkdir -p "dist/$name"
+          cp /tmp/demo/target/x86_64-fullrust-linux/release/demo "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
 
       - name: Upload as a workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: demo-x86_64-fullrust-linux
-          path: dist/demo-x86_64-linux-static
+          path: dist/demo-x86_64-linux-static.tar.gz
           if-no-files-found: error
 
-      # On a tag, also attach the static binary to the GitHub Release.
+      # On a tag, also attach the archive to the GitHub Release.
       - name: Attach to the release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/demo-x86_64-linux-static
+          files: dist/demo-x86_64-linux-static.tar.gz

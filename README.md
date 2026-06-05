@@ -129,21 +129,24 @@ jobs:
         with:
           args: --release --bin myapp     # your binary
 
-      - name: Rename to include the target (optional, nicer asset name)
+      - name: Package as a .tar.gz
         run: |
-          install -D target/x86_64-fullrust-linux/release/myapp \
-                     dist/myapp-${{ github.ref_name }}-x86_64-linux-static
+          name="myapp-${{ github.ref_name }}-x86_64-linux-static"
+          mkdir -p "dist/$name"
+          cp target/x86_64-fullrust-linux/release/myapp "dist/$name/"
+          cp README.md LICENSE* "dist/$name/" 2>/dev/null || true
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
 
       - name: Attach to the release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/myapp-${{ github.ref_name }}-x86_64-linux-static
+          files: dist/*.tar.gz
 ```
 
 `softprops/action-gh-release` creates/updates the release for the tag and
-uploads the file; with the `release: published` trigger it attaches to the
+uploads the archive; with the `release: published` trigger it attaches to the
 existing release instead. (Equivalent with the CLI:
-`gh release upload "$TAG" target/x86_64-fullrust-linux/release/myapp`.)
+`gh release upload "$TAG" dist/*.tar.gz`.)
 
 The output path is `target/x86_64-fullrust-linux/release/<bin>` relative to the
 crate's workspace root (so if you set `working-directory:`, the binary still
