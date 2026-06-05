@@ -92,7 +92,7 @@ nightly toolchain with `rust-src`
 ### GitHub Action
 
 Build static artifacts in CI with the reusable action (see
-[`action.yml`](action.yml)):
+[`action.yml`](action.yml)). To keep them as workflow artifacts:
 
 ```yaml
 - uses: KarpelesLab/fullrust@master
@@ -103,6 +103,51 @@ Build static artifacts in CI with the reusable action (see
   with:
     path: target/x86_64-fullrust-linux/release/<your-bin>
 ```
+
+#### Attach a static binary to a GitHub Release
+
+On a tag (or a published release), build with the action and upload the binary
+as a release asset. Note the **`contents: write`** permission:
+
+```yaml
+name: Release
+on:
+  push:
+    tags: ["v*"]            # or: release: { types: [published] }
+
+permissions:
+  contents: write           # required to upload release assets
+
+jobs:
+  static-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the libc-free static binary
+        uses: KarpelesLab/fullrust@master
+        with:
+          args: --release --bin myapp     # your binary
+
+      - name: Rename to include the target (optional, nicer asset name)
+        run: |
+          install -D target/x86_64-fullrust-linux/release/myapp \
+                     dist/myapp-${{ github.ref_name }}-x86_64-linux-static
+
+      - name: Attach to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/myapp-${{ github.ref_name }}-x86_64-linux-static
+```
+
+`softprops/action-gh-release` creates/updates the release for the tag and
+uploads the file; with the `release: published` trigger it attaches to the
+existing release instead. (Equivalent with the CLI:
+`gh release upload "$TAG" target/x86_64-fullrust-linux/release/myapp`.)
+
+The output path is `target/x86_64-fullrust-linux/release/<bin>` relative to the
+crate's workspace root (so if you set `working-directory:`, the binary still
+lands under that workspace's `target/`).
 
 ### Explicit-runtime crates: `--runtime`
 

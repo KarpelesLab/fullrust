@@ -8,7 +8,7 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: read
+  contents: write # upload-artifact needs read; attaching release assets needs write
 
 jobs:
   build:
@@ -44,8 +44,21 @@ jobs:
           ldd "$BIN" || true
           "$BIN"
 
-      - uses: actions/upload-artifact@v4
+      - name: Stage a nicely-named asset
+        run: |
+          install -D /tmp/demo/target/x86_64-fullrust-linux/release/demo \
+                     dist/demo-x86_64-linux-static
+
+      - name: Upload as a workflow artifact
+        uses: actions/upload-artifact@v4
         with:
           name: demo-x86_64-fullrust-linux
-          path: /tmp/demo/target/x86_64-fullrust-linux/release/demo
+          path: dist/demo-x86_64-linux-static
           if-no-files-found: error
+
+      # On a tag, also attach the static binary to the GitHub Release.
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/demo-x86_64-linux-static
