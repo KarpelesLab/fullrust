@@ -1,6 +1,6 @@
 [package]
 name = "fullrust-std"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "A pure-Rust, libc-free std replacement backed by fullrust syscalls. Alias as `std` on the freestanding target."
@@ -13,5 +13,5 @@ categories = ["no-std", "os::linux-apis"]
 # crates.io when fullrust-std is published; release-plz keeps it in sync.
 # default-features = false: pull only the mechanisms, not the binary-policy
 # symbols (those come from the user crate via entry!, or the sysroot std crate).
-fullrust = { path = "../fullrust", version = "0.1.0", default-features = false }
+fullrust = { path = "../fullrust", version = "0.1.1", default-features = false }
 hashbrown = { version = "0.15", default-features = false, features = ["default-hasher"] }
