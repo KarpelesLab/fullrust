@@ -1,0 +1,13 @@
+[package]
+name = "cargo-fullrust"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Cargo subcommand that builds crates as libc-free, fully-static binaries with the fullrust runtime."
+repository = "https://github.com/KarpelesLab/fullrust"
+keywords = ["cargo-subcommand", "no_std", "libc-free", "static", "freestanding"]
+categories = ["development-tools::cargo-plugins", "command-line-utilities"]
+
+[[bin]]
+name = "cargo-fullrust"
+path = "src/main.rs"

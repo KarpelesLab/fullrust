@@ -51,8 +51,42 @@ nightly toolchain with the `rust-src` component:
 rustup component add rust-src --toolchain nightly
 ```
 
-Build and run through the `./x` wrapper (it resolves the linker and selects the
-build strategy — see [Two build paths](#two-build-paths)):
+### Use it from any crate: `cargo fullrust`
+
+Install the cargo subcommand once, then build any crate that uses the fullrust
+runtime as a libc-free static binary — no manual target, linker, or `-Z` flags:
+
+```console
+cargo install cargo-fullrust          # from crates.io (or: cargo install --path crates/cargo-fullrust)
+
+# in your crate:
+cargo fullrust build --release        # nightly build-std (default), smallest binaries
+cargo fullrust run -- arg1 arg2
+cargo fullrust --stable build         # precompiled core/alloc instead
+```
+
+Your crate just needs the runtime and an entry point:
+
+```toml
+[dependencies]
+fullrust = "0.1"
+```
+```rust
+#![no_std]
+#![no_main]
+use fullrust::prelude::*;
+fn main() { println!("hello from libc-free rust"); }
+fullrust::entry!(main);
+```
+
+The default path needs a nightly toolchain with `rust-src`
+(`rustup component add rust-src --toolchain nightly`); `--stable` needs nothing
+extra. See [Two build paths](#two-build-paths) for the trade-offs.
+
+### Working inside this repo: `./x`
+
+The `./x` wrapper is the in-repo equivalent of `cargo fullrust` (it predates the
+subcommand and is what CI uses):
 
 ```console
 ./x build                      # all examples, stable path
@@ -62,7 +96,7 @@ build strategy — see [Two build paths](#two-build-paths)):
 ```
 
 Examples live in [`examples/`](examples/): `hello`, `args`, `alloc-demo`,
-`panic-demo`.
+`panic-demo`, `std-smoke`.
 
 ---
 
@@ -197,7 +231,8 @@ All CPU/ABI-specific code is confined to `arch/`. To port to, say, `aarch64`:
    (stack pointer arrives in `x0`/`sp`), and the `nr` table for that ABI.
 2. Wire it up with a `#[cfg(target_arch = "aarch64")]` arm in
    [`arch/mod.rs`](crates/fullrust/src/arch/mod.rs).
-3. Add a `targets/aarch64-fullrust-linux.json` for the nightly path.
+3. Add an `aarch64-fullrust-linux.json` target spec (next to the x86_64 one in
+   `crates/cargo-fullrust/`) for the nightly path.
 
 The rest of the crate is written against `arch::syscallN` and `arch::nr` only.
 
@@ -218,9 +253,10 @@ crates/fullrust/         the runtime
   src/rt.rs                Termination, exit/abort
   src/prelude.rs           glob import for programs
   src/lib.rs               crate root + entry!() macro
-examples/                hello, args, alloc-demo, panic-demo
-targets/                 custom freestanding target spec(s) for the nightly path
-x                        build wrapper (linker resolution + path selection)
+examples/                hello, args, alloc-demo, panic-demo, std-smoke
+crates/cargo-fullrust/   the `cargo fullrust` subcommand (+ the freestanding
+                           target spec it and ./x both use)
+x                        in-repo build wrapper (linker resolution + path selection)
 .cargo/config.toml       intentionally minimal — see ./x
 ```
 

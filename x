@@ -61,7 +61,7 @@ fi
 
 EXTRA=()
 if [ "$TOOLCHAIN" = nightly ]; then
-  TARGET="$HERE/targets/x86_64-fullrust-linux.json"
+  TARGET="$HERE/crates/cargo-fullrust/x86_64-fullrust-linux.json"
   ENVTRIPLE=X86_64_FULLRUST_LINUX
   # Most freestanding settings (relocation model, panic strategy, no unwind
   # tables) live in the target JSON, so only -static is needed here.

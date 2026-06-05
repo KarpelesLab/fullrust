@@ -3,6 +3,20 @@ resolver = "2"
 members = [
     "crates/fullrust",
     "crates/fullrust-std",
+    "crates/cargo-fullrust",
+    "examples/hello",
+    "examples/args",
+    "examples/alloc-demo",
+    "examples/panic-demo",
+    "examples/std-smoke",
+]
+# cargo-fullrust is a host tool (ordinary std binary); exclude it from the
+# default set so `./x build` / `cargo fullrust build` (freestanding target) don't
+# try to build it for a libc-free target. Build it with `cargo build -p
+# cargo-fullrust` or install it with `cargo install cargo-fullrust`.
+default-members = [
+    "crates/fullrust",
+    "crates/fullrust-std",
     "examples/hello",
     "examples/args",
     "examples/alloc-demo",

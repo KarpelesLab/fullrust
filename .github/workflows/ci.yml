@@ -31,7 +31,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -p fullrust -p fullrust-std -- -D warnings
+      - run: cargo clippy -p fullrust -p fullrust-std -p cargo-fullrust -- -D warnings
 
   build-stable:
     name: Build (stable, precompiled core/alloc)
@@ -69,3 +69,21 @@ jobs:
           # `args` exits with code = argc by design, and panic-demo aborts (134),
           # so they are built but not run here. std-smoke does live DNS/TCP
           # (flaky in CI), so it is built but run only locally.
+
+  cargo-subcommand:
+    name: cargo fullrust (end-to-end)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the cargo subcommand (host tool)
+        run: cargo build -p cargo-fullrust
+      - name: Use it to build an example, then run it
+        run: |
+          export PATH="$PWD/target/debug:$PATH"
+          cargo fullrust build -p hello
+          out=$(target/x86_64-fullrust-linux/debug/hello); echo "$out"
+          test "$out" = "hello from libc-free rust"
