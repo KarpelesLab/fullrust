@@ -46,11 +46,17 @@ pub enum IpAddr {
 }
 
 impl Ipv4Addr {
-    pub const LOCALHOST: Ipv4Addr = Ipv4Addr { octets: [127, 0, 0, 1] };
-    pub const UNSPECIFIED: Ipv4Addr = Ipv4Addr { octets: [0, 0, 0, 0] };
+    pub const LOCALHOST: Ipv4Addr = Ipv4Addr {
+        octets: [127, 0, 0, 1],
+    };
+    pub const UNSPECIFIED: Ipv4Addr = Ipv4Addr {
+        octets: [0, 0, 0, 0],
+    };
 
     pub const fn new(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
-        Ipv4Addr { octets: [a, b, c, d] }
+        Ipv4Addr {
+            octets: [a, b, c, d],
+        }
     }
     pub const fn octets(&self) -> [u8; 4] {
         self.octets
@@ -64,12 +70,18 @@ impl Ipv4Addr {
     /// Map this IPv4 address into the IPv4-mapped IPv6 space (`::ffff:a.b.c.d`).
     pub fn to_ipv6_mapped(&self) -> Ipv6Addr {
         let o = self.octets;
-        Ipv6Addr { octets: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, o[0], o[1], o[2], o[3]] }
+        Ipv6Addr {
+            octets: [
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, o[0], o[1], o[2], o[3],
+            ],
+        }
     }
 }
 
 impl Ipv6Addr {
-    pub const LOCALHOST: Ipv6Addr = Ipv6Addr { octets: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1] };
+    pub const LOCALHOST: Ipv6Addr = Ipv6Addr {
+        octets: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    };
     pub const UNSPECIFIED: Ipv6Addr = Ipv6Addr { octets: [0; 16] };
 
     pub const fn from_octets(octets: [u8; 16]) -> Ipv6Addr {
@@ -410,7 +422,11 @@ impl ToSocketAddrs for (&str, u16) {
     type Iter = alloc::vec::IntoIter<SocketAddr>;
     fn to_socket_addrs(&self) -> io::Result<Self::Iter> {
         let ips = dns::lookup_host(self.0)?;
-        Ok(ips.into_iter().map(|ip| SocketAddr::new(ip, self.1)).collect::<Vec<_>>().into_iter())
+        Ok(ips
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, self.1))
+            .collect::<Vec<_>>()
+            .into_iter())
     }
 }
 impl<T: ToSocketAddrs + ?Sized> ToSocketAddrs for &T {
@@ -426,9 +442,9 @@ fn resolve_str(s: &str) -> io::Result<alloc::vec::IntoIter<SocketAddr>> {
     }
     // "host:port" form — split off the port, resolve the host.
     let (host, port) = if let Some(rest) = s.strip_prefix('[') {
-        let (h, p) = rest.split_once("]:").ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "invalid socket address")
-        })?;
+        let (h, p) = rest
+            .split_once("]:")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket address"))?;
         (h, p)
     } else {
         s.rsplit_once(':')
@@ -438,7 +454,11 @@ fn resolve_str(s: &str) -> io::Result<alloc::vec::IntoIter<SocketAddr>> {
         .parse()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid port"))?;
     let ips = dns::lookup_host(host)?;
-    Ok(ips.into_iter().map(|ip| SocketAddr::new(ip, port)).collect::<Vec<_>>().into_iter())
+    Ok(ips
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect::<Vec<_>>()
+        .into_iter())
 }
 
 /// Minimal hostname resolution: IP literal → `/etc/hosts` → DNS over UDP.
@@ -458,8 +478,7 @@ mod dns {
                 return Ok(ips);
             }
         }
-        let server = resolv_conf_nameserver()
-            .unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 53)));
+        let server = resolv_conf_nameserver().unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 53)));
         let mut out = Vec::new();
         // A (IPv4) then AAAA (IPv6).
         if let Ok(mut v) = query(server, host, 1) {
@@ -469,7 +488,10 @@ mod dns {
             out.append(&mut v);
         }
         if out.is_empty() {
-            Err(io::Error::new(io::ErrorKind::NotFound, "name resolution failed"))
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "name resolution failed",
+            ))
         } else {
             Ok(out)
         }
@@ -529,7 +551,11 @@ mod dns {
         pkt.extend_from_slice(&qtype.to_be_bytes());
         pkt.extend_from_slice(&[0x00, 0x01]); // class IN
 
-        let bind = if server.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+        let bind = if server.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
         let sock = UdpSocket::bind(bind)?;
         sock.set_read_timeout(Some(crate::time::Duration::from_secs(5)))?;
         sock.send_to(&pkt, super::SocketAddr::new(server, 53))?;
@@ -566,7 +592,10 @@ mod dns {
             }
             if rtype == qtype && qtype == 1 && rdlen == 4 {
                 out.push(IpAddr::V4(Ipv4Addr::new(
-                    msg[pos], msg[pos + 1], msg[pos + 2], msg[pos + 3],
+                    msg[pos],
+                    msg[pos + 1],
+                    msg[pos + 2],
+                    msg[pos + 3],
                 )));
             } else if rtype == qtype && qtype == 28 && rdlen == 16 {
                 let mut o = [0u8; 16];
@@ -638,8 +667,14 @@ fn set_timeout(fd: RawFd, opt: usize, dur: Option<Duration>) -> io::Result<()> {
         tv_usec: i64,
     }
     let tv = match dur {
-        Some(d) => Timeval { tv_sec: d.as_secs() as i64, tv_usec: d.subsec_micros() as i64 },
-        None => Timeval { tv_sec: 0, tv_usec: 0 },
+        Some(d) => Timeval {
+            tv_sec: d.as_secs() as i64,
+            tv_usec: d.subsec_micros() as i64,
+        },
+        None => Timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
     };
     e(unsafe {
         sys::sc5(
@@ -724,7 +759,12 @@ fn getname(fd: RawFd, which: usize) -> io::Result<SocketAddr> {
     let mut sa = [0u8; 28];
     let mut len: u32 = 28;
     e(unsafe {
-        sys::sc3(which, fd as usize, sa.as_mut_ptr() as usize, &mut len as *mut _ as usize)
+        sys::sc3(
+            which,
+            fd as usize,
+            sa.as_mut_ptr() as usize,
+            &mut len as *mut _ as usize,
+        )
     })?;
     decode_sockaddr(&sa).ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))
 }
@@ -754,17 +794,38 @@ fn set_nonblocking(fd: RawFd, nb: bool) -> io::Result<()> {
 
 impl Read for TcpStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        e(unsafe { sys::sc3(sys::nr::READ, self.fd as usize, buf.as_mut_ptr() as usize, buf.len()) })
+        e(unsafe {
+            sys::sc3(
+                sys::nr::READ,
+                self.fd as usize,
+                buf.as_mut_ptr() as usize,
+                buf.len(),
+            )
+        })
     }
 }
 impl Read for &TcpStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        e(unsafe { sys::sc3(sys::nr::READ, self.fd as usize, buf.as_mut_ptr() as usize, buf.len()) })
+        e(unsafe {
+            sys::sc3(
+                sys::nr::READ,
+                self.fd as usize,
+                buf.as_mut_ptr() as usize,
+                buf.len(),
+            )
+        })
     }
 }
 impl Write for TcpStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        e(unsafe { sys::sc3(sys::nr::WRITE, self.fd as usize, buf.as_ptr() as usize, buf.len()) })
+        e(unsafe {
+            sys::sc3(
+                sys::nr::WRITE,
+                self.fd as usize,
+                buf.as_ptr() as usize,
+                buf.len(),
+            )
+        })
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
@@ -772,7 +833,14 @@ impl Write for TcpStream {
 }
 impl Write for &TcpStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        e(unsafe { sys::sc3(sys::nr::WRITE, self.fd as usize, buf.as_ptr() as usize, buf.len()) })
+        e(unsafe {
+            sys::sc3(
+                sys::nr::WRITE,
+                self.fd as usize,
+                buf.as_ptr() as usize,
+                buf.len(),
+            )
+        })
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
@@ -844,7 +912,8 @@ impl TcpListener {
                 SOCK_CLOEXEC,
             )
         })?;
-        let peer = decode_sockaddr(&sa).unwrap_or(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
+        let peer = decode_sockaddr(&sa)
+            .unwrap_or(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
         Ok((TcpStream { fd: fd as RawFd }, peer))
     }
 
@@ -901,17 +970,40 @@ impl UdpSocket {
         let addr = first_addr(addr)?;
         let mut sa = [0u8; 28];
         let len = encode_sockaddr(&addr, &mut sa);
-        e(unsafe { sys::sc3(sys::nr::CONNECT, self.fd as usize, sa.as_ptr() as usize, len) })
-            .map(|_| ())
+        e(unsafe {
+            sys::sc3(
+                sys::nr::CONNECT,
+                self.fd as usize,
+                sa.as_ptr() as usize,
+                len,
+            )
+        })
+        .map(|_| ())
     }
     pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
         e(unsafe {
-            sys::sc6(sys::nr::SENDTO, self.fd as usize, buf.as_ptr() as usize, buf.len(), 0, 0, 0)
+            sys::sc6(
+                sys::nr::SENDTO,
+                self.fd as usize,
+                buf.as_ptr() as usize,
+                buf.len(),
+                0,
+                0,
+                0,
+            )
         })
     }
     pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         e(unsafe {
-            sys::sc6(sys::nr::RECVFROM, self.fd as usize, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0)
+            sys::sc6(
+                sys::nr::RECVFROM,
+                self.fd as usize,
+                buf.as_mut_ptr() as usize,
+                buf.len(),
+                0,
+                0,
+                0,
+            )
         })
     }
     pub fn send_to<A: ToSocketAddrs>(&self, buf: &[u8], addr: A) -> io::Result<usize> {
@@ -944,7 +1036,8 @@ impl UdpSocket {
                 &mut len as *mut _ as usize,
             )
         })?;
-        let from = decode_sockaddr(&sa).unwrap_or(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
+        let from = decode_sockaddr(&sa)
+            .unwrap_or(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
         Ok((n, from))
     }
     pub fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {

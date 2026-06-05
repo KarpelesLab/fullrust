@@ -14,7 +14,10 @@ fn main() {
     }
     let start = Instant::now();
     let e = start.elapsed();
-    println!("instant elapsed = {} ns (monotonic ok if small)", e.as_nanos());
+    println!(
+        "instant elapsed = {} ns (monotonic ok if small)",
+        e.as_nanos()
+    );
 
     match ("one.one.one.one", 443u16).to_socket_addrs() {
         Ok(it) => {
@@ -32,7 +35,8 @@ fn main() {
     match TcpStream::connect(("example.com", 80u16)) {
         Ok(mut s) => {
             s.set_read_timeout(Some(Duration::from_secs(10))).ok();
-            s.write_all(b"GET / HTTP/1.0\r\nHost: example.com\r\n\r\n").unwrap();
+            s.write_all(b"GET / HTTP/1.0\r\nHost: example.com\r\n\r\n")
+                .unwrap();
             let mut buf = [0u8; 256];
             let n = s.read(&mut buf).unwrap_or(0);
             let text = core::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>");
@@ -69,7 +73,10 @@ fn main() {
     for t in ts {
         t.join().unwrap();
     }
-    println!("threads: shared counter = {} (expect 8000)", *counter.lock().unwrap());
+    println!(
+        "threads: shared counter = {} (expect 8000)",
+        *counter.lock().unwrap()
+    );
 }
 
 fullrust::entry!(main);

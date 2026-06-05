@@ -32,7 +32,9 @@ impl DoubleEndedIterator for Args {
 /// The process arguments (including argv[0]).
 pub fn args() -> Args {
     let v: Vec<String> = fullrust::env::args().map(|s| s.to_string()).collect();
-    Args { inner: v.into_iter() }
+    Args {
+        inner: v.into_iter(),
+    }
 }
 
 /// Error from [`var`].

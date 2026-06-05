@@ -57,7 +57,11 @@ impl Inner {
 
     /// Replace the bump region with a fresh `mmap` arena big enough for `min`.
     fn refill(&mut self, min: usize) -> bool {
-        let size = if ARENA >= min { ARENA } else { round_up(min, PAGE) };
+        let size = if ARENA >= min {
+            ARENA
+        } else {
+            round_up(min, PAGE)
+        };
         match syscall::mmap_anon(size, PROT_READ | PROT_WRITE) {
             Ok(p) => {
                 self.cur = p;

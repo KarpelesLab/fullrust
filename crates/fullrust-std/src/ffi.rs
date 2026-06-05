@@ -31,7 +31,9 @@ impl OsStr {
         &self.inner
     }
     pub fn to_os_string(&self) -> OsString {
-        OsString { inner: self.inner.to_owned() }
+        OsString {
+            inner: self.inner.to_owned(),
+        }
     }
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
@@ -43,7 +45,9 @@ impl OsStr {
 
 impl OsString {
     pub fn new() -> OsString {
-        OsString { inner: String::new() }
+        OsString {
+            inner: String::new(),
+        }
     }
     pub fn from<S: Into<String>>(s: S) -> OsString {
         OsString { inner: s.into() }
@@ -76,7 +80,9 @@ impl From<String> for OsString {
 }
 impl From<&str> for OsString {
     fn from(s: &str) -> OsString {
-        OsString { inner: s.to_owned() }
+        OsString {
+            inner: s.to_owned(),
+        }
     }
 }
 impl AsRef<OsStr> for OsStr {

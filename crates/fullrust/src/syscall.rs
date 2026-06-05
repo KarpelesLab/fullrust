@@ -102,9 +102,7 @@ pub unsafe fn munmap(addr: *mut u8, len: usize) -> Result<(), Errno> {
 /// Fill `buf` with random bytes from the kernel CSPRNG (`getrandom`).
 #[inline]
 pub fn getrandom(buf: &mut [u8]) -> Result<usize, Errno> {
-    from_ret(unsafe {
-        arch::syscall3(nr::GETRANDOM, buf.as_mut_ptr() as usize, buf.len(), 0)
-    })
+    from_ret(unsafe { arch::syscall3(nr::GETRANDOM, buf.as_mut_ptr() as usize, buf.len(), 0) })
 }
 
 /// Terminate the whole process (all threads) with `code`. Never returns.

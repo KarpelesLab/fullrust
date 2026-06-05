@@ -37,23 +37,27 @@ pub use alloc::{borrow, boxed, fmt, format, rc, string, vec};
 
 pub mod sync {
     //! Synchronization primitives.
+    pub use crate::sync_impl::{
+        Mutex, MutexGuard, Once, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
+    };
     pub use alloc::sync::{Arc, Weak};
     pub use core::sync::atomic;
-    pub use crate::sync_impl::{Mutex, MutexGuard, Once, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 }
 
 pub mod collections {
     //! Collections: ordered ones from `alloc`, hash ones from `hashbrown`.
-    pub use alloc::collections::{btree_map, btree_set, BTreeMap, BTreeSet, BinaryHeap, LinkedList, VecDeque};
-    pub use hashbrown::{HashMap, HashSet};
+    pub use alloc::collections::{
+        btree_map, btree_set, BTreeMap, BTreeSet, BinaryHeap, LinkedList, VecDeque,
+    };
     pub use hashbrown::hash_map;
     pub use hashbrown::hash_set;
+    pub use hashbrown::{HashMap, HashSet};
 }
 
 pub mod time {
     //! Time: `Duration` from `core`, plus syscall-backed clocks.
-    pub use core::time::Duration;
     pub use crate::time_impl::{Instant, SystemTime, SystemTimeError, UNIX_EPOCH};
+    pub use core::time::Duration;
 }
 
 // OS-backed modules implemented in this crate.

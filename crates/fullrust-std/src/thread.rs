@@ -23,7 +23,10 @@ pub fn sleep(dur: Duration) {
         tv_sec: i64,
         tv_nsec: i64,
     }
-    let ts = Timespec { tv_sec: dur.as_secs() as i64, tv_nsec: dur.subsec_nanos() as i64 };
+    let ts = Timespec {
+        tv_sec: dur.as_secs() as i64,
+        tv_nsec: dur.subsec_nanos() as i64,
+    };
     unsafe {
         let _ = sys::sc2(sys::nr::NANOSLEEP, &ts as *const _ as usize, 0);
     }
@@ -71,17 +74,17 @@ unsafe extern "C" fn fr_clone(
         "mov r9, r11",      // fn kept in r9 for the child
         "and rsi, -16",     // align child stack
         "sub rsi, 8",
-        "mov [rsi], rcx",   // push arg for the child to pop
-        "mov rax, 56",      // SYS_clone
+        "mov [rsi], rcx", // push arg for the child to pop
+        "mov rax, 56",    // SYS_clone
         "syscall",
         "test rax, rax",
-        "jnz 2f",           // parent -> return tid
+        "jnz 2f", // parent -> return tid
         // child:
         "xor ebp, ebp",
-        "pop rdi",          // arg
-        "call r9",          // fn(arg)
-        "mov rdi, rax",     // exit code = fn's return
-        "mov rax, 60",      // SYS_exit
+        "pop rdi",      // arg
+        "call r9",      // fn(arg)
+        "mov rdi, rax", // exit code = fn's return
+        "mov rax, 60",  // SYS_exit
         "syscall",
         "2:",
         "ret",
@@ -119,7 +122,13 @@ where
 fn futex_wait(addr: &AtomicI32, expected: i32) {
     unsafe {
         // futex(uaddr, FUTEX_WAIT=0, val, timeout=NULL)
-        let _ = sys::sc4(sys::nr::FUTEX, addr as *const _ as usize, 0, expected as usize, 0);
+        let _ = sys::sc4(
+            sys::nr::FUTEX,
+            addr as *const _ as usize,
+            0,
+            expected as usize,
+            0,
+        );
     }
 }
 
@@ -217,7 +226,10 @@ impl Builder {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        let shared = Arc::new(Shared { result: UnsafeCell::new(None), ctid: AtomicI32::new(0) });
+        let shared = Arc::new(Shared {
+            result: UnsafeCell::new(None),
+            ctid: AtomicI32::new(0),
+        });
         let stack_size = self.stack_size.unwrap_or(STACK_SIZE);
 
         // Allocate the child stack.
@@ -227,7 +239,10 @@ impl Builder {
         };
         let top = stack.wrapping_add(stack_size);
 
-        let payload = Box::new(Payload { f, shared: shared.clone() });
+        let payload = Box::new(Payload {
+            f,
+            shared: shared.clone(),
+        });
         let arg = Box::into_raw(payload) as *mut u8;
 
         let flags = CLONE_VM
@@ -261,7 +276,12 @@ impl Builder {
             return run_inline(payload.f, shared);
         }
 
-        Ok(JoinHandle { shared, stack, stack_size, inline: false })
+        Ok(JoinHandle {
+            shared,
+            stack,
+            stack_size,
+            inline: false,
+        })
     }
 }
 
@@ -273,7 +293,12 @@ where
     unsafe {
         *shared.result.get() = Some(res);
     }
-    Ok(JoinHandle { shared, stack: core::ptr::null_mut(), stack_size: 0, inline: true })
+    Ok(JoinHandle {
+        shared,
+        stack: core::ptr::null_mut(),
+        stack_size: 0,
+        inline: true,
+    })
 }
 
 // ---- thread-local storage (single-slot shim) ----
@@ -289,7 +314,10 @@ unsafe impl<T: 'static> Sync for LocalKey<T> {}
 impl<T: 'static> LocalKey<T> {
     #[doc(hidden)]
     pub const fn new(init: fn() -> T) -> LocalKey<T> {
-        LocalKey { init, slot: UnsafeCell::new(None) }
+        LocalKey {
+            init,
+            slot: UnsafeCell::new(None),
+        }
     }
 
     pub fn with<F, R>(&'static self, f: F) -> R

@@ -152,7 +152,11 @@ impl File {
         OpenOptions::new().read(true).open(path)
     }
     pub fn create<P: AsRef<Path>>(path: P) -> io::Result<File> {
-        OpenOptions::new().write(true).create(true).truncate(true).open(path)
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
     }
     pub fn metadata(&self) -> io::Result<Metadata> {
         let mut s = Stat::default();
@@ -176,10 +180,24 @@ impl File {
 }
 
 fn do_read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
-    e(unsafe { sys::sc3(sys::nr::READ, fd as usize, buf.as_mut_ptr() as usize, buf.len()) })
+    e(unsafe {
+        sys::sc3(
+            sys::nr::READ,
+            fd as usize,
+            buf.as_mut_ptr() as usize,
+            buf.len(),
+        )
+    })
 }
 fn do_write(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
-    e(unsafe { sys::sc3(sys::nr::WRITE, fd as usize, buf.as_ptr() as usize, buf.len()) })
+    e(unsafe {
+        sys::sc3(
+            sys::nr::WRITE,
+            fd as usize,
+            buf.as_ptr() as usize,
+            buf.len(),
+        )
+    })
 }
 fn do_seek(fd: RawFd, pos: SeekFrom) -> io::Result<u64> {
     let (whence, off): (usize, i64) = match pos {
@@ -380,14 +398,26 @@ pub fn write<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> io::Result
 
 pub fn remove_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
     let c = cstr(&path)?;
-    e(unsafe { sys::sc3(sys::nr::UNLINKAT, sys::AT_FDCWD as usize, c.as_ptr() as usize, 0) })
-        .map(|_| ())
+    e(unsafe {
+        sys::sc3(
+            sys::nr::UNLINKAT,
+            sys::AT_FDCWD as usize,
+            c.as_ptr() as usize,
+            0,
+        )
+    })
+    .map(|_| ())
 }
 
 pub fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
     let c = cstr(&path)?;
     e(unsafe {
-        sys::sc3(sys::nr::MKDIRAT, sys::AT_FDCWD as usize, c.as_ptr() as usize, 0o777)
+        sys::sc3(
+            sys::nr::MKDIRAT,
+            sys::AT_FDCWD as usize,
+            c.as_ptr() as usize,
+            0o777,
+        )
     })
     .map(|_| ())
 }
@@ -467,7 +497,12 @@ pub fn remove_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()> {
     let mut buf = [0u8; 4096];
     loop {
         let n = e(unsafe {
-            sys::sc3(sys::nr::GETDENTS64, dirfd as usize, buf.as_mut_ptr() as usize, buf.len())
+            sys::sc3(
+                sys::nr::GETDENTS64,
+                dirfd as usize,
+                buf.as_mut_ptr() as usize,
+                buf.len(),
+            )
         })?;
         if n == 0 {
             break;

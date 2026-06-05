@@ -108,7 +108,14 @@ pub unsafe fn sc4(n: usize, a: usize, b: usize, c: usize, d: usize) -> Result<us
     r(syscall4(n, a, b, c, d))
 }
 #[inline]
-pub unsafe fn sc5(n: usize, a: usize, b: usize, c: usize, d: usize, e: usize) -> Result<usize, Errno> {
+pub unsafe fn sc5(
+    n: usize,
+    a: usize,
+    b: usize,
+    c: usize,
+    d: usize,
+    e: usize,
+) -> Result<usize, Errno> {
     r(syscall5(n, a, b, c, d, e))
 }
 #[inline]

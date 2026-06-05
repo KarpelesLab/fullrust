@@ -13,7 +13,10 @@ struct Timespec {
 }
 
 fn clock_gettime(which: usize) -> Duration {
-    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     unsafe {
         let _ = sys::sc2(sys::nr::CLOCK_GETTIME, which, &mut ts as *mut _ as usize);
     }

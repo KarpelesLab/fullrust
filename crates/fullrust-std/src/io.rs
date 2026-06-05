@@ -258,7 +258,10 @@ pub trait Write {
                 }
             }
         }
-        let mut a = Adapter { inner: self, error: Ok(()) };
+        let mut a = Adapter {
+            inner: self,
+            error: Ok(()),
+        };
         match fmt::write(&mut a, args) {
             Ok(()) => Ok(()),
             Err(_) => a.error,
@@ -443,7 +446,12 @@ impl<R: Read> BufReader<R> {
         Self::with_capacity(8192, inner)
     }
     pub fn with_capacity(cap: usize, inner: R) -> BufReader<R> {
-        BufReader { inner, buf: alloc::vec![0; cap], pos: 0, cap: 0 }
+        BufReader {
+            inner,
+            buf: alloc::vec![0; cap],
+            pos: 0,
+            cap: 0,
+        }
     }
     pub fn get_ref(&self) -> &R {
         &self.inner
@@ -491,7 +499,10 @@ pub struct BufWriter<W: Write> {
 
 impl<W: Write> BufWriter<W> {
     pub fn new(inner: W) -> BufWriter<W> {
-        BufWriter { inner: Some(inner), buf: Vec::with_capacity(8192) }
+        BufWriter {
+            inner: Some(inner),
+            buf: Vec::with_capacity(8192),
+        }
     }
     pub fn get_ref(&self) -> &W {
         self.inner.as_ref().unwrap()
@@ -542,10 +553,24 @@ impl<W: Write> Drop for BufWriter<W> {
 // ---- standard streams ----
 
 fn fd_read(fd: i32, buf: &mut [u8]) -> Result<usize> {
-    cvt(unsafe { sys::sc3(sys::nr::READ, fd as usize, buf.as_mut_ptr() as usize, buf.len()) })
+    cvt(unsafe {
+        sys::sc3(
+            sys::nr::READ,
+            fd as usize,
+            buf.as_mut_ptr() as usize,
+            buf.len(),
+        )
+    })
 }
 fn fd_write(fd: i32, buf: &[u8]) -> Result<usize> {
-    cvt(unsafe { sys::sc3(sys::nr::WRITE, fd as usize, buf.as_ptr() as usize, buf.len()) })
+    cvt(unsafe {
+        sys::sc3(
+            sys::nr::WRITE,
+            fd as usize,
+            buf.as_ptr() as usize,
+            buf.len(),
+        )
+    })
 }
 
 pub struct Stdin;
@@ -608,7 +633,15 @@ pub trait IsTerminal {
 fn isatty(fd: i32) -> bool {
     // ioctl(fd, TCGETS, &termios) succeeds only for terminals.
     let mut termios = [0u8; 64];
-    unsafe { sys::sc3(sys::nr::IOCTL, fd as usize, 0x5401, termios.as_mut_ptr() as usize).is_ok() }
+    unsafe {
+        sys::sc3(
+            sys::nr::IOCTL,
+            fd as usize,
+            0x5401,
+            termios.as_mut_ptr() as usize,
+        )
+        .is_ok()
+    }
 }
 
 impl IsTerminal for Stdin {

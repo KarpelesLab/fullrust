@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy (library crates)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p fullrust -p fullrust-std -- -D warnings
+
+  build-stable:
+    name: Build (stable, precompiled core/alloc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build all examples (libc-free static)
+        run: ./x build
+      - name: Run hello and assert it is libc-free
+        run: |
+          BIN=target/x86_64-unknown-linux-gnu/debug/hello
+          out=$("$BIN"); echo "$out"
+          test "$out" = "hello from libc-free rust"
+          ldd "$BIN" 2>&1 | grep -q "not a dynamic executable"
+          test "$(readelf -d "$BIN" 2>/dev/null | grep -c NEEDED)" -eq 0
+
+  build-nightly:
+    name: Build (nightly, build-std)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: Build all examples (build-std, release)
+        run: ./x build --nightly --release
+      - name: Run offline examples
+        run: |
+          B=target/x86_64-fullrust-linux/release
+          ./$B/hello
+          ./$B/alloc-demo
+          # `args` exits with code = argc by design, and panic-demo aborts (134),
+          # so they are built but not run here. std-smoke does live DNS/TCP
+          # (flaky in CI), so it is built but run only locally.

@@ -58,22 +58,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "purecrypto"
-version = "0.6.2"
-dependencies = [
- "fullrust",
- "fullrust-std",
-]
-
-[[package]]
-name = "purecrypto-sha256"
-version = "0.1.0"
-dependencies = [
- "fullrust",
- "purecrypto",
-]
-
-[[package]]
 name = "std-smoke"
 version = "0.1.0"
 dependencies = [

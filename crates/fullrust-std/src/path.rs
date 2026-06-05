@@ -32,7 +32,9 @@ impl Path {
         OsStr::new(&self.inner)
     }
     pub fn to_path_buf(&self) -> PathBuf {
-        PathBuf { inner: self.inner.to_owned() }
+        PathBuf {
+            inner: self.inner.to_owned(),
+        }
     }
     pub fn display(&self) -> &str {
         &self.inner
@@ -44,10 +46,14 @@ impl Path {
         crate::fs::metadata(self).is_ok()
     }
     pub fn is_file(&self) -> bool {
-        crate::fs::metadata(self).map(|m| m.is_file()).unwrap_or(false)
+        crate::fs::metadata(self)
+            .map(|m| m.is_file())
+            .unwrap_or(false)
     }
     pub fn is_dir(&self) -> bool {
-        crate::fs::metadata(self).map(|m| m.is_dir()).unwrap_or(false)
+        crate::fs::metadata(self)
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
     }
     pub fn file_name(&self) -> Option<&OsStr> {
         let s = self.inner.trim_end_matches('/');
@@ -84,7 +90,9 @@ impl Path {
 
 impl PathBuf {
     pub fn new() -> PathBuf {
-        PathBuf { inner: String::new() }
+        PathBuf {
+            inner: String::new(),
+        }
     }
     pub fn from<S: Into<String>>(s: S) -> PathBuf {
         PathBuf { inner: s.into() }
@@ -165,7 +173,9 @@ impl From<String> for PathBuf {
 }
 impl From<&str> for PathBuf {
     fn from(s: &str) -> PathBuf {
-        PathBuf { inner: s.to_owned() }
+        PathBuf {
+            inner: s.to_owned(),
+        }
     }
 }
 impl From<&Path> for PathBuf {

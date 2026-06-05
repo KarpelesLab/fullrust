@@ -7,7 +7,6 @@ members = [
     "examples/args",
     "examples/alloc-demo",
     "examples/panic-demo",
-    "examples/purecrypto-sha256",
     "examples/std-smoke",
 ]
 

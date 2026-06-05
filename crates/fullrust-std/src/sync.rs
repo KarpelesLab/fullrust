@@ -62,7 +62,10 @@ pub struct MutexGuard<'a, T: ?Sized + 'a> {
 
 impl<T> Mutex<T> {
     pub const fn new(t: T) -> Mutex<T> {
-        Mutex { locked: AtomicUsize::new(0), data: UnsafeCell::new(t) }
+        Mutex {
+            locked: AtomicUsize::new(0),
+            data: UnsafeCell::new(t),
+        }
     }
     pub fn into_inner(self) -> LockResult<T> {
         Ok(self.data.into_inner())
@@ -140,7 +143,10 @@ pub struct RwLockWriteGuard<'a, T: ?Sized + 'a> {
 
 impl<T> RwLock<T> {
     pub const fn new(t: T) -> RwLock<T> {
-        RwLock { state: AtomicUsize::new(0), data: UnsafeCell::new(t) }
+        RwLock {
+            state: AtomicUsize::new(0),
+            data: UnsafeCell::new(t),
+        }
     }
     pub fn into_inner(self) -> LockResult<T> {
         Ok(self.data.into_inner())
@@ -217,7 +223,9 @@ pub struct Once {
 
 impl Once {
     pub const fn new() -> Once {
-        Once { state: AtomicUsize::new(INCOMPLETE) }
+        Once {
+            state: AtomicUsize::new(INCOMPLETE),
+        }
     }
     pub fn is_completed(&self) -> bool {
         self.state.load(Ordering::Acquire) == COMPLETE
@@ -261,7 +269,10 @@ unsafe impl<T: Send> Send for OnceLock<T> {}
 
 impl<T> OnceLock<T> {
     pub const fn new() -> OnceLock<T> {
-        OnceLock { once: Once::new(), value: UnsafeCell::new(None) }
+        OnceLock {
+            once: Once::new(),
+            value: UnsafeCell::new(None),
+        }
     }
     pub fn get(&self) -> Option<&T> {
         if self.once.is_completed() {
