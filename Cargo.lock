@@ -59,7 +59,7 @@ dependencies = [
 
 [[package]]
 name = "purecrypto"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "fullrust",
  "fullrust-std",

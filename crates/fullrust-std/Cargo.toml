@@ -4,7 +4,12 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "A pure-Rust, libc-free std replacement backed by fullrust syscalls. Alias as `std` on the freestanding target."
+repository = "https://github.com/KarpelesLab/fullrust"
+keywords = ["no_std", "libc-free", "std", "freestanding", "syscall"]
+categories = ["no-std", "os::linux-apis"]
 
 [dependencies]
-fullrust = { path = "../fullrust" }
+# `version` is required alongside `path` so this dependency resolves from
+# crates.io when fullrust-std is published; release-plz keeps it in sync.
+fullrust = { path = "../fullrust", version = "0.1.0" }
 hashbrown = { version = "0.15", default-features = false, features = ["default-hasher"] }

@@ -4,3 +4,6 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "A libc-free, fully-static, pure-Rust runtime: std-lite on raw Linux syscalls."
+repository = "https://github.com/KarpelesLab/fullrust"
+keywords = ["no_std", "libc-free", "freestanding", "static", "syscall"]
+categories = ["no-std", "os::linux-apis"]
