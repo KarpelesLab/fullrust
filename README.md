@@ -12,27 +12,30 @@ kernel directly through raw `syscall` instructions (see
 linked with the Rust-bundled LLVM linker, so **no C toolchain is involved** in
 the build.
 
-```rust
-#![no_std]
-#![no_main]
+An ordinary crate — **no fullrust dependency, no attributes, plain `fn main`** —
+builds into a libc-free static binary:
 
-use fullrust::prelude::*;
+```rust
+// src/main.rs
+use std::collections::BTreeMap;
 
 fn main() {
-    println!("hello from libc-free rust");
+    let mut counts = BTreeMap::new();
+    for w in "the quick brown fox the fox".split_whitespace() {
+        *counts.entry(w).or_insert(0) += 1;
+    }
+    println!("{counts:?}");
 }
-fullrust::entry!(main);
 ```
 
 ```console
-$ ./x run -p hello
-hello from libc-free rust
-
-$ file target/x86_64-unknown-linux-gnu/debug/hello
+$ cargo install cargo-fullrust
+$ cargo fullrust build --release
+$ file    target/x86_64-fullrust-linux/release/wordcount
 ELF 64-bit LSB executable, x86-64, statically linked
-$ ldd  target/x86_64-unknown-linux-gnu/debug/hello
+$ ldd     target/x86_64-fullrust-linux/release/wordcount
         not a dynamic executable
-$ readelf -d target/x86_64-unknown-linux-gnu/debug/hello
+$ readelf -d target/x86_64-fullrust-linux/release/wordcount
 There is no dynamic section in this file.
 ```
 
@@ -47,10 +50,11 @@ link time**. Pure-Rust code links; anything reaching for libc does not.
 
 ## Quick start
 
-You need a recent stable Rust toolchain. The nightly path additionally needs a
-nightly toolchain with the `rust-src` component:
+The default (zero-touch) path needs a nightly toolchain with `rust-src`; the
+`--stable` explicit-runtime path needs only stable:
 
 ```console
+rustup toolchain install nightly
 rustup component add rust-src --toolchain nightly
 ```
 
@@ -221,12 +225,20 @@ rsp ->  argc
 
 There is no return address. fullrust defines `_start` as a *naked* function
 (no prologue/epilogue) that captures `rsp`, aligns the stack as the SysV ABI
-requires, and calls into Rust — see
-[`arch/x86_64.rs`](crates/fullrust/src/arch/x86_64.rs). The Rust bootstrap in
-[`start.rs`](crates/fullrust/src/start.rs) parses `argc`/`argv`/`envp`, then
-calls your `main` (exported as `__fullrust_main` by the
-[`entry!`](crates/fullrust/src/lib.rs) macro) and finally `exit_group`s with the
-returned code.
+requires, parses `argc`/`argv`/`envp`, and calls `main` — see
+[`arch/x86_64.rs`](crates/fullrust/src/arch/x86_64.rs) and
+[`start.rs`](crates/fullrust/src/start.rs).
+
+There are two ways `main` gets wired up:
+
+* **Zero-touch (default).** The sysroot `std` provides the `start` lang item, so
+  an ordinary `fn main` links exactly as it would under real std — the
+  compiler-generated entry calls our `lang_start`.
+* **`--runtime`.** A `no_std` crate exports its `main` as `__fullrust_main` via
+  the [`entry!`](crates/fullrust/src/lib.rs) macro, which `_start` calls
+  directly.
+
+Either way the process ends with `exit_group`.
 
 ### 2. Syscalls instead of libc
 
@@ -254,21 +266,27 @@ fullrust supplies them in [`intrinsics.rs`](crates/fullrust/src/intrinsics.rs):
 
 ### 4. A heap (`alloc`)
 
-To get `Box`, `Vec`, `String` and `format!`, fullrust installs a
+To get `Box`, `Vec`, `String` and `format!`, fullrust provides a
 `#[global_allocator]`: a small **mmap-backed segregated free-list** allocator
 (see [`allocator.rs`](crates/fullrust/src/allocator.rs)). Requests up to 64 KiB
 are rounded to a size class and served from per-class free lists carved out of
 1 MiB `mmap` arenas; larger requests get their own `mmap`/`munmap`. It is
-`Sync` via a spinlock (fullrust programs are single-threaded, so it is
-effectively uncontended).
+`Sync` via a spinlock guarding the arena state.
 
 ### 5. Panics
 
-A `no_std` crate must define exactly one `#[panic_handler]`. fullrust's
+The binary needs exactly one `#[panic_handler]`. fullrust's
 (in [`panic.rs`](crates/fullrust/src/panic.rs)) prints the message and source
 location to stderr and calls `exit_group(134)` (mimicking `128 + SIGABRT`).
 Because we compile with `panic = "abort"`, panicking never unwinds, so the
 unwind stubs from (3) are never reached.
+
+> The binary-policy symbols — `_start`, the `#[panic_handler]`, and the
+> `#[global_allocator]` static — are gated behind fullrust's default `rt`
+> feature. The `--runtime`/`entry!` model leaves `rt` on so they come from
+> `fullrust`; the zero-touch sysroot `std` turns `rt` off and supplies them
+> itself (you can only have one of each per binary). The *mechanisms* — the
+> syscalls, the `Allocator` type, the mem intrinsics — are always present.
 
 ### 6. Linking with no C runtime
 
@@ -282,23 +300,20 @@ why `./x` points at the `gcc-ld/ld.lld` shim.)
 
 ---
 
-## Two build paths
+## Build modes
 
-The same source compiles two ways. `./x` picks one; they use **different target
-triples** so the freestanding linker flags never touch host build scripts.
+`cargo fullrust` has three ways to produce a binary; all are genuinely libc-free
+and fully static.
 
-| | `--stable` (default) | `--nightly` |
-|---|---|---|
-| Toolchain | stable | nightly + `rust-src` |
-| `core`/`alloc` | precompiled, from the sysroot | recompiled from source (`-Z build-std`) |
-| Target triple | `x86_64-unknown-linux-gnu` | `x86_64-fullrust-linux` (custom JSON) |
-| Unwinding | precompiled `alloc` carries unwind tables (unused under `panic=abort`); our abort-stubs satisfy the references | none emitted at all |
-| `mem*` intrinsics | supplied by `fullrust` | supplied by `fullrust` |
-| Binary size | small (release strips the unused tables); larger in debug | smallest |
-| Best for | zero extra setup, works anywhere stable does | minimal binaries |
+| Mode | Crate looks like | Toolchain | How |
+|---|---|---|---|
+| **zero-touch** (default) | unmodified `fn main`, `use std`, no deps | nightly + `rust-src` | sysroot whose `std` is fullrust's, built once and cached; your crate compiles with `--sysroot` |
+| **`--runtime`** | `#![no_std]` + `fullrust::entry!` | nightly + `rust-src` | `-Z build-std` recompiles core/alloc; `fullrust` supplies the runtime |
+| **`--stable`** | `#![no_std]` + `fullrust::entry!` | stable | precompiled core/alloc from the sysroot; our abort-stubs satisfy `alloc`'s unwind references |
 
-Both produce genuinely libc-free static binaries. On a release build a trivial
-program is well under 10 KiB either way.
+The `--runtime`/`--stable` paths use a **different target triple per path** so
+the freestanding linker flags never touch host build scripts (`./x` mirrors this
+in-repo). On a release build a trivial program is well under 10 KiB.
 
 ### Why a custom target on nightly?
 
@@ -356,9 +371,13 @@ crates/fullrust/         the runtime
 crates/fullrust-std/     the standard library (own-std, on syscalls)
   src/{io,fs,net,time,env,process,thread,sync,...}.rs
                            std-shaped modules backed by fullrust syscalls
-examples/                hello, args, alloc-demo, panic-demo, std-smoke
-crates/cargo-fullrust/   the `cargo fullrust` subcommand (+ the freestanding
-                           target spec it and ./x both use)
+crates/cargo-fullrust/   the `cargo fullrust` subcommand
+  src/main.rs              builds/caches the sysroot, drives cargo
+  sysroot/std_lib.rs       the sysroot `std` (re-exports fullrust-std + policy)
+  x86_64-fullrust-linux.json   freestanding target spec (cargo-fullrust + ./x)
+examples/                hello, args, alloc-demo, panic-demo, std-smoke (entry!);
+                           plain (zero-touch demo: ordinary crate, no fullrust dep)
+action.yml               reusable GitHub Action (build static artifacts in CI)
 x                        in-repo build wrapper (linker resolution + path selection)
 .cargo/config.toml       intentionally minimal — see ./x
 ```
