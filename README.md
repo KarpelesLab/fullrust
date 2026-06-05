@@ -122,7 +122,7 @@ jobs:
   static-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Build the libc-free static binary
         uses: KarpelesLab/fullrust@master
