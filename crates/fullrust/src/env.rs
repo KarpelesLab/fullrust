@@ -16,10 +16,25 @@ static ENVP: AtomicPtr<*const u8> = AtomicPtr::new(core::ptr::null_mut());
 /// # Safety
 /// Must be called exactly once, from the bootstrap, with valid `argv`/`envp`
 /// arrays as laid out by the kernel.
-pub(crate) unsafe fn init(argc: usize, argv: *const *const u8, envp: *const *const u8) {
+pub unsafe fn init(argc: usize, argv: *const *const u8, envp: *const *const u8) {
     ARGC.store(argc, Ordering::Relaxed);
     ARGV.store(argv as *mut *const u8, Ordering::Relaxed);
     ENVP.store(envp as *mut *const u8, Ordering::Relaxed);
+}
+
+/// Parse the kernel-provided initial stack (pointer to `argc`) and record the
+/// argument/environment pointers. Returns `(argc, argv)` for handing to a C-ABI
+/// `main`. Used by the `entry!` bootstrap and the sysroot `std`.
+///
+/// # Safety
+/// `stack` must be the initial stack pointer as supplied by the kernel.
+pub unsafe fn init_from_stack(stack: *const usize) -> (isize, *const *const u8) {
+    let argc = *stack;
+    let argv = stack.add(1) as *const *const u8;
+    // envp begins one slot past argv's NULL terminator.
+    let envp = stack.add(1 + argc + 1) as *const *const u8;
+    init(argc, argv, envp);
+    (argc as isize, argv)
 }
 
 /// Number of command-line arguments (including the program name).

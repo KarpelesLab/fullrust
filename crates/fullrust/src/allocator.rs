@@ -192,5 +192,6 @@ unsafe impl GlobalAlloc for Allocator {
     }
 }
 
+#[cfg(feature = "rt")]
 #[global_allocator]
 static GLOBAL: Allocator = Allocator::new();

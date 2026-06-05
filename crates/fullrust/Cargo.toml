@@ -7,3 +7,11 @@ description = "A libc-free, fully-static, pure-Rust runtime: std-lite on raw Lin
 repository = "https://github.com/KarpelesLab/fullrust"
 keywords = ["no_std", "libc-free", "freestanding", "static", "syscall"]
 categories = ["no-std", "os::linux-apis"]
+
+[features]
+# `rt` provides the binary-level policy symbols: `_start`, the `#[panic_handler]`,
+# the `#[global_allocator]` static, and the `__fullrust_main` entry glue. It is
+# on by default (the `entry!` model). Turn it off (`default-features = false`)
+# when another crate — e.g. the sysroot `std` — supplies those itself.
+default = ["rt"]
+rt = []

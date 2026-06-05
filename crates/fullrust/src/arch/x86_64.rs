@@ -11,7 +11,9 @@
 //! NULL, and finally the auxiliary vector. There is no return address and no
 //! C runtime: `_start` must never return.
 
-use core::arch::{asm, naked_asm};
+use core::arch::asm;
+#[cfg(feature = "rt")]
+use core::arch::naked_asm;
 
 macro_rules! syscall_fn {
     ($name:ident; $($arg:ident => $reg:tt),*) => {
@@ -49,6 +51,7 @@ syscall_fn!(syscall6; a => "rdi", b => "rsi", c => "rdx", d => "r10", e => "r8",
 /// It captures the initial stack pointer (which points at `argc`), aligns the
 /// stack to 16 bytes as the SysV ABI requires before a `call`, and hands off to
 /// the Rust-level [`crate::start::rust_start`], which never returns.
+#[cfg(feature = "rt")]
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {

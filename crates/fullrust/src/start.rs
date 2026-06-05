@@ -21,12 +21,7 @@ extern "C" {
 /// # Safety
 /// `stack` must be the initial stack pointer as supplied by the kernel.
 pub(crate) unsafe extern "C" fn rust_start(stack: *const usize) -> ! {
-    let argc = *stack;
-    let argv = stack.add(1) as *const *const u8;
-    // envp begins one slot past argv's NULL terminator.
-    let envp = stack.add(1 + argc + 1) as *const *const u8;
-
-    env::init(argc, argv, envp);
+    let _ = env::init_from_stack(stack);
 
     let code = __fullrust_main();
     syscall::exit_group(code);

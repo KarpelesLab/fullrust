@@ -76,7 +76,16 @@ pub mod syscall;
 
 mod allocator;
 mod intrinsics;
+
+// Binary-level *policy* symbols (`_start`, `#[panic_handler]`, the
+// `#[global_allocator]` static, the `__fullrust_main` entry glue). Exactly one
+// crate in the final binary may define each of these, so they live behind the
+// default `rt` feature. The `entry!` model keeps `rt` on; the sysroot `std`
+// crate turns it off and supplies its own policy. The *mechanisms* (syscalls,
+// the `Allocator` type, mem intrinsics, io/env/rt helpers) are always available.
+#[cfg(feature = "rt")]
 mod panic;
+#[cfg(feature = "rt")]
 mod start;
 
 pub use allocator::Allocator;
