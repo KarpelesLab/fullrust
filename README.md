@@ -2,11 +2,14 @@
 
 **Fully-static, libc-free, pure-Rust Linux binaries.**
 
-`fullrust` is a `no_std` runtime plus its own standard library
-([`fullrust-std`](crates/fullrust-std/)) that let you write ordinary-looking Rust
-programs — with `println!`, `Vec`, `String`, `format!`, command-line arguments,
-files, threads and sockets — and compile them into Linux ELF executables that
-link **no libc and no C runtime at all**. Like the Go runtime, it talks to the
+`fullrust` is the `no_std` runtime that pairs with
+[`purestd`](https://github.com/KarpelesLab/purestd) — a libc-free standard
+library on raw syscalls — to let you write ordinary-looking Rust programs (with
+`println!`, `Vec`, `String`, `format!`, command-line arguments, files, threads)
+and compile them into Linux ELF executables that link **no libc and no C runtime
+at all**. fullrust itself is small: it provides only what a hosted build gets
+from crt0 and compiler_builtins — the process entry point and the `mem*`/unwind
+symbols — while purestd is the standard library. Like the Go runtime, it talks to the
 kernel directly through raw `syscall` instructions (see
 [Why a standalone `std`](#why-a-standalone-std-the-go-no-cgo-model)), and is
 linked with the Rust-bundled LLVM linker, so **no C toolchain is involved** in
@@ -86,8 +89,8 @@ own standard library**, then compiles your crate against it. Your `use std::…`
 resolves to the syscall-backed std, and the binary links no libc. Needs a
 nightly toolchain with `rust-src`
 (`rustup component add rust-src --toolchain nightly`). Coverage is whatever
-[`fullrust-std`](crates/fullrust-std/) implements — gaps surface as ordinary
-"not found in `std`" errors as the stdlib grows.
+[`purestd`](https://github.com/KarpelesLab/purestd) implements — gaps surface as
+ordinary "not found in `std`" errors as the stdlib grows.
 
 ### GitHub Action
 
@@ -192,9 +195,10 @@ Examples live in [`examples/`](examples/): `hello`, `args`, `alloc-demo`,
 
 ## Why a standalone `std` (the Go "no cgo" model)
 
-fullrust ships **its own standard library** — [`fullrust-std`](crates/fullrust-std/) —
-implemented directly on Linux syscalls, instead of reusing the platform libc or
-the upstream `std` that sits on top of it. This is the same architecture as the
+fullrust pairs with **a standalone standard library** —
+[`purestd`](https://github.com/KarpelesLab/purestd) — implemented directly on
+Linux syscalls, instead of reusing the platform libc or the upstream `std` that
+sits on top of it. This is the same architecture as the
 **Go runtime**: Go issues syscalls itself and only touches libc when you opt into
 cgo. fullrust is, in effect, *Rust with cgo off* — programs are written against
 fullrust's std, and the binary's only boundary to the outside world is the
@@ -404,27 +408,19 @@ The rest of the crate is written against `arch::syscallN` and `arch::nr` only.
 ## Layout
 
 ```
-crates/fullrust/         the runtime
-  src/arch/x86_64.rs       syscall asm, naked _start, syscall numbers  (only arch-specific file)
-  src/syscall.rs           arch-neutral Result-returning syscall wrappers
-  src/start.rs             argc/argv/envp parsing -> user main -> exit
-  src/intrinsics.rs        mem*/strlen + unwind abort-stubs
-  src/allocator.rs         mmap-backed segregated free-list global allocator
-  src/panic.rs             the #[panic_handler]
-  src/io.rs                Fd, fmt::Write, print!/println!/eprint!/eprintln!
-  src/env.rs               args()/vars()/var()
-  src/rt.rs                Termination, exit/abort
-  src/prelude.rs           glob import for programs
-  src/lib.rs               crate root + entry!() macro
-crates/fullrust-std/     the standard library (own-std, on syscalls)
-  src/{io,fs,net,time,env,process,thread,sync,...}.rs
-                           std-shaped modules backed by fullrust syscalls
+crates/fullrust/         the runtime (crt0 + compiler_builtins equivalent)
+  src/entry.rs             naked _start: argc/argv/envp -> purestd's `main`
+  src/intrinsics.rs        mem*/strlen + getauxval + _Unwind_Resume stub
+  src/lib.rs               crate root
+                         (the standard library is the separate `purestd` crate;
+                          it provides the API + panic handler + allocator +
+                          rust_eh_personality)
 crates/cargo-fullrust/   the `cargo fullrust` subcommand
   src/main.rs              builds/caches the sysroot, drives cargo
-  sysroot/std_lib.rs       the sysroot `std` (re-exports fullrust-std + policy)
+  sysroot/std_lib.rs       the sysroot `std` (re-exports purestd + lang_start)
   x86_64-fullrust-linux.json   freestanding target spec (cargo-fullrust + ./x)
-examples/                hello, args, alloc-demo, panic-demo, std-smoke (entry!);
-                           plain (zero-touch demo: ordinary crate, no fullrust dep)
+examples/                hello, args, alloc-demo, panic-demo (purestd + entry!);
+                           plain (zero-touch demo: ordinary crate, no deps)
 action.yml               reusable GitHub Action (build static artifacts in CI)
 x                        in-repo build wrapper (linker resolution + path selection)
 .cargo/config.toml       intentionally minimal — see ./x

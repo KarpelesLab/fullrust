@@ -1,14 +1,15 @@
 #![no_std]
 #![no_main]
 
-use fullrust::prelude::*;
+extern crate fullrust;
+use purestd::prelude::*;
 
 fn main() {
     let v: Vec<i32> = vec![1, 2, 3];
     println!("about to index out of bounds...");
-    // This panics; the fullrust panic handler prints to stderr and aborts (134).
+    // This panics; purestd's panic handler prints to stderr and exits 101.
     let _ = v[10];
     println!("unreachable");
 }
 
-fullrust::entry!(main);
+purestd::entry!(main);

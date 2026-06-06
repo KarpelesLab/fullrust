@@ -3,14 +3,14 @@
 //! Two modes:
 //!
 //! * **zero-touch (default).** Builds and caches a sysroot whose `std` is
-//!   fullrust's own standard library, then compiles your crate against it with
-//!   `--sysroot`. An **unmodified** crate — plain `fn main`, `use std::…`, no
-//!   deps, no attributes — becomes a pure-syscall static binary. Nightly +
-//!   `rust-src`.
+//!   `purestd`, then compiles your crate against it with `--sysroot`. An
+//!   **unmodified** crate — plain `fn main`, `use std::…`, no deps, no
+//!   attributes — becomes a pure-syscall static binary. Nightly + `rust-src`.
 //!
-//! * **`--runtime` (explicit).** For crates that opt into the fullrust runtime
-//!   directly (`#![no_std]` + `fullrust::entry!`). Uses `-Z build-std` (nightly)
-//!   or, with `--stable`, the precompiled core/alloc.
+//! * **`--runtime` (explicit).** For crates that use purestd + the fullrust
+//!   runtime directly (`#![no_std]` + `extern crate fullrust;` +
+//!   `purestd::entry!`). Uses `-Z build-std` (nightly) or, with `--stable`, the
+//!   precompiled core/alloc.
 //!
 //! ```text
 //! cargo install cargo-fullrust
@@ -154,13 +154,15 @@ fn ensure_sysroot(host: &str, lld: &Path, target_path: &Path) -> PathBuf {
     // 1. Generate the std-crate project.
     let proj = base.join("std-src");
     let _ = std::fs::create_dir_all(proj.join("src"));
+    // The sysroot std is `purestd` (the standard library) re-exported, plus the
+    // `fullrust` runtime (entry point + mem*/unwind/getauxval symbols).
     let deps = match std::env::var("FULLRUST_DEV_REPO") {
         Ok(repo) if !repo.is_empty() => format!(
-            "fullrust = {{ path = \"{repo}/crates/fullrust\", default-features = false }}\n\
-             fullrust-std = {{ path = \"{repo}/crates/fullrust-std\" }}\n"
+            "fullrust = {{ path = \"{repo}/crates/fullrust\" }}\n\
+             purestd = \"0.0\"\n"
         ),
-        _ => "fullrust = { version = \"0.1\", default-features = false }\n\
-              fullrust-std = \"0.1\"\n"
+        _ => "fullrust = \"0.1\"\n\
+              purestd = \"0.0\"\n"
             .to_string(),
     };
     write(

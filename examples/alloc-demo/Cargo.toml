@@ -5,4 +5,5 @@ edition = "2021"
 publish = false
 
 [dependencies]
+purestd = "0.0.1"
 fullrust = { path = "../../crates/fullrust" }

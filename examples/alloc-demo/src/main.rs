@@ -1,7 +1,8 @@
 #![no_std]
 #![no_main]
 
-use fullrust::prelude::*;
+extern crate fullrust;
+use purestd::prelude::*;
 
 fn main() {
     // Vec growth exercises the segregated free-list allocator across classes.
@@ -28,4 +29,4 @@ fn main() {
     println!("boxed   : {} = {}", boxed.0, boxed.1);
 }
 
-fullrust::entry!(main);
+purestd::entry!(main);

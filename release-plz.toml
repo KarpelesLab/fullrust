@@ -1,9 +1,8 @@
 # release-plz configuration.
 #
-# Only the two library crates are published to crates.io; every crate under
-# examples/ is `publish = false` and is skipped automatically. release-plz
-# resolves the intra-workspace order itself (fullrust is published before
-# fullrust-std, which depends on it).
+# The published crates are `fullrust` (the runtime) and `cargo-fullrust` (the
+# build tool); the standard library is a separate crate, `purestd`. Everything
+# under examples/ is `publish = false` and is skipped automatically.
 
 [workspace]
 # Create a GitHub Release for each published crate version.

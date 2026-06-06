@@ -3,15 +3,7 @@ name = "fullrust"
 version = "0.1.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "A libc-free, fully-static, pure-Rust runtime: std-lite on raw Linux syscalls."
+description = "The libc-free runtime for purestd: the process entry point (_start) plus the mem*/unwind/getauxval symbols a freestanding binary needs from crt0/compiler_builtins/the unwinder."
 repository = "https://github.com/KarpelesLab/fullrust"
-keywords = ["no_std", "libc-free", "freestanding", "static", "syscall"]
+keywords = ["no_std", "libc-free", "freestanding", "static", "runtime"]
 categories = ["no-std", "os::linux-apis"]
-
-[features]
-# `rt` provides the binary-level policy symbols: `_start`, the `#[panic_handler]`,
-# the `#[global_allocator]` static, and the `__fullrust_main` entry glue. It is
-# on by default (the `entry!` model). Turn it off (`default-features = false`)
-# when another crate — e.g. the sysroot `std` — supplies those itself.
-default = ["rt"]
-rt = []

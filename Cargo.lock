@@ -7,6 +7,7 @@ name = "alloc-demo"
 version = "0.1.0"
 dependencies = [
  "fullrust",
+ "purestd",
 ]
 
 [[package]]
@@ -14,6 +15,7 @@ name = "args"
 version = "0.1.0"
 dependencies = [
  "fullrust",
+ "purestd",
 ]
 
 [[package]]
@@ -21,37 +23,15 @@ name = "cargo-fullrust"
 version = "0.1.1"
 
 [[package]]
-name = "foldhash"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
-
-[[package]]
 name = "fullrust"
 version = "0.1.1"
-
-[[package]]
-name = "fullrust-std"
-version = "0.1.1"
-dependencies = [
- "fullrust",
- "hashbrown",
-]
-
-[[package]]
-name = "hashbrown"
-version = "0.15.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
-dependencies = [
- "foldhash",
-]
 
 [[package]]
 name = "hello"
 version = "0.1.0"
 dependencies = [
  "fullrust",
+ "purestd",
 ]
 
 [[package]]
@@ -59,6 +39,7 @@ name = "panic-demo"
 version = "0.1.0"
 dependencies = [
  "fullrust",
+ "purestd",
 ]
 
 [[package]]
@@ -66,9 +47,7 @@ name = "plain"
 version = "0.1.0"
 
 [[package]]
-name = "std-smoke"
-version = "0.1.0"
-dependencies = [
- "fullrust",
- "fullrust-std",
-]
+name = "purestd"
+version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b335c5172e2727e37b6e15a679097d4bd66fc2c6dd36da461bac53d357b2a7b"

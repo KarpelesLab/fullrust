@@ -80,7 +80,7 @@ pub unsafe extern "C" fn bcmp(a: *const u8, b: *const u8, n: usize) -> c_int {
 }
 
 /// Length of a NUL-terminated C string. Used by `core::ffi::CStr::from_ptr`,
-/// which we rely on to read `argv`/`envp`.
+/// which the std layer relies on to read `argv`/`envp`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn strlen(s: *const core::ffi::c_char) -> usize {
     let mut n = 0;
@@ -90,14 +90,30 @@ pub unsafe extern "C" fn strlen(s: *const core::ffi::c_char) -> usize {
     n
 }
 
-// ---- unwind abort-stubs (never executed under panic = "abort") ----
-
+/// On aarch64, `compiler_builtins` calls `getauxval` to detect LSE atomics at
+/// runtime. With no libc we supply it; returning 0 (no `HWCAP` bits) selects the
+/// always-correct LL/SC atomic fallback.
+#[cfg(target_arch = "aarch64")]
 #[unsafe(no_mangle)]
-extern "C" fn rust_eh_personality() {}
+pub unsafe extern "C" fn getauxval(_type_: core::ffi::c_ulong) -> core::ffi::c_ulong {
+    0
+}
+
+// ---- unwind abort-stub (never executed under panic = "abort") ----
+//
+// `rust_eh_personality` is NOT here — that one is a std symbol, provided by
+// purestd. `_Unwind_Resume` is the unwinder's; we stub it.
 
 #[unsafe(no_mangle)]
 extern "C" fn _Unwind_Resume() -> ! {
-    // Reaching here would mean unwinding is actually happening, which must not
-    // occur under panic = "abort". Treat it as a fatal logic error.
-    crate::syscall::exit_group(134)
+    // Reaching here means unwinding is happening, which must not occur under
+    // panic = "abort". Trap rather than depend on the std layer for exit.
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("udf #0", options(noreturn))
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!("ud2", options(noreturn))
+    }
 }
