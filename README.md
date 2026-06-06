@@ -420,6 +420,7 @@ crates/cargo-fullrust/   the `cargo fullrust` subcommand
   sysroot/std_lib.rs       the sysroot `std` (re-exports purestd + lang_start)
   x86_64-fullrust-linux.json   freestanding target spec (cargo-fullrust + ./x)
 examples/                hello, args, alloc-demo, panic-demo (purestd + entry!);
+                           std-smoke (net/time/threads; live network, manual);
                            plain (zero-touch demo: ordinary crate, no deps)
 action.yml               reusable GitHub Action (build static artifacts in CI)
 x                        in-repo build wrapper (linker resolution + path selection)

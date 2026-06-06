@@ -7,12 +7,16 @@ members = [
     "examples/args",
     "examples/alloc-demo",
     "examples/panic-demo",
+    "examples/std-smoke",
     "examples/plain",
 ]
 # cargo-fullrust is a host tool (ordinary std binary); exclude it from the
 # default set so `./x build` / `cargo fullrust build` (freestanding target) don't
 # try to build it for a libc-free target. Build it with `cargo build -p
 # cargo-fullrust` or install it with `cargo install cargo-fullrust`.
+# std-smoke is excluded from the default set too: it does live DNS/TCP (flaky in
+# CI), so it is a manual example — `./x run -p std-smoke` (purestd net + time +
+# threads over raw syscalls).
 default-members = [
     "crates/fullrust",
     "examples/hello",
