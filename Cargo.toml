@@ -1,5 +1,8 @@
 [workspace]
 resolver = "2"
+# The toolchain/ directory holds out-of-tree Rust source checkouts (the fork we
+# build the libc-free target into); keep them out of this Cargo workspace.
+exclude = ["toolchain"]
 members = [
     "crates/fullrust",
     "crates/cargo-fullrust",

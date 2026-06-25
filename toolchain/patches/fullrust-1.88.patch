@@ -1,0 +1,985 @@
+diff --git a/compiler/rustc_target/src/spec/base/fullrust.rs b/compiler/rustc_target/src/spec/base/fullrust.rs
+new file mode 100644
+index 00000000..fcf231bf
+--- /dev/null
++++ b/compiler/rustc_target/src/spec/base/fullrust.rs
+@@ -0,0 +1,49 @@
++use crate::spec::{Cc, LinkerFlavor, Lld, PanicStrategy, RelocModel, TargetOptions};
++
++/// Base options for the `fullrust` platform: a libc-free, fully-static Linux
++/// ABI target. The kernel interface is plain Linux syscalls (so `llvm_target`
++/// stays `x86_64-unknown-linux-gnu`), but there is **no libc and no C runtime**:
++/// the process entry point (`_start`), the `mem*` intrinsics and the std
++/// platform layer are all provided in-tree by `std::sys::pal::fullrust`
++/// (backed by purestd's raw-syscall code).
++///
++/// `os = "fullrust"` is deliberately a distinct OS rather than `linux` so that
++/// `cfg(unix)` is false and std selects our own pal instead of the libc-based
++/// `unix` one. It is not a member of the `unix` target family.
++pub(crate) fn opts() -> TargetOptions {
++    TargetOptions {
++        os: "fullrust".into(),
++        vendor: "unknown".into(),
++
++        // Libc-free, fully static: no dynamic linking, no C runtime, no PIE,
++        // static relocation model. crt-static is the only mode and is implied.
++        dynamic_linking: false,
++        executables: true,
++        crt_static_allows_dylibs: false,
++        crt_static_default: true,
++        crt_static_respected: true,
++        static_position_independent_executables: false,
++        position_independent_executables: false,
++        relocation_model: RelocModel::Static,
++
++        // No unwinder; panics abort. This removes the landing pads that would
++        // otherwise reference the personality routine.
++        panic_strategy: PanicStrategy::Abort,
++
++        // Milestone 1 is single-threaded and uses std's `no_threads`
++        // thread-locals (plain statics), so ELF `#[thread_local]` TLS is off for
++        // now. Enabling it later (with %fs/TCB setup in `_start`) unlocks the
++        // native TLS path and real threads.
++        has_thread_local: false,
++
++        max_atomic_width: Some(64),
++
++        // Link with the Rust-bundled LLVM linker, GNU-flavored, invoked
++        // directly (no C compiler driver). No crt objects are linked: `_start`
++        // comes from std's fullrust pal.
++        linker: Some("rust-lld".into()),
++        linker_flavor: LinkerFlavor::Gnu(Cc::No, Lld::Yes),
++
++        ..Default::default()
++    }
++}
+diff --git a/compiler/rustc_target/src/spec/base/mod.rs b/compiler/rustc_target/src/spec/base/mod.rs
+index b368d93f..8b88b366 100644
+--- a/compiler/rustc_target/src/spec/base/mod.rs
++++ b/compiler/rustc_target/src/spec/base/mod.rs
+@@ -7,6 +7,7 @@
+ pub(crate) mod dragonfly;
+ pub(crate) mod freebsd;
+ pub(crate) mod fuchsia;
++pub(crate) mod fullrust;
+ pub(crate) mod haiku;
+ pub(crate) mod hermit;
+ pub(crate) mod hurd;
+diff --git a/compiler/rustc_target/src/spec/mod.rs b/compiler/rustc_target/src/spec/mod.rs
+index 303be54a..084ff587 100644
+--- a/compiler/rustc_target/src/spec/mod.rs
++++ b/compiler/rustc_target/src/spec/mod.rs
+@@ -1785,6 +1785,7 @@ fn $module() {
+     ("aarch64-unknown-linux-gnu", aarch64_unknown_linux_gnu),
+     ("aarch64-unknown-linux-musl", aarch64_unknown_linux_musl),
+     ("x86_64-unknown-linux-musl", x86_64_unknown_linux_musl),
++    ("x86_64-unknown-linux-fullrust", x86_64_unknown_linux_fullrust),
+     ("i686-unknown-linux-musl", i686_unknown_linux_musl),
+     ("i586-unknown-linux-musl", i586_unknown_linux_musl),
+     ("mips-unknown-linux-musl", mips_unknown_linux_musl),
+diff --git a/compiler/rustc_target/src/spec/targets/x86_64_unknown_linux_fullrust.rs b/compiler/rustc_target/src/spec/targets/x86_64_unknown_linux_fullrust.rs
+new file mode 100644
+index 00000000..d20db759
+--- /dev/null
++++ b/compiler/rustc_target/src/spec/targets/x86_64_unknown_linux_fullrust.rs
+@@ -0,0 +1,33 @@
++use crate::spec::{Cc, LinkerFlavor, Lld, StackProbeType, Target, TargetMetadata, base};
++
++/// `x86_64-unknown-linux-fullrust`: 64-bit Linux, but **libc-free and fully
++/// static**. Same kernel syscall ABI and codegen as `x86_64-unknown-linux-gnu`
++/// (hence the shared `llvm_target`/`data_layout`), but std is implemented on
++/// raw syscalls via `std::sys::pal::fullrust` — no libc, no C runtime, no
++/// dynamic linker. Produces a single statically-linked ELF executable.
++pub(crate) fn target() -> Target {
++    let mut base = base::fullrust::opts();
++    base.cpu = "x86-64".into();
++    base.plt_by_default = false;
++    base.max_atomic_width = Some(64);
++    base.stack_probes = StackProbeType::Inline;
++    // Statically link the binary; do not pull in any default/C libraries.
++    // `add_pre_link_args` takes the `Lld::No` flavor and adds the `Lld::Yes`
++    // twin itself, so pass `Lld::No` here even though we link with rust-lld.
++    base.add_pre_link_args(LinkerFlavor::Gnu(Cc::No, Lld::No), &["-static"]);
++
++    Target {
++        llvm_target: "x86_64-unknown-linux-gnu".into(),
++        metadata: TargetMetadata {
++            description: Some("64-bit Linux, libc-free fully-static (purestd/fullrust)".into()),
++            tier: Some(3),
++            host_tools: Some(false),
++            std: Some(true),
++        },
++        pointer_width: 64,
++        data_layout:
++            "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128".into(),
++        arch: "x86_64".into(),
++        options: base,
++    }
++}
+diff --git a/library/std/build.rs b/library/std/build.rs
+index ef695601..f4f4971b 100644
+--- a/library/std/build.rs
++++ b/library/std/build.rs
+@@ -8,6 +8,11 @@ fn main() {
+         env::var("CARGO_CFG_TARGET_VENDOR").expect("CARGO_CFG_TARGET_VENDOR was not set");
+     let target_env = env::var("CARGO_CFG_TARGET_ENV").expect("CARGO_CFG_TARGET_ENV was not set");
+ 
++    // `fullrust` is a new `target_os` this fork adds. Teach check-cfg about the
++    // value so the stage0 bootstrap compiler (which predates the os) does not
++    // reject `cfg(target_os = "fullrust")` when building the host std.
++    println!("cargo:rustc-check-cfg=cfg(target_os, values(\"fullrust\"))");
++
+     println!("cargo:rustc-check-cfg=cfg(netbsd10)");
+     if target_os == "netbsd" && env::var("RUSTC_STD_NETBSD10").is_ok() {
+         println!("cargo:rustc-cfg=netbsd10");
+@@ -52,6 +57,7 @@ fn main() {
+         || target_os == "rtems"
+         || target_os == "nuttx"
+         || target_os == "cygwin"
++        || target_os == "fullrust"
+ 
+         // See src/bootstrap/src/core/build_steps/synthetic_targets.rs
+         || env::var("RUSTC_BOOTSTRAP_SYNTHETIC_TARGET").is_ok()
+diff --git a/library/std/src/sys/alloc/fullrust.rs b/library/std/src/sys/alloc/fullrust.rs
+new file mode 100644
+index 00000000..df74af19
+--- /dev/null
++++ b/library/std/src/sys/alloc/fullrust.rs
+@@ -0,0 +1,71 @@
++//! Global allocator for the fullrust target: anonymous `mmap`/`munmap`.
++//!
++//! Milestone-1 allocator: every allocation is a page-rounded private anonymous
++//! mapping, released with `munmap` on free (the size comes back via `Layout`,
++//! so no header is needed). Simple and correct; wasteful for small allocations.
++//! A segregated free-list (ported from purestd) replaces this later.
++
++use super::super::pal::sysc;
++use crate::alloc::{GlobalAlloc, Layout, System};
++use crate::ptr;
++
++const PAGE: usize = 4096;
++
++#[inline]
++fn round_up(v: usize, to: usize) -> usize {
++    (v + to - 1) & !(to - 1)
++}
++
++#[inline]
++fn mmap(len: usize) -> *mut u8 {
++    let r = unsafe {
++        // mmap(NULL, len, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
++        sysc::syscall6(
++            sysc::MMAP,
++            0,
++            len,
++            sysc::PROT_READ | sysc::PROT_WRITE,
++            sysc::MAP_PRIVATE | sysc::MAP_ANONYMOUS,
++            usize::MAX, // fd = -1
++            0,
++        )
++    };
++    match sysc::ret(r) {
++        // The kernel handed us a fresh mapping at address `p`; materialize a
++        // pointer with provenance for it (strict-provenance compliant).
++        Ok(p) => ptr::with_exposed_provenance_mut(p),
++        Err(_) => ptr::null_mut(),
++    }
++}
++
++#[stable(feature = "alloc_system_type", since = "1.28.0")]
++unsafe impl GlobalAlloc for System {
++    #[inline]
++    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
++        // mmap returns page-aligned memory; that satisfies any alignment up to a
++        // page. std's allocations are far below that.
++        debug_assert!(layout.align() <= PAGE);
++        mmap(round_up(layout.size().max(1), PAGE))
++    }
++
++    #[inline]
++    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
++        // Freshly mmap'd anonymous memory is already zeroed.
++        unsafe { self.alloc(layout) }
++    }
++
++    #[inline]
++    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
++        if ptr.is_null() {
++            return;
++        }
++        unsafe {
++            sysc::syscall2(sysc::MUNMAP, ptr as usize, round_up(layout.size().max(1), PAGE));
++        }
++    }
++
++    #[inline]
++    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
++        unsafe { super::realloc_fallback(self, ptr, layout, new_size) }
++    }
++}
+diff --git a/library/std/src/sys/alloc/mod.rs b/library/std/src/sys/alloc/mod.rs
+index 8489e17c..e9e1fe23 100644
+--- a/library/std/src/sys/alloc/mod.rs
++++ b/library/std/src/sys/alloc/mod.rs
+@@ -68,7 +68,9 @@ unsafe fn realloc_fallback(
+ }
+ 
+ cfg_if::cfg_if! {
+-    if #[cfg(any(
++    if #[cfg(target_os = "fullrust")] {
++        mod fullrust;
++    } else if #[cfg(any(
+         target_family = "unix",
+         target_os = "wasi",
+         target_os = "teeos",
+diff --git a/library/std/src/sys/args/fullrust.rs b/library/std/src/sys/args/fullrust.rs
+new file mode 100644
+index 00000000..9cd28fb5
+--- /dev/null
++++ b/library/std/src/sys/args/fullrust.rs
+@@ -0,0 +1,38 @@
++//! Command-line arguments for the fullrust target.
++//!
++//! `argc`/`argv` are captured once at startup (by `pal::fullrust::common::init`,
++//! which `rt::init` calls). Decoded lazily, lossily as UTF-8 — matching how
++//! purestd treats non-Unicode args on a best-effort basis.
++
++pub use super::common::Args;
++use crate::ffi::{CStr, OsString};
++use crate::ptr;
++use crate::sync::atomic::{AtomicIsize, AtomicPtr, Ordering};
++
++static ARGC: AtomicIsize = AtomicIsize::new(0);
++static ARGV: AtomicPtr<*const u8> = AtomicPtr::new(ptr::null_mut());
++
++/// One-time global initialization.
++pub unsafe fn init(argc: isize, argv: *const *const u8) {
++    ARGC.store(argc, Ordering::Relaxed);
++    ARGV.store(argv as *mut *const u8, Ordering::Relaxed);
++}
++
++/// Returns the command line arguments.
++pub fn args() -> Args {
++    let argv = ARGV.load(Ordering::Relaxed);
++    let argc = if argv.is_null() { 0 } else { ARGC.load(Ordering::Relaxed) };
++
++    let mut vec = Vec::with_capacity(argc.max(0) as usize);
++    for i in 0..argc {
++        // SAFETY: argv is non-null with at least `argc` entries.
++        let ptr = unsafe { (argv as *const *const u8).offset(i).read() };
++        if ptr.is_null() {
++            break;
++        }
++        // SAFETY: argv entries are valid NUL-terminated C strings.
++        let bytes = unsafe { CStr::from_ptr(ptr.cast()).to_bytes() };
++        vec.push(OsString::from(String::from_utf8_lossy(bytes).into_owned()));
++    }
++    Args::new(vec)
++}
+diff --git a/library/std/src/sys/args/mod.rs b/library/std/src/sys/args/mod.rs
+index 0011f55d..3333896a 100644
+--- a/library/std/src/sys/args/mod.rs
++++ b/library/std/src/sys/args/mod.rs
+@@ -5,6 +5,7 @@
+ #[cfg(any(
+     all(target_family = "unix", not(any(target_os = "espidf", target_os = "vita"))),
+     target_family = "windows",
++    target_os = "fullrust",
+     target_os = "hermit",
+     target_os = "uefi",
+     target_os = "wasi",
+@@ -13,7 +14,10 @@
+ mod common;
+ 
+ cfg_if::cfg_if! {
+-    if #[cfg(any(
++    if #[cfg(target_os = "fullrust")] {
++        mod fullrust;
++        pub use fullrust::*;
++    } else if #[cfg(any(
+         all(target_family = "unix", not(any(target_os = "espidf", target_os = "vita"))),
+         target_os = "hermit",
+     ))] {
+diff --git a/library/std/src/sys/pal/fullrust/common.rs b/library/std/src/sys/pal/fullrust/common.rs
+new file mode 100644
+index 00000000..cf8c20ca
+--- /dev/null
++++ b/library/std/src/sys/pal/fullrust/common.rs
+@@ -0,0 +1,50 @@
++use crate::io as std_io;
++
++// Called once by `rt::init` via `sys::init`, with the real argc/argv that the
++// compiler-emitted `main` passed to `lang_start`. We hand them to the args
++// machinery so `std::env::args()` works.
++//
++// SAFETY: must be called only once during runtime initialization.
++pub unsafe fn init(argc: isize, argv: *const *const u8, _sigpipe: u8) {
++    unsafe { crate::sys::args::init(argc, argv) };
++}
++
++// SAFETY: must be called only once during runtime cleanup.
++pub unsafe fn cleanup() {}
++
++pub fn unsupported<T>() -> std_io::Result<T> {
++    Err(unsupported_err())
++}
++
++pub fn unsupported_err() -> std_io::Error {
++    std_io::Error::UNSUPPORTED_PLATFORM
++}
++
++pub fn is_interrupted(code: i32) -> bool {
++    code == 4 // EINTR
++}
++
++pub fn decode_error_kind(code: i32) -> crate::io::ErrorKind {
++    use crate::io::ErrorKind::*;
++    match code {
++        1 | 13 => PermissionDenied,  // EPERM / EACCES
++        2 => NotFound,               // ENOENT
++        4 => Interrupted,            // EINTR
++        11 => WouldBlock,            // EAGAIN
++        17 => AlreadyExists,         // EEXIST
++        21 => IsADirectory,          // EISDIR
++        22 => InvalidInput,          // EINVAL
++        28 => StorageFull,           // ENOSPC
++        32 => BrokenPipe,            // EPIPE
++        110 => TimedOut,             // ETIMEDOUT
++        111 => ConnectionRefused,    // ECONNREFUSED
++        _ => Uncategorized,
++    }
++}
++
++pub fn abort_internal() -> ! {
++    unsafe {
++        super::sysc::syscall1(super::sysc::EXIT_GROUP, 134);
++    }
++    core::intrinsics::abort()
++}
+diff --git a/library/std/src/sys/pal/fullrust/mod.rs b/library/std/src/sys/pal/fullrust/mod.rs
+new file mode 100644
+index 00000000..27279914
+--- /dev/null
++++ b/library/std/src/sys/pal/fullrust/mod.rs
+@@ -0,0 +1,138 @@
++//! The `fullrust` platform abstraction layer: libc-free Linux on raw syscalls.
++//!
++//! This pal provides what a hosted std gets from libc + crt0: the process entry
++//! point (`_start`), process control, time, and the syscall wrappers the other
++//! `sys` modules build on. The kernel ABI is plain Linux x86-64 `syscall`; there
++//! is no C runtime. Ported from purestd's raw-syscall layer, inlined here so std
++//! stays self-contained.
++
++#![deny(unsafe_op_in_unsafe_fn)]
++
++pub mod os;
++pub mod pipe;
++pub mod thread;
++pub mod time;
++
++mod common;
++pub use common::*;
++
++// ---------------------------------------------------------------------------
++// Raw syscall layer (x86-64). Number in rax; args rdi, rsi, rdx, r10, r8, r9;
++// result in rax; -errno in [-4095, -1].
++// ---------------------------------------------------------------------------
++pub mod sysc {
++    use core::arch::asm;
++
++    #[inline]
++    pub unsafe fn syscall1(n: usize, a: usize) -> usize {
++        let r;
++        unsafe {
++            asm!("syscall", inlateout("rax") n => r, in("rdi") a,
++                 lateout("rcx") _, lateout("r11") _, options(nostack, preserves_flags));
++        }
++        r
++    }
++    #[inline]
++    pub unsafe fn syscall2(n: usize, a: usize, b: usize) -> usize {
++        let r;
++        unsafe {
++            asm!("syscall", inlateout("rax") n => r, in("rdi") a, in("rsi") b,
++                 lateout("rcx") _, lateout("r11") _, options(nostack, preserves_flags));
++        }
++        r
++    }
++    #[inline]
++    pub unsafe fn syscall3(n: usize, a: usize, b: usize, c: usize) -> usize {
++        let r;
++        unsafe {
++            asm!("syscall", inlateout("rax") n => r, in("rdi") a, in("rsi") b, in("rdx") c,
++                 lateout("rcx") _, lateout("r11") _, options(nostack, preserves_flags));
++        }
++        r
++    }
++    #[inline]
++    pub unsafe fn syscall6(
++        n: usize, a: usize, b: usize, c: usize, d: usize, e: usize, f: usize,
++    ) -> usize {
++        let r;
++        unsafe {
++            asm!("syscall", inlateout("rax") n => r, in("rdi") a, in("rsi") b, in("rdx") c,
++                 in("r10") d, in("r8") e, in("r9") f,
++                 lateout("rcx") _, lateout("r11") _, options(nostack, preserves_flags));
++        }
++        r
++    }
++
++    pub const READ: usize = 0;
++    pub const WRITE: usize = 1;
++    pub const GETPID: usize = 39;
++    pub const EXIT_GROUP: usize = 231;
++    pub const CLOCK_GETTIME: usize = 228;
++    pub const GETRANDOM: usize = 318;
++    pub const SCHED_YIELD: usize = 24;
++    pub const NANOSLEEP: usize = 35;
++    pub const MMAP: usize = 9;
++    pub const MUNMAP: usize = 11;
++
++    pub const PROT_READ: usize = 0x1;
++    pub const PROT_WRITE: usize = 0x2;
++    pub const MAP_PRIVATE: usize = 0x2;
++    pub const MAP_ANONYMOUS: usize = 0x20;
++
++    /// Interpret a raw return as `Result<usize, i32>` (Err is the errno).
++    #[inline]
++    pub fn ret(r: usize) -> Result<usize, i32> {
++        let s = r as isize;
++        if (-4095..0).contains(&s) { Err(-s as i32) } else { Ok(r) }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Process entry point. The kernel jumps here with rsp at argc; there is no
++// return address and no C runtime. We call the compiler-emitted C `main`, which
++// drives `lang_start` -> `rt::init` (capturing argc/argv) -> user `fn main`.
++// When it returns, exit_group with its code.
++// ---------------------------------------------------------------------------
++unsafe extern "C" {
++    // The C `main` shim the compiler emits for `fn main`: it calls
++    // `lang_start(user_main, argc, argv, sigpipe)`.
++    fn main(argc: core::ffi::c_int, argv: *const *const u8) -> core::ffi::c_int;
++}
++
++#[unsafe(naked)]
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn _start() -> ! {
++    core::arch::naked_asm!(
++        "xor rbp, rbp",
++        "mov rdi, rsp", // pointer to argc
++        "and rsp, -16", // ABI stack alignment
++        "call {start}",
++        start = sym rust_start,
++    )
++}
++
++unsafe extern "C" fn rust_start(stack: *const usize) -> ! {
++    // [argc][argv0..argv(argc-1)][NULL][envp0..][NULL][auxv...]
++    let argc = unsafe { *stack } as core::ffi::c_int;
++    let argv = unsafe { stack.add(1) } as *const *const u8;
++    let code = unsafe { main(argc, argv) };
++    os::exit(code as i32)
++}
++
++// ---------------------------------------------------------------------------
++// Symbols the toolchain expects from the environment that neither libc (absent)
++// nor compiler_builtins provide. `compiler-builtins-mem` supplies the `mem*`
++// intrinsics; `strlen` is not among them, and core's `CStr::from_ptr` (used to
++// decode argv/envp) calls it.
++// ---------------------------------------------------------------------------
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn strlen(s: *const core::ffi::c_char) -> usize {
++    let mut n = 0;
++    // SAFETY: `s` points to a NUL-terminated C string (caller contract).
++    unsafe {
++        while *s.add(n) != 0 {
++            n += 1;
++        }
++    }
++    n
++}
+diff --git a/library/std/src/sys/pal/fullrust/os.rs b/library/std/src/sys/pal/fullrust/os.rs
+new file mode 100644
+index 00000000..905c78ec
+--- /dev/null
++++ b/library/std/src/sys/pal/fullrust/os.rs
+@@ -0,0 +1,83 @@
++use super::{sysc, unsupported};
++use crate::error::Error as StdError;
++use crate::ffi::{OsStr, OsString};
++use crate::marker::PhantomData;
++use crate::path::{self, PathBuf};
++use crate::{fmt, io};
++
++pub fn errno() -> i32 {
++    0
++}
++
++pub fn error_string(errno: i32) -> String {
++    format!("os error {errno}")
++}
++
++pub fn getcwd() -> io::Result<PathBuf> {
++    unsupported()
++}
++
++pub fn chdir(_: &path::Path) -> io::Result<()> {
++    unsupported()
++}
++
++pub struct SplitPaths<'a>(!, PhantomData<&'a ()>);
++
++pub fn split_paths(_unparsed: &OsStr) -> SplitPaths<'_> {
++    panic!("unsupported")
++}
++
++impl<'a> Iterator for SplitPaths<'a> {
++    type Item = PathBuf;
++    fn next(&mut self) -> Option<PathBuf> {
++        self.0
++    }
++}
++
++#[derive(Debug)]
++pub struct JoinPathsError;
++
++pub fn join_paths<I, T>(_paths: I) -> Result<OsString, JoinPathsError>
++where
++    I: Iterator<Item = T>,
++    T: AsRef<OsStr>,
++{
++    Err(JoinPathsError)
++}
++
++impl fmt::Display for JoinPathsError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        "not supported on this platform yet".fmt(f)
++    }
++}
++
++impl StdError for JoinPathsError {
++    #[allow(deprecated)]
++    fn description(&self) -> &str {
++        "not supported on this platform yet"
++    }
++}
++
++pub fn current_exe() -> io::Result<PathBuf> {
++    unsupported()
++}
++
++pub fn temp_dir() -> PathBuf {
++    PathBuf::from("/tmp")
++}
++
++pub fn home_dir() -> Option<PathBuf> {
++    None
++}
++
++pub fn exit(code: i32) -> ! {
++    unsafe {
++        sysc::syscall1(sysc::EXIT_GROUP, code as usize);
++    }
++    // exit_group never returns; satisfy the `!` return type if it ever did.
++    crate::intrinsics::abort()
++}
++
++pub fn getpid() -> u32 {
++    unsafe { sysc::syscall1(sysc::GETPID, 0) as u32 }
++}
+diff --git a/library/std/src/sys/pal/fullrust/pipe.rs b/library/std/src/sys/pal/fullrust/pipe.rs
+new file mode 100644
+index 00000000..30a4cbfa
+--- /dev/null
++++ b/library/std/src/sys/pal/fullrust/pipe.rs
+@@ -0,0 +1,69 @@
++use crate::fmt;
++use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
++use crate::sys_common::{FromInner, IntoInner};
++
++pub struct AnonPipe(!);
++
++impl fmt::Debug for AnonPipe {
++    fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
++        self.0
++    }
++}
++
++impl AnonPipe {
++    pub fn try_clone(&self) -> io::Result<Self> {
++        self.0
++    }
++
++    pub fn read(&self, _buf: &mut [u8]) -> io::Result<usize> {
++        self.0
++    }
++
++    pub fn read_buf(&self, _buf: BorrowedCursor<'_>) -> io::Result<()> {
++        self.0
++    }
++
++    pub fn read_vectored(&self, _bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
++        self.0
++    }
++
++    pub fn is_read_vectored(&self) -> bool {
++        self.0
++    }
++
++    pub fn read_to_end(&self, _buf: &mut Vec<u8>) -> io::Result<usize> {
++        self.0
++    }
++
++    pub fn write(&self, _buf: &[u8]) -> io::Result<usize> {
++        self.0
++    }
++
++    pub fn write_vectored(&self, _bufs: &[IoSlice<'_>]) -> io::Result<usize> {
++        self.0
++    }
++
++    pub fn is_write_vectored(&self) -> bool {
++        self.0
++    }
++
++    pub fn diverge(&self) -> ! {
++        self.0
++    }
++}
++
++pub fn read2(p1: AnonPipe, _v1: &mut Vec<u8>, _p2: AnonPipe, _v2: &mut Vec<u8>) -> io::Result<()> {
++    match p1.0 {}
++}
++
++impl FromInner<!> for AnonPipe {
++    fn from_inner(inner: !) -> Self {
++        inner
++    }
++}
++
++impl IntoInner<!> for AnonPipe {
++    fn into_inner(self) -> ! {
++        self.0
++    }
++}
+diff --git a/library/std/src/sys/pal/fullrust/thread.rs b/library/std/src/sys/pal/fullrust/thread.rs
+new file mode 100644
+index 00000000..1164c3c7
+--- /dev/null
++++ b/library/std/src/sys/pal/fullrust/thread.rs
+@@ -0,0 +1,44 @@
++use super::{sysc, unsupported};
++use crate::ffi::CStr;
++use crate::io;
++use crate::num::NonZero;
++use crate::time::Duration;
++
++pub struct Thread(!);
++
++pub const DEFAULT_MIN_STACK_SIZE: usize = 64 * 1024;
++
++impl Thread {
++    // unsafe: see thread::Builder::spawn_unchecked for safety requirements
++    pub unsafe fn new(_stack: usize, _p: Box<dyn FnOnce()>) -> io::Result<Thread> {
++        // Thread spawning is not implemented yet for the fullrust target
++        // (milestone 1 is single-threaded). Comes with the futex/clone port.
++        unsupported()
++    }
++
++    pub fn yield_now() {
++        unsafe {
++            sysc::syscall1(sysc::SCHED_YIELD, 0);
++        }
++    }
++
++    pub fn set_name(_name: &CStr) {
++        // prctl(PR_SET_NAME) — not wired up yet.
++    }
++
++    pub fn sleep(dur: Duration) {
++        // struct timespec { i64 tv_sec; i64 tv_nsec; }
++        let ts = [dur.as_secs() as i64, dur.subsec_nanos() as i64];
++        unsafe {
++            sysc::syscall2(sysc::NANOSLEEP, ts.as_ptr() as usize, 0);
++        }
++    }
++
++    pub fn join(self) {
++        self.0
++    }
++}
++
++pub fn available_parallelism() -> io::Result<NonZero<usize>> {
++    Ok(NonZero::new(1).unwrap())
++}
+diff --git a/library/std/src/sys/pal/fullrust/time.rs b/library/std/src/sys/pal/fullrust/time.rs
+new file mode 100644
+index 00000000..6c0ae184
+--- /dev/null
++++ b/library/std/src/sys/pal/fullrust/time.rs
+@@ -0,0 +1,55 @@
++use super::sysc;
++use crate::time::Duration;
++
++#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
++pub struct Instant(Duration);
++
++#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
++pub struct SystemTime(Duration);
++
++pub const UNIX_EPOCH: SystemTime = SystemTime(Duration::from_secs(0));
++
++fn clock(id: usize) -> Duration {
++    // struct timespec { i64 tv_sec; i64 tv_nsec; }
++    let mut ts = [0i64; 2];
++    unsafe {
++        sysc::syscall2(sysc::CLOCK_GETTIME, id, ts.as_mut_ptr() as usize);
++    }
++    Duration::new(ts[0] as u64, ts[1] as u32)
++}
++
++impl Instant {
++    pub fn now() -> Instant {
++        Instant(clock(1)) // CLOCK_MONOTONIC
++    }
++
++    pub fn checked_sub_instant(&self, other: &Instant) -> Option<Duration> {
++        self.0.checked_sub(other.0)
++    }
++
++    pub fn checked_add_duration(&self, other: &Duration) -> Option<Instant> {
++        Some(Instant(self.0.checked_add(*other)?))
++    }
++
++    pub fn checked_sub_duration(&self, other: &Duration) -> Option<Instant> {
++        Some(Instant(self.0.checked_sub(*other)?))
++    }
++}
++
++impl SystemTime {
++    pub fn now() -> SystemTime {
++        SystemTime(clock(0)) // CLOCK_REALTIME
++    }
++
++    pub fn sub_time(&self, other: &SystemTime) -> Result<Duration, Duration> {
++        self.0.checked_sub(other.0).ok_or_else(|| other.0 - self.0)
++    }
++
++    pub fn checked_add_duration(&self, other: &Duration) -> Option<SystemTime> {
++        Some(SystemTime(self.0.checked_add(*other)?))
++    }
++
++    pub fn checked_sub_duration(&self, other: &Duration) -> Option<SystemTime> {
++        Some(SystemTime(self.0.checked_sub(*other)?))
++    }
++}
+diff --git a/library/std/src/sys/pal/mod.rs b/library/std/src/sys/pal/mod.rs
+index fbefc62a..518bb2a7 100644
+--- a/library/std/src/sys/pal/mod.rs
++++ b/library/std/src/sys/pal/mod.rs
+@@ -25,7 +25,10 @@
+ pub mod common;
+ 
+ cfg_if::cfg_if! {
+-    if #[cfg(unix)] {
++    if #[cfg(target_os = "fullrust")] {
++        mod fullrust;
++        pub use self::fullrust::*;
++    } else if #[cfg(unix)] {
+         mod unix;
+         pub use self::unix::*;
+     } else if #[cfg(windows)] {
+diff --git a/library/std/src/sys/random/fullrust.rs b/library/std/src/sys/random/fullrust.rs
+new file mode 100644
+index 00000000..8a52e503
+--- /dev/null
++++ b/library/std/src/sys/random/fullrust.rs
+@@ -0,0 +1,19 @@
++//! Randomness for the fullrust target: the `getrandom(2)` syscall directly
++//! (no libc). Falls back to a fixed seed only if the syscall is unavailable,
++//! which on any modern Linux kernel does not happen.
++
++use super::super::pal::sysc;
++
++pub fn fill_bytes(mut bytes: &mut [u8]) {
++    while !bytes.is_empty() {
++        let r = unsafe {
++            sysc::syscall3(sysc::GETRANDOM, bytes.as_mut_ptr() as usize, bytes.len(), 0)
++        };
++        match sysc::ret(r) {
++            Ok(0) => break,
++            Ok(n) => bytes = &mut bytes[n..],
++            Err(4) => continue, // EINTR
++            Err(_) => break,
++        }
++    }
++}
+diff --git a/library/std/src/sys/random/mod.rs b/library/std/src/sys/random/mod.rs
+index 013e886a..6e6083ea 100644
+--- a/library/std/src/sys/random/mod.rs
++++ b/library/std/src/sys/random/mod.rs
+@@ -1,6 +1,9 @@
+ cfg_if::cfg_if! {
+     // Tier 1
+-    if #[cfg(any(target_os = "linux", target_os = "android"))] {
++    if #[cfg(target_os = "fullrust")] {
++        mod fullrust;
++        pub use fullrust::fill_bytes;
++    } else if #[cfg(any(target_os = "linux", target_os = "android"))] {
+         mod linux;
+         pub use linux::{fill_bytes, hashmap_random_keys};
+     } else if #[cfg(target_os = "windows")] {
+diff --git a/library/std/src/sys/stdio/fullrust.rs b/library/std/src/sys/stdio/fullrust.rs
+new file mode 100644
+index 00000000..be08f5a1
+--- /dev/null
++++ b/library/std/src/sys/stdio/fullrust.rs
+@@ -0,0 +1,63 @@
++use super::super::pal::sysc;
++use crate::io;
++
++pub struct Stdin;
++pub struct Stdout;
++pub struct Stderr;
++
++impl Stdin {
++    pub const fn new() -> Stdin {
++        Stdin
++    }
++}
++
++impl io::Read for Stdin {
++    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
++        let r = unsafe { sysc::syscall3(sysc::READ, 0, buf.as_mut_ptr() as usize, buf.len()) };
++        sysc::ret(r).map_err(io::Error::from_raw_os_error)
++    }
++}
++
++impl Stdout {
++    pub const fn new() -> Stdout {
++        Stdout
++    }
++}
++
++impl io::Write for Stdout {
++    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
++        let r = unsafe { sysc::syscall3(sysc::WRITE, 1, buf.as_ptr() as usize, buf.len()) };
++        sysc::ret(r).map_err(io::Error::from_raw_os_error)
++    }
++
++    fn flush(&mut self) -> io::Result<()> {
++        Ok(())
++    }
++}
++
++impl Stderr {
++    pub const fn new() -> Stderr {
++        Stderr
++    }
++}
++
++impl io::Write for Stderr {
++    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
++        let r = unsafe { sysc::syscall3(sysc::WRITE, 2, buf.as_ptr() as usize, buf.len()) };
++        sysc::ret(r).map_err(io::Error::from_raw_os_error)
++    }
++
++    fn flush(&mut self) -> io::Result<()> {
++        Ok(())
++    }
++}
++
++pub const STDIN_BUF_SIZE: usize = crate::sys::io::DEFAULT_BUF_SIZE;
++
++pub fn is_ebadf(err: &io::Error) -> bool {
++    err.raw_os_error() == Some(9) // EBADF
++}
++
++pub fn panic_output() -> Option<impl io::Write> {
++    Some(Stderr::new())
++}
+diff --git a/library/std/src/sys/stdio/mod.rs b/library/std/src/sys/stdio/mod.rs
+index 336d4c85..1aeaf187 100644
+--- a/library/std/src/sys/stdio/mod.rs
++++ b/library/std/src/sys/stdio/mod.rs
+@@ -1,7 +1,10 @@
+ #![forbid(unsafe_op_in_unsafe_fn)]
+ 
+ cfg_if::cfg_if! {
+-    if #[cfg(any(
++    if #[cfg(target_os = "fullrust")] {
++        mod fullrust;
++        pub use fullrust::*;
++    } else if #[cfg(any(
+         target_family = "unix",
+         target_os = "hermit"
+     ))] {
+diff --git a/library/std/src/sys/thread_local/mod.rs b/library/std/src/sys/thread_local/mod.rs
+index 9fafac3a..3afb56f8 100644
+--- a/library/std/src/sys/thread_local/mod.rs
++++ b/library/std/src/sys/thread_local/mod.rs
+@@ -26,6 +26,7 @@
+ cfg_if::cfg_if! {
+     if #[cfg(any(
+         all(target_family = "wasm", not(target_feature = "atomics")),
++        target_os = "fullrust",
+         target_os = "uefi",
+         target_os = "zkvm",
+         target_os = "trusty",
+@@ -90,6 +91,7 @@ pub(crate) mod guard {
+             all(target_family = "wasm", not(
+                 all(target_os = "wasi", target_env = "p1", target_feature = "atomics")
+             )),
++            target_os = "fullrust",
+             target_os = "uefi",
+             target_os = "zkvm",
+             target_os = "trusty",
+diff --git a/src/bootstrap/src/core/build_steps/compile.rs b/src/bootstrap/src/core/build_steps/compile.rs
+index 2e5865e5..db03deb7 100644
+--- a/src/bootstrap/src/core/build_steps/compile.rs
++++ b/src/bootstrap/src/core/build_steps/compile.rs
+@@ -603,6 +603,14 @@ pub fn std_cargo(builder: &Builder<'_>, target: TargetSelection, stage: u32, car
+         features += "compiler-builtins-no-f16-f128 ";
+     }
+ 
++    // The fullrust target is a libc-free *std* target: there is no libc to
++    // provide the `mem*` intrinsics, and being a std (not no_std) target it
++    // otherwise wouldn't get `compiler-builtins-mem`. Enable it so
++    // compiler_builtins supplies pure-Rust memcpy/memset/memmove/memcmp.
++    if target.triple.contains("fullrust") {
++        features += " compiler-builtins-mem ";
++    }
++
+     if builder.no_std(target) == Some(true) {
+         features += " compiler-builtins-mem";
+         if !target.starts_with("bpf") {
+diff --git a/src/bootstrap/src/utils/cc_detect.rs b/src/bootstrap/src/utils/cc_detect.rs
+index ceac24d4..5dce690c 100644
+--- a/src/bootstrap/src/utils/cc_detect.rs
++++ b/src/bootstrap/src/utils/cc_detect.rs
+@@ -62,13 +62,22 @@ fn cc2ar(cc: &Path, target: TargetSelection, default_ar: PathBuf) -> Option<Path
+ /// Creates and configures a new [`cc::Build`] instance for the given target.
+ fn new_cc_build(build: &Build, target: TargetSelection) -> cc::Build {
+     let mut cfg = cc::Build::new();
++    // The `fullrust` target is libc-free: it never invokes a C compiler (no C
++    // shims, pure-Rust compiler-builtins, rust-lld as linker). cc-rs can't parse
++    // its triple, so probe using the equivalent gnu triple purely to satisfy
++    // detection; the resulting compiler is recorded but never used to build C.
++    let cc_triple: &str = if target.contains("fullrust") {
++        "x86_64-unknown-linux-gnu"
++    } else {
++        &target.triple
++    };
+     cfg.cargo_metadata(false)
+         .opt_level(2)
+         .warnings(false)
+         .debug(false)
+         // Compress debuginfo
+         .flag_if_supported("-gz")
+-        .target(&target.triple)
++        .target(cc_triple)
+         .host(&build.build.triple);
+     match build.crt_static(target) {
+         Some(a) => {

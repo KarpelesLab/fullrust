@@ -1,2 +1,8 @@
 /target
 **/*.rs.bk
+# Out-of-tree Rust source checkouts + their build trees and logs (huge); our
+# patches/scripts under toolchain/ are tracked explicitly.
+/toolchain/rust-*
+/toolchain/*.log
+/toolchain/test-hello/target
+/toolchain/build.pid
