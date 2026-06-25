@@ -100,23 +100,31 @@ cd rust-1.88 && git add -A -- compiler/rustc_target library/std src/bootstrap \
 **statically-linked, libc-free ELF** (~44 KB): no `INTERP` segment, no `NEEDED`
 entries, no libc/GLIBC symbols; `strace` shows raw `write`/`exit_group` syscalls.
 
+**Threads work too.** `thread::spawn`/`join`, `Arc<Mutex>` under contention,
+and `thread_local!` all run correctly on a static libc-free binary: an 8-thread
+× 100k-iteration contended-counter test lands 800000/800000 with per-thread TLS
+verified, `available_parallelism()` reports the real CPU count.
+
 Implemented `std::sys::pal::fullrust`: `_start`, raw x86-64 syscalls, process
 exit/abort, `clock_gettime` time, sleep/yield, args (lossy-UTF8), stdio
-read/write, `getrandom`, an mmap `System` allocator, and `no_threads`
-thread-locals. `strlen` is provided in the pal; `mem*` come from
-`compiler-builtins-mem` (enabled for the target in `std_cargo`).
+read/write, `getrandom`, an mmap `System` allocator, **threads** (`clone(2)`
+musl-style trampoline + `CLONE_CHILD_CLEARTID` join handshake), **futex-based
+sync** (Mutex/Condvar/RwLock/Once/parking), and **key-based thread-locals** (a
+`(tid, key)` registry via the `os` TLS path). `strlen` is provided in the pal;
+`mem*` come from `compiler-builtins-mem` (enabled for the target in `std_cargo`).
 
 Extra changes beyond the target spec / pal: `build.rs` (check-cfg + restricted_std
 allowlist), `cc_detect.rs` (probe via the gnu triple), `compile.rs`
-(`compiler-builtins-mem`), and the `sys/{stdio,args,random,alloc,thread_local}`
-dispatchers + `thread_local` guard branch.
+(`compiler-builtins-mem`), the `sys/{stdio,args,random,alloc,thread_local}`
+dispatchers, and `fullrust` branches in the `sys/sync/*` + `thread_local` guards.
 
 ### Known limitations (next steps)
-- **Single-threaded.** `thread::spawn` is unsupported and `has_thread_local =
-  false` (no ELF `#[thread_local]`). Real threads need clone(2)/futex + `%fs`/TCB
-  setup in `_start`, then switch to the `native` TLS path.
+- **TLS destructors don't run** at thread exit — the key-based registry leaks
+  per-thread values (common `FOO.with(..)` access is correct; `Drop` is skipped).
 - **Allocator** is a simple page-per-allocation mmap (correct, wasteful); port
   purestd's segregated free-list for efficiency.
+- **No fs/net/process** yet — those pal pieces are still `unsupported`; wire them
+  to real syscalls (reuse purestd) next.
 - **fs/net/process** fall through to `unsupported` — wire them to purestd's
   syscall code next.
 

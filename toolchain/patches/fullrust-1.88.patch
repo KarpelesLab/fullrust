@@ -356,12 +356,80 @@ index 00000000..cf8c20ca
 +    }
 +    core::intrinsics::abort()
 +}
+diff --git a/library/std/src/sys/pal/fullrust/futex.rs b/library/std/src/sys/pal/fullrust/futex.rs
+new file mode 100644
+index 00000000..47cf7101
+--- /dev/null
++++ b/library/std/src/sys/pal/fullrust/futex.rs
+@@ -0,0 +1,62 @@
++//! Futex primitives on the raw Linux `futex(2)` syscall (private futexes).
++//!
++//! This is the interface std's futex-based Mutex/Condvar/RwLock/Once/Parker are
++//! written against. Mirrors `pal::unix::futex` but calls the syscall directly.
++
++use super::sysc;
++use crate::sync::atomic::Atomic;
++use crate::sync::atomic::Ordering::Relaxed;
++use crate::time::Duration;
++
++/// An atomic for use as a futex that is at least 32-bits but may be larger.
++pub type Futex = Atomic<Primitive>;
++/// Must be the underlying type of Futex.
++pub type Primitive = u32;
++
++/// An atomic for use as a futex that is at least 8-bits but may be larger.
++pub type SmallFutex = Atomic<SmallPrimitive>;
++/// Must be the underlying type of SmallFutex.
++pub type SmallPrimitive = u32;
++
++const SYS_FUTEX: usize = 202;
++const FUTEX_WAIT_PRIVATE: usize = 0 | 128; // FUTEX_WAIT | FUTEX_PRIVATE_FLAG
++const FUTEX_WAKE_PRIVATE: usize = 1 | 128; // FUTEX_WAKE | FUTEX_PRIVATE_FLAG
++
++/// Waits for a `futex_wake` operation to wake us, returning early if the futex
++/// no longer holds `expected`. Returns false on timeout, true otherwise.
++pub fn futex_wait(futex: &Atomic<u32>, expected: u32, timeout: Option<Duration>) -> bool {
++    let ptr = futex as *const Atomic<u32> as usize;
++    // `FUTEX_WAIT` takes a *relative* timeout (timespec), or NULL for forever.
++    let ts = timeout.map(|d| [d.as_secs() as i64, d.subsec_nanos() as i64]);
++    loop {
++        // No need to wait if the value already changed.
++        if futex.load(Relaxed) != expected {
++            return true;
++        }
++        let ts_ptr = ts.as_ref().map_or(0usize, |t| t.as_ptr() as usize);
++        let r = unsafe {
++            sysc::syscall6(SYS_FUTEX, ptr, FUTEX_WAIT_PRIVATE, expected as usize, ts_ptr, 0, 0)
++        };
++        match sysc::ret(r) {
++            Err(110) => return false, // ETIMEDOUT
++            Err(4) => continue,       // EINTR
++            _ => return true,         // woken, or EAGAIN (value changed)
++        }
++    }
++}
++
++/// Wakes one thread blocked on `futex_wait` on this futex. Returns whether a
++/// thread was actually woken.
++pub fn futex_wake(futex: &Atomic<u32>) -> bool {
++    let ptr = futex as *const Atomic<u32> as usize;
++    let r = unsafe { sysc::syscall3(SYS_FUTEX, ptr, FUTEX_WAKE_PRIVATE, 1) };
++    sysc::ret(r).map(|n| n > 0).unwrap_or(false)
++}
++
++/// Wakes all threads blocked on `futex_wait` on this futex.
++pub fn futex_wake_all(futex: &Atomic<u32>) {
++    let ptr = futex as *const Atomic<u32> as usize;
++    unsafe {
++        sysc::syscall3(SYS_FUTEX, ptr, FUTEX_WAKE_PRIVATE, i32::MAX as usize);
++    }
++}
 diff --git a/library/std/src/sys/pal/fullrust/mod.rs b/library/std/src/sys/pal/fullrust/mod.rs
 new file mode 100644
-index 00000000..27279914
+index 00000000..bd1b8a86
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/mod.rs
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,139 @@
 +//! The `fullrust` platform abstraction layer: libc-free Linux on raw syscalls.
 +//!
 +//! This pal provides what a hosted std gets from libc + crt0: the process entry
@@ -372,6 +440,7 @@ index 00000000..27279914
 +
 +#![deny(unsafe_op_in_unsafe_fn)]
 +
++pub mod futex;
 +pub mod os;
 +pub mod pipe;
 +pub mod thread;
@@ -666,26 +735,165 @@ index 00000000..30a4cbfa
 +}
 diff --git a/library/std/src/sys/pal/fullrust/thread.rs b/library/std/src/sys/pal/fullrust/thread.rs
 new file mode 100644
-index 00000000..1164c3c7
+index 00000000..8d7112c9
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/thread.rs
-@@ -0,0 +1,44 @@
-+use super::{sysc, unsupported};
+@@ -0,0 +1,211 @@
++use super::sysc;
 +use crate::ffi::CStr;
 +use crate::io;
 +use crate::num::NonZero;
++use crate::sync::Arc;
++use crate::sync::atomic::{AtomicU32, Ordering};
 +use crate::time::Duration;
 +
-+pub struct Thread(!);
++pub const DEFAULT_MIN_STACK_SIZE: usize = 2 * 1024 * 1024;
 +
-+pub const DEFAULT_MIN_STACK_SIZE: usize = 64 * 1024;
++// Child-stack-launching clone wrapper (musl-style): the child begins on the new
++// stack and calls `entry(arg)`, then exits. `ctid` is passed as the child-tid
++// pointer so the kernel can clear it (CLONE_CHILD_CLEARTID) once the thread has
++// fully left its stack — the join handshake.
++//   rdi=entry, rsi=stack_top, rdx=flags, rcx=arg, r8=ctid
++core::arch::global_asm!(
++    ".text",
++    ".globl __fullrust_clone",
++    ".hidden __fullrust_clone",
++    "__fullrust_clone:",
++    "  and rsi, -16",
++    "  sub rsi, 16",
++    "  mov [rsi], rdi",   // save entry on child stack
++    "  mov [rsi+8], rcx", // save arg
++    "  mov r10, r8",      // child_tid = ctid
++    "  mov rdi, rdx",     // clone arg1 = flags (rsi already = child stack)
++    "  xor edx, edx",     // parent_tid = 0
++    "  xor r8d, r8d",     // tls = 0
++    "  mov eax, 56",      // SYS_clone
++    "  syscall",
++    "  test rax, rax",
++    "  jnz 1f",           // parent: return tid
++    "  xor ebp, ebp",     // child: end the call-frame chain
++    "  pop rax",          // rax = entry
++    "  pop rdi",          // rdi = arg
++    "  call rax",         // entry(arg); never returns
++    "  mov eax, 60",      // SYS_exit (fallback)
++    "  xor edi, edi",
++    "  syscall",
++    "1:",
++    "  ret",
++);
++
++unsafe extern "C" {
++    fn __fullrust_clone(
++        entry: extern "C" fn(*mut u8) -> !,
++        stack_top: *mut u8,
++        flags: usize,
++        arg: *mut u8,
++        ctid: *mut u32,
++    ) -> isize;
++}
++
++// Shared VM/fds/signals, same thread group — a thread, not a process.
++const CLONE_VM: usize = 0x00000100;
++const CLONE_FS: usize = 0x00000200;
++const CLONE_FILES: usize = 0x00000400;
++const CLONE_SIGHAND: usize = 0x00000800;
++const CLONE_THREAD: usize = 0x00010000;
++const CLONE_SYSVSEM: usize = 0x00040000;
++const CLONE_CHILD_CLEARTID: usize = 0x00200000;
++
++struct Inner {
++    /// The child-tid futex word: nonzero while the thread exists, cleared to 0
++    /// (and futex-woken) by the kernel once the thread has terminated and is no
++    /// longer using its stack.
++    ctid: AtomicU32,
++}
++
++pub struct Thread {
++    inner: Arc<Inner>,
++    stack_base: *mut u8,
++    stack_size: usize,
++}
++
++// The handle is moved between threads; the stack pointer is only used (munmap)
++// after the kernel reports the thread gone.
++unsafe impl Send for Thread {}
++unsafe impl Sync for Thread {}
++
++type Payload = (Box<dyn FnOnce()>, Arc<Inner>);
++
++extern "C" fn thread_start(arg: *mut u8) -> ! {
++    // SAFETY: `arg` is the `Payload` box leaked in `Thread::new`.
++    let payload = unsafe { Box::from_raw(arg as *mut Payload) };
++    let (f, inner) = *payload;
++    f();
++    // Keep `Inner` (and thus the `ctid` word) alive past our exit: the kernel
++    // writes 0 to it *after* this thread is gone. The joiner owns the other Arc
++    // ref and frees `Inner` once it has observed the clear.
++    core::mem::forget(inner);
++    unsafe { exit_thread() }
++}
++
++unsafe fn exit_thread() -> ! {
++    unsafe {
++        sysc::syscall1(60, 0); // SYS_exit — this thread only
++    }
++    loop {
++        core::hint::spin_loop();
++    }
++}
++
++fn mmap_stack(size: usize) -> *mut u8 {
++    let r = unsafe {
++        sysc::syscall6(
++            sysc::MMAP,
++            0,
++            size,
++            sysc::PROT_READ | sysc::PROT_WRITE,
++            sysc::MAP_PRIVATE | sysc::MAP_ANONYMOUS,
++            usize::MAX,
++            0,
++        )
++    };
++    match sysc::ret(r) {
++        Ok(p) => crate::ptr::with_exposed_provenance_mut(p),
++        Err(_) => crate::ptr::null_mut(),
++    }
++}
 +
 +impl Thread {
 +    // unsafe: see thread::Builder::spawn_unchecked for safety requirements
-+    pub unsafe fn new(_stack: usize, _p: Box<dyn FnOnce()>) -> io::Result<Thread> {
-+        // Thread spawning is not implemented yet for the fullrust target
-+        // (milestone 1 is single-threaded). Comes with the futex/clone port.
-+        unsupported()
++    pub unsafe fn new(stack: usize, p: Box<dyn FnOnce()>) -> io::Result<Thread> {
++        // ctid starts nonzero; the kernel clears it on thread exit.
++        let inner = Arc::new(Inner { ctid: AtomicU32::new(1) });
++        let payload: Box<Payload> = Box::new((p, inner.clone()));
++        let arg = Box::into_raw(payload) as *mut u8;
++
++        let size = stack.max(DEFAULT_MIN_STACK_SIZE);
++        let base = mmap_stack(size);
++        if base.is_null() {
++            drop(unsafe { Box::from_raw(arg as *mut Payload) });
++            return Err(io::Error::from_raw_os_error(12)); // ENOMEM
++        }
++
++        let stack_top = unsafe { base.add(size) };
++        let ctid = inner.ctid.as_ptr();
++        let flags = CLONE_VM
++            | CLONE_FS
++            | CLONE_FILES
++            | CLONE_SIGHAND
++            | CLONE_THREAD
++            | CLONE_SYSVSEM
++            | CLONE_CHILD_CLEARTID;
++        let r = unsafe { __fullrust_clone(thread_start, stack_top, flags, arg, ctid) };
++        if r <= 0 {
++            drop(unsafe { Box::from_raw(arg as *mut Payload) });
++            unsafe {
++                sysc::syscall2(sysc::MUNMAP, base as usize, size);
++            }
++            return Err(io::Error::from_raw_os_error(if r < 0 { -r as i32 } else { 11 }));
++        }
++
++        Ok(Thread { inner, stack_base: base, stack_size: size })
 +    }
 +
 +    pub fn yield_now() {
@@ -699,7 +907,6 @@ index 00000000..1164c3c7
 +    }
 +
 +    pub fn sleep(dur: Duration) {
-+        // struct timespec { i64 tv_sec; i64 tv_nsec; }
 +        let ts = [dur.as_secs() as i64, dur.subsec_nanos() as i64];
 +        unsafe {
 +            sysc::syscall2(sysc::NANOSLEEP, ts.as_ptr() as usize, 0);
@@ -707,12 +914,41 @@ index 00000000..1164c3c7
 +    }
 +
 +    pub fn join(self) {
-+        self.0
++        // Wait for the kernel to clear the child-tid word (thread fully gone).
++        // CLONE_CHILD_CLEARTID's exit wake is a *non-private* FUTEX_WAKE, so we
++        // must wait with a non-private FUTEX_WAIT (not the private one used by
++        // the sync primitives) or the wake lands in a different hash bucket.
++        const FUTEX_WAIT: usize = 0; // shared (no FUTEX_PRIVATE_FLAG)
++        let ptr = self.inner.ctid.as_ptr() as usize;
++        loop {
++            let v = self.inner.ctid.load(Ordering::Acquire);
++            if v == 0 {
++                break;
++            }
++            unsafe {
++                // futex(uaddr, FUTEX_WAIT, v, NULL)
++                sysc::syscall6(202, ptr, FUTEX_WAIT, v as usize, 0, 0, 0);
++            }
++        }
++        // Safe now: the thread is no longer executing on its stack.
++        unsafe {
++            sysc::syscall2(sysc::MUNMAP, self.stack_base as usize, self.stack_size);
++        }
 +    }
 +}
 +
 +pub fn available_parallelism() -> io::Result<NonZero<usize>> {
-+    Ok(NonZero::new(1).unwrap())
++    // sched_getaffinity(0, sizeof(set), &set) then count the set CPU bits.
++    let mut set = [0u64; 16]; // up to 1024 CPUs
++    let r =
++        unsafe { sysc::syscall3(204, 0, core::mem::size_of_val(&set), set.as_mut_ptr() as usize) };
++    match sysc::ret(r) {
++        Ok(_) => {
++            let n: u32 = set.iter().map(|w| w.count_ones()).sum();
++            Ok(NonZero::new(n.max(1) as usize).unwrap())
++        }
++        Err(_) => Ok(NonZero::new(1).unwrap()),
++    }
 +}
 diff --git a/library/std/src/sys/pal/fullrust/time.rs b/library/std/src/sys/pal/fullrust/time.rs
 new file mode 100644
@@ -916,19 +1152,123 @@ index 336d4c85..1aeaf187 100644
          target_family = "unix",
          target_os = "hermit"
      ))] {
-diff --git a/library/std/src/sys/thread_local/mod.rs b/library/std/src/sys/thread_local/mod.rs
-index 9fafac3a..3afb56f8 100644
---- a/library/std/src/sys/thread_local/mod.rs
-+++ b/library/std/src/sys/thread_local/mod.rs
-@@ -26,6 +26,7 @@
+diff --git a/library/std/src/sys/sync/condvar/mod.rs b/library/std/src/sys/sync/condvar/mod.rs
+index d0c998a5..e18329cb 100644
+--- a/library/std/src/sys/sync/condvar/mod.rs
++++ b/library/std/src/sys/sync/condvar/mod.rs
+@@ -1,6 +1,7 @@
  cfg_if::cfg_if! {
      if #[cfg(any(
-         all(target_family = "wasm", not(target_feature = "atomics")),
+         all(target_os = "windows", not(target_vendor="win7")),
 +        target_os = "fullrust",
-         target_os = "uefi",
-         target_os = "zkvm",
-         target_os = "trusty",
-@@ -90,6 +91,7 @@ pub(crate) mod guard {
+         target_os = "linux",
+         target_os = "android",
+         target_os = "freebsd",
+diff --git a/library/std/src/sys/sync/mutex/mod.rs b/library/std/src/sys/sync/mutex/mod.rs
+index 360df3fc..03a32e55 100644
+--- a/library/std/src/sys/sync/mutex/mod.rs
++++ b/library/std/src/sys/sync/mutex/mod.rs
+@@ -1,6 +1,7 @@
+ cfg_if::cfg_if! {
+     if #[cfg(any(
+         all(target_os = "windows", not(target_vendor = "win7")),
++        target_os = "fullrust",
+         target_os = "linux",
+         target_os = "android",
+         target_os = "freebsd",
+diff --git a/library/std/src/sys/sync/once/mod.rs b/library/std/src/sys/sync/once/mod.rs
+index 0e38937b..cca86d09 100644
+--- a/library/std/src/sys/sync/once/mod.rs
++++ b/library/std/src/sys/sync/once/mod.rs
+@@ -10,6 +10,7 @@
+ cfg_if::cfg_if! {
+     if #[cfg(any(
+         all(target_os = "windows", not(target_vendor="win7")),
++        target_os = "fullrust",
+         target_os = "linux",
+         target_os = "android",
+         all(target_arch = "wasm32", target_feature = "atomics"),
+diff --git a/library/std/src/sys/sync/rwlock/mod.rs b/library/std/src/sys/sync/rwlock/mod.rs
+index 70ba6bf3..52d3f67a 100644
+--- a/library/std/src/sys/sync/rwlock/mod.rs
++++ b/library/std/src/sys/sync/rwlock/mod.rs
+@@ -1,6 +1,7 @@
+ cfg_if::cfg_if! {
+     if #[cfg(any(
+         all(target_os = "windows", not(target_vendor = "win7")),
++        target_os = "fullrust",
+         target_os = "linux",
+         target_os = "android",
+         target_os = "freebsd",
+diff --git a/library/std/src/sys/sync/thread_parking/mod.rs b/library/std/src/sys/sync/thread_parking/mod.rs
+index f4d8fa0a..2b9885cc 100644
+--- a/library/std/src/sys/sync/thread_parking/mod.rs
++++ b/library/std/src/sys/sync/thread_parking/mod.rs
+@@ -1,6 +1,7 @@
+ cfg_if::cfg_if! {
+     if #[cfg(any(
+         all(target_os = "windows", not(target_vendor = "win7")),
++        target_os = "fullrust",
+         target_os = "linux",
+         target_os = "android",
+         all(target_arch = "wasm32", target_feature = "atomics"),
+diff --git a/library/std/src/sys/thread_local/key/fullrust.rs b/library/std/src/sys/thread_local/key/fullrust.rs
+new file mode 100644
+index 00000000..0b7c19ae
+--- /dev/null
++++ b/library/std/src/sys/thread_local/key/fullrust.rs
+@@ -0,0 +1,46 @@
++//! Key-based TLS for the fullrust target.
++//!
++//! There is no libc and (for now) no ELF `#[thread_local]`, so thread-locals are
++//! stored in a global registry keyed by `(thread id, key)`. A `Key` is just a
++//! monotonically increasing id; `set`/`get` look up the current thread's slot.
++//! Destructors are not run at thread exit (the value is leaked) — the common
++//! `FOO.with(..)` access pattern works; this mirrors purestd's approach.
++
++use crate::collections::BTreeMap;
++use crate::sync::Mutex;
++use crate::sync::atomic::{AtomicUsize, Ordering};
++
++pub type Key = usize;
++
++static NEXT_KEY: AtomicUsize = AtomicUsize::new(1); // 0 is KEY_SENTVAL; never hand it out
++static REGISTRY: Mutex<BTreeMap<(u64, Key), usize>> = Mutex::new(BTreeMap::new());
++
++#[inline]
++fn tid() -> u64 {
++    // gettid(2) = 186 on x86-64; returns this thread's kernel id.
++    unsafe { crate::sys::pal::sysc::syscall1(186, 0) as u64 }
++}
++
++#[inline]
++pub fn create(_dtor: Option<unsafe extern "C" fn(*mut u8)>) -> Key {
++    NEXT_KEY.fetch_add(1, Ordering::Relaxed)
++}
++
++#[inline]
++pub unsafe fn set(key: Key, value: *mut u8) {
++    let v = value.expose_provenance();
++    REGISTRY.lock().unwrap().insert((tid(), key), v);
++}
++
++#[inline]
++pub unsafe fn get(key: Key) -> *mut u8 {
++    match REGISTRY.lock().unwrap().get(&(tid(), key)).copied() {
++        Some(v) => crate::ptr::with_exposed_provenance_mut(v),
++        None => crate::ptr::null_mut(),
++    }
++}
++
++#[inline]
++pub unsafe fn destroy(_key: Key) {
++    // Keys are never reused; nothing to free.
++}
+diff --git a/library/std/src/sys/thread_local/mod.rs b/library/std/src/sys/thread_local/mod.rs
+index 9fafac3a..a0eed36b 100644
+--- a/library/std/src/sys/thread_local/mod.rs
++++ b/library/std/src/sys/thread_local/mod.rs
+@@ -90,6 +90,7 @@ pub(crate) mod guard {
              all(target_family = "wasm", not(
                  all(target_os = "wasi", target_env = "p1", target_feature = "atomics")
              )),
@@ -936,6 +1276,21 @@ index 9fafac3a..3afb56f8 100644
              target_os = "uefi",
              target_os = "zkvm",
              target_os = "trusty",
+@@ -132,7 +133,13 @@ pub(crate) fn enable() {}
+ /// with a pointer which we can get and set to store our data.
+ pub(crate) mod key {
+     cfg_if::cfg_if! {
+-        if #[cfg(any(
++        if #[cfg(target_os = "fullrust")] {
++            mod racy;
++            mod fullrust;
++            pub(super) use fullrust::{Key, get, set};
++            pub(super) use racy::LazyKey;
++            use fullrust::{create, destroy};
++        } else if #[cfg(any(
+             all(
+                 not(target_vendor = "apple"),
+                 not(target_family = "wasm"),
 diff --git a/src/bootstrap/src/core/build_steps/compile.rs b/src/bootstrap/src/core/build_steps/compile.rs
 index 2e5865e5..db03deb7 100644
 --- a/src/bootstrap/src/core/build_steps/compile.rs
