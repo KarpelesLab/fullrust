@@ -95,23 +95,44 @@ cd rust-1.88 && git add -A -- compiler/rustc_target library/std src/bootstrap \
 
 ## Status
 
-**Rust 1.88 — milestone 1 reached.** An unmodified crate (`fn main`, `use std`,
-`println!`, `BTreeMap`, `env::args`) builds with the fork and runs as a
-**statically-linked, libc-free ELF** (~44 KB): no `INTERP` segment, no `NEEDED`
-entries, no libc/GLIBC symbols; `strace` shows raw `write`/`exit_group` syscalls.
+**Rust 1.88 — milestone 1 + threads + native TLS + fast allocator.** An
+unmodified crate (`fn main`, `use std`, `println!`, `BTreeMap`, `env::args`)
+builds with the fork and runs as a **statically-linked, libc-free ELF** (~44 KB):
+no `INTERP` segment, no `NEEDED` entries, no libc/GLIBC symbols; `strace` shows
+raw `write`/`exit_group` syscalls.
 
 **Threads work too.** `thread::spawn`/`join`, `Arc<Mutex>` under contention,
 and `thread_local!` all run correctly on a static libc-free binary: an 8-thread
 × 100k-iteration contended-counter test lands 800000/800000 with per-thread TLS
 verified, `available_parallelism()` reports the real CPU count.
 
+**Native `%fs` TLS.** Thread-locals are real ELF `#[thread_local]` (local-exec
+model), not a registry: the pal sets up a variant-II TCB and installs `%fs` for
+the main thread (`arch_prctl` after parsing `PT_TLS` from the auxv) and for
+spawned threads (`CLONE_SETTLS`), so a thread-local access is a single `mov`.
+`has_thread_local = true`; the old `(tid,key)` `BTreeMap` registry is gone.
+Thread-local **destructors now run** at thread exit (the pal calls
+`destructors::run` + `rt::thread_cleanup`, hermit-style). See
+`sys/pal/fullrust/tls.rs`.
+
+**mimalloc-class allocator.** The `System` allocator is a per-thread, free-list-
+sharded heap (`sys/pal/fullrust/heap.rs`): 4 MiB aligned segments sliced into
+64 KiB size-class pages, a lock-/atomic-free owner fast path reached in two loads
+off `%fs`, atomic `thread_free` lists for cross-thread frees, abandoned-segment
+reclamation on thread exit, and OS purging via `madvise(MADV_FREE)`/`munmap`.
+Free is routed entirely by `Layout` (no per-allocation header). Versus the old
+page-per-mmap allocator on a 32-core box: **~235× faster** single-thread
+(2879 → 12 ns/op), near-linear multicore scaling (0.16 → ~1800 M ops/s at 32
+threads), and fragmentation overhead cut 1.43× → 1.08×. A debug-assertion-gated
+integrity check rejects double/foreign/use-after-frees at zero release cost.
+
 Implemented `std::sys::pal::fullrust`: `_start`, raw x86-64 syscalls, process
 exit/abort, `clock_gettime` time, sleep/yield, args (lossy-UTF8), stdio
-read/write, `getrandom`, an mmap `System` allocator, **threads** (`clone(2)`
-musl-style trampoline + `CLONE_CHILD_CLEARTID` join handshake), **futex-based
-sync** (Mutex/Condvar/RwLock/Once/parking), and **key-based thread-locals** (a
-`(tid, key)` registry via the `os` TLS path). `strlen` is provided in the pal;
-`mem*` come from `compiler-builtins-mem` (enabled for the target in `std_cargo`).
+read/write, `getrandom`, the **mimalloc-class allocator** above, **threads**
+(`clone(2)` musl-style trampoline + `CLONE_CHILD_CLEARTID` join handshake),
+**futex-based sync** (Mutex/Condvar/RwLock/Once/parking), and **native `%fs`
+thread-locals**. `strlen` is provided in the pal; `mem*` come from
+`compiler-builtins-mem` (enabled for the target in `std_cargo`).
 
 Extra changes beyond the target spec / pal: `build.rs` (check-cfg + restricted_std
 allowlist), `cc_detect.rs` (probe via the gnu triple), `compile.rs`
@@ -119,14 +140,12 @@ allowlist), `cc_detect.rs` (probe via the gnu triple), `compile.rs`
 dispatchers, and `fullrust` branches in the `sys/sync/*` + `thread_local` guards.
 
 ### Known limitations (next steps)
-- **TLS destructors don't run** at thread exit — the key-based registry leaks
-  per-thread values (common `FOO.with(..)` access is correct; `Drop` is skipped).
-- **Allocator** is a simple page-per-allocation mmap (correct, wasteful); port
-  purestd's segregated free-list for efficiency.
 - **No fs/net/process** yet — those pal pieces are still `unsupported`; wire them
   to real syscalls (reuse purestd) next.
-- **fs/net/process** fall through to `unsupported` — wire them to purestd's
-  syscall code next.
+- **Allocator**: large (>8 KiB) and over-aligned allocations take a dedicated
+  `mmap` each (correct, but not cached); a medium/large segment tier and finer
+  decommit hysteresis are future work. Abandoned segments are reclaimed on
+  demand; never-reclaimed ones stay mapped (bounded, mimalloc-style).
 
 ## Version matrix
 

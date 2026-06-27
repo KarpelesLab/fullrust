@@ -4,6 +4,5 @@
 # patches/scripts under toolchain/ are tracked explicitly.
 /toolchain/rust-*
 /toolchain/*.log
-/toolchain/test-hello/target
-/toolchain/test-threads/target
+/toolchain/test-*/target
 /toolchain/build.pid

@@ -1,0 +1,15 @@
+[package]
+name = "alloc-bench-fullrust"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "alloc-bench-fullrust"
+path = "src/main.rs"
+
+# opt-level 3 (not z): we are benchmarking the allocator, not minimizing size.
+[profile.release]
+panic = "abort"
+opt-level = 3
+lto = true
+strip = true

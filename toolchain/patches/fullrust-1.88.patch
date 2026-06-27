@@ -1,6 +1,6 @@
 diff --git a/compiler/rustc_target/src/spec/base/fullrust.rs b/compiler/rustc_target/src/spec/base/fullrust.rs
 new file mode 100644
-index 00000000..fcf231bf
+index 00000000..e5776ab0
 --- /dev/null
 +++ b/compiler/rustc_target/src/spec/base/fullrust.rs
 @@ -0,0 +1,49 @@
@@ -36,11 +36,11 @@ index 00000000..fcf231bf
 +        // otherwise reference the personality routine.
 +        panic_strategy: PanicStrategy::Abort,
 +
-+        // Milestone 1 is single-threaded and uses std's `no_threads`
-+        // thread-locals (plain statics), so ELF `#[thread_local]` TLS is off for
-+        // now. Enabling it later (with %fs/TCB setup in `_start`) unlocks the
-+        // native TLS path and real threads.
-+        has_thread_local: false,
++        // Native ELF `#[thread_local]` TLS: the pal sets up a `%fs`-based TCB in
++        // `_start` (main thread) and via CLONE_SETTLS (spawned threads), so std
++        // can use the fast single-instruction local-exec TLS model instead of a
++        // key/registry lookup. See `sys::pal::fullrust::tls`.
++        has_thread_local: true,
 +
 +        max_atomic_width: Some(64),
 +
@@ -142,79 +142,41 @@ index ef695601..f4f4971b 100644
          || env::var("RUSTC_BOOTSTRAP_SYNTHETIC_TARGET").is_ok()
 diff --git a/library/std/src/sys/alloc/fullrust.rs b/library/std/src/sys/alloc/fullrust.rs
 new file mode 100644
-index 00000000..df74af19
+index 00000000..758984ca
 --- /dev/null
 +++ b/library/std/src/sys/alloc/fullrust.rs
-@@ -0,0 +1,71 @@
-+//! Global allocator for the fullrust target: anonymous `mmap`/`munmap`.
+@@ -0,0 +1,33 @@
++//! Global allocator for the fullrust target.
 +//!
-+//! Milestone-1 allocator: every allocation is a page-rounded private anonymous
-+//! mapping, released with `munmap` on free (the size comes back via `Layout`,
-+//! so no header is needed). Simple and correct; wasteful for small allocations.
-+//! A segregated free-list (ported from purestd) replaces this later.
++//! This is a thin shim over [`crate::sys::pal::fullrust::heap`], a mimalloc-class
++//! allocator: per-thread heaps reached via `%fs`, 4 MiB segments sliced into
++//! size-class pages, sharded local/cross-thread free lists, and OS purging via
++//! `madvise`/`munmap`. See that module for the design. Free is routed purely by
++//! `Layout`, so there is no per-allocation header.
 +
-+use super::super::pal::sysc;
++use super::super::pal::heap;
 +use crate::alloc::{GlobalAlloc, Layout, System};
-+use crate::ptr;
-+
-+const PAGE: usize = 4096;
-+
-+#[inline]
-+fn round_up(v: usize, to: usize) -> usize {
-+    (v + to - 1) & !(to - 1)
-+}
-+
-+#[inline]
-+fn mmap(len: usize) -> *mut u8 {
-+    let r = unsafe {
-+        // mmap(NULL, len, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
-+        sysc::syscall6(
-+            sysc::MMAP,
-+            0,
-+            len,
-+            sysc::PROT_READ | sysc::PROT_WRITE,
-+            sysc::MAP_PRIVATE | sysc::MAP_ANONYMOUS,
-+            usize::MAX, // fd = -1
-+            0,
-+        )
-+    };
-+    match sysc::ret(r) {
-+        // The kernel handed us a fresh mapping at address `p`; materialize a
-+        // pointer with provenance for it (strict-provenance compliant).
-+        Ok(p) => ptr::with_exposed_provenance_mut(p),
-+        Err(_) => ptr::null_mut(),
-+    }
-+}
 +
 +#[stable(feature = "alloc_system_type", since = "1.28.0")]
 +unsafe impl GlobalAlloc for System {
 +    #[inline]
 +    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-+        // mmap returns page-aligned memory; that satisfies any alignment up to a
-+        // page. std's allocations are far below that.
-+        debug_assert!(layout.align() <= PAGE);
-+        mmap(round_up(layout.size().max(1), PAGE))
++        unsafe { heap::alloc(layout.size(), layout.align()) }
 +    }
 +
 +    #[inline]
 +    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-+        // Freshly mmap'd anonymous memory is already zeroed.
-+        unsafe { self.alloc(layout) }
++        unsafe { heap::alloc_zeroed(layout.size(), layout.align()) }
 +    }
 +
 +    #[inline]
 +    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-+        if ptr.is_null() {
-+            return;
-+        }
-+        unsafe {
-+            sysc::syscall2(sysc::MUNMAP, ptr as usize, round_up(layout.size().max(1), PAGE));
-+        }
++        unsafe { heap::dealloc(ptr, layout.size(), layout.align()) }
 +    }
 +
 +    #[inline]
 +    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-+        unsafe { super::realloc_fallback(self, ptr, layout, new_size) }
++        unsafe { heap::realloc(ptr, layout.size(), layout.align(), new_size) }
 +    }
 +}
 diff --git a/library/std/src/sys/alloc/mod.rs b/library/std/src/sys/alloc/mod.rs
@@ -424,12 +386,833 @@ index 00000000..47cf7101
 +        sysc::syscall3(SYS_FUTEX, ptr, FUTEX_WAKE_PRIVATE, i32::MAX as usize);
 +    }
 +}
+diff --git a/library/std/src/sys/pal/fullrust/heap.rs b/library/std/src/sys/pal/fullrust/heap.rs
+new file mode 100644
+index 00000000..887454d8
+--- /dev/null
++++ b/library/std/src/sys/pal/fullrust/heap.rs
+@@ -0,0 +1,815 @@
++//! A mimalloc-class global allocator for the fullrust target.
++//!
++//! The design follows mimalloc's "free-list sharding" model, adapted to a
++//! libc-free Linux target on raw syscalls:
++//!
++//!   * **Per-thread heaps.** Each thread owns a `Heap`, reached in one load off
++//!     the `%fs` TCB (see [`super::tls`]). The hot alloc/free path touches only
++//!     the owning thread's data — no lock, no atomics, no syscall.
++//!
++//!   * **Segments and pages.** Memory comes from 4 MiB, 4 MiB-aligned segments
++//!     (`mmap`). A segment is sliced into 64 KiB *pages*; each page serves a
++//!     single size class. Because segments are aligned, the segment header (and
++//!     thus a block's page) is found from any block pointer by masking — so
++//!     there is **no per-allocation header** and free is routed entirely by the
++//!     caller's `Layout`.
++//!
++//!   * **Sharded free lists.** A page has a `free` list owned exclusively by the
++//!     allocating thread (popped/pushed with no atomics) and an atomic
++//!     `thread_free` list onto which *other* threads push when they free a block
++//!     they don't own. The owner folds `thread_free` into `free` only when its
++//!     local list runs dry — so cross-thread frees never contend the fast path.
++//!
++//!   * **Size classes.** ~36 classes with bounded internal waste: 8 B, then
++//!     16 B-spaced, then four geometric steps per octave up to 8 KiB. Every
++//!     class above the 8 B one is a multiple of 16, so any allocation with
++//!     `align <= 16` is satisfied by class selection alone. Anything larger than
++//!     8 KiB, or with `align > 16`, takes a dedicated page-rounded `mmap`,
++//!     released to the OS on free.
++//!
++//! Memory is returned to the OS when a page empties (`madvise(MADV_FREE)`) and a
++//! fully-empty segment is `munmap`ped, so resident size tracks live bytes.
++
++use super::sysc;
++use super::tls;
++use crate::ptr;
++use crate::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
++
++// --- geometry -------------------------------------------------------------
++
++const SEGMENT_SHIFT: usize = 22;
++const SEGMENT_SIZE: usize = 1 << SEGMENT_SHIFT; // 4 MiB
++const SEGMENT_MASK: usize = SEGMENT_SIZE - 1;
++
++const PAGE_SHIFT: usize = 16;
++const PAGE_SIZE: usize = 1 << PAGE_SHIFT; // 64 KiB
++const PAGES_PER_SEGMENT: usize = SEGMENT_SIZE / PAGE_SIZE; // 64; page 0 is the header
++
++const OS_PAGE: usize = 4096;
++const MAX_SMALL: usize = 8192; // largest size served from pages
++
++/// Size classes (bytes). All but the first are multiples of 16, so an
++/// allocation with `align <= 16` is satisfied by picking a class `>= max(size,
++/// align)` rounded to `align`.
++const CLASS_SIZES: [u32; 36] = [
++    8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512, 640,
++    768, 896, 1024, 1280, 1536, 1792, 2048, 2560, 3072, 3584, 4096, 5120, 6144, 7168, 8192,
++];
++const NUM_CLASSES: usize = CLASS_SIZES.len();
++const IDX_LEN: usize = MAX_SMALL / 8; // 1024
++
++/// `IDX[(need - 1) >> 3]` is the index of the smallest class `>= need`, for
++/// `1 <= need <= MAX_SMALL`. Built so the whole `[need-7 ..= need]` bucket maps
++/// to a class large enough for the bucket's top.
++const IDX: [u8; IDX_LEN] = build_idx();
++
++const fn build_idx() -> [u8; IDX_LEN] {
++    let mut t = [0u8; IDX_LEN];
++    let mut b = 0;
++    while b < IDX_LEN {
++        let target = (b + 1) * 8;
++        let mut i = 0;
++        while i < NUM_CLASSES {
++            if CLASS_SIZES[i] as usize >= target {
++                break;
++            }
++            i += 1;
++        }
++        t[b] = i as u8;
++        b += 1;
++    }
++    t
++}
++
++#[inline]
++fn round_up(v: usize, to: usize) -> usize {
++    (v + to - 1) & !(to - 1)
++}
++
++/// Class index for an already-`need`-rounded request, `need <= MAX_SMALL`.
++#[inline]
++fn class_of(need: usize) -> usize {
++    IDX[(need - 1) >> 3] as usize
++}
++
++// --- raw OS memory --------------------------------------------------------
++
++#[inline]
++fn os_mmap(len: usize) -> *mut u8 {
++    let r = unsafe {
++        sysc::syscall6(
++            sysc::MMAP,
++            0,
++            len,
++            sysc::PROT_READ | sysc::PROT_WRITE,
++            sysc::MAP_PRIVATE | sysc::MAP_ANONYMOUS,
++            usize::MAX, // fd = -1
++            0,
++        )
++    };
++    match sysc::ret(r) {
++        Ok(p) => ptr::with_exposed_provenance_mut(p),
++        Err(_) => ptr::null_mut(),
++    }
++}
++
++#[inline]
++unsafe fn os_munmap(addr: usize, len: usize) {
++    unsafe {
++        sysc::syscall2(sysc::MUNMAP, addr, len);
++    }
++}
++
++#[inline]
++unsafe fn os_madvise(addr: usize, len: usize, advice: usize) {
++    unsafe {
++        sysc::syscall3(sysc::MADVISE, addr, len, advice);
++    }
++}
++
++/// Map a fresh 4 MiB segment aligned to its size (over-map by one segment, then
++/// trim the head and tail). Returns the aligned base, or null.
++fn os_alloc_segment() -> *mut u8 {
++    let over = SEGMENT_SIZE * 2;
++    let raw = os_mmap(over);
++    if raw.is_null() {
++        return ptr::null_mut();
++    }
++    let raw_addr = raw.addr();
++    let base_addr = round_up(raw_addr, SEGMENT_SIZE);
++    // Trim the unaligned head and the leftover tail back to the OS.
++    if base_addr > raw_addr {
++        unsafe { os_munmap(raw_addr, base_addr - raw_addr) };
++    }
++    let tail = base_addr + SEGMENT_SIZE;
++    let end = raw_addr + over;
++    if end > tail {
++        unsafe { os_munmap(tail, end - tail) };
++    }
++    ptr::with_exposed_provenance_mut(base_addr)
++}
++
++// --- data structures ------------------------------------------------------
++
++/// A free block: when on a free list, its first word is the next pointer.
++#[repr(C)]
++struct Block {
++    next: *mut Block,
++}
++
++/// Per-page metadata, stored in the owning segment's header (never in the page's
++/// own data area, which stays fully usable).
++#[repr(C)]
++struct Page {
++    /// Owner-thread free list (no atomics).
++    free: *mut Block,
++    /// Cross-thread free list: other threads push here atomically.
++    thread_free: AtomicPtr<Block>,
++    /// Bump pointer for never-yet-allocated blocks in this page.
++    bump: *mut u8,
++    /// End of this page's data area.
++    bump_end: *mut u8,
++    /// Outstanding blocks (handed out, not yet freed/collected). `0` ⟹ empty.
++    used: u32,
++    /// Size class in bytes, or `0` for an unused page slot.
++    block_size: u32,
++    /// Links within the owning heap's per-class page list.
++    next: *mut Page,
++    prev: *mut Page,
++}
++
++/// A 4 MiB segment header (at the segment base). `pages[0]`'s data area holds
++/// this header; usable pages are `1..PAGES_PER_SEGMENT`.
++#[repr(C)]
++struct Segment {
++    /// Owning heap, or null while abandoned. Atomic so a cross-thread freer can
++    /// read it while the owner publishes/abandons.
++    owner: AtomicPtr<Heap>,
++    /// Pages with `used > 0`. When this hits 0 the segment is fully free.
++    used_pages: u32,
++    /// Link in the owning heap's segment list.
++    next: *mut Segment,
++    prev: *mut Segment,
++    /// Link in the global abandoned-segment stack.
++    abandoned_next: *mut Segment,
++    pages: [Page; PAGES_PER_SEGMENT],
++}
++
++/// A per-thread heap: the head of a per-class page list, plus the owned
++/// segments. Created lazily on first allocation and reached via `%fs`.
++#[repr(C)]
++struct Heap {
++    /// Head page per size class (allocation tries this first).
++    active: [*mut Page; NUM_CLASSES],
++    /// Owned segments (doubly linked for O(1) unlink on free-to-OS).
++    segments: *mut Segment,
++}
++
++// --- segment / page helpers ----------------------------------------------
++
++#[inline]
++fn segment_of(block: *mut u8) -> *mut Segment {
++    ptr::with_exposed_provenance_mut(block.addr() & !SEGMENT_MASK)
++}
++
++#[inline]
++fn page_index(seg: *mut Segment, block: *mut u8) -> usize {
++    (block.addr() - (seg as *mut u8).addr()) >> PAGE_SHIFT
++}
++
++/// Data area base of page `i` within `seg`.
++#[inline]
++fn page_data(seg: *mut Segment, i: usize) -> *mut u8 {
++    ptr::with_exposed_provenance_mut((seg as *mut u8).addr() + i * PAGE_SIZE)
++}
++
++// --- the global allocator -------------------------------------------------
++
++/// Spinlock guarding the global abandoned-segment stack (touched only on thread
++/// exit and segment reclaim, both rare).
++static ABANDON_LOCK: AtomicBool = AtomicBool::new(false);
++static ABANDONED: AtomicPtr<Segment> = AtomicPtr::new(ptr::null_mut());
++
++#[inline]
++fn lock_abandon() {
++    while ABANDON_LOCK
++        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
++        .is_err()
++    {
++        core::hint::spin_loop();
++    }
++}
++#[inline]
++fn unlock_abandon() {
++    ABANDON_LOCK.store(false, Ordering::Release);
++}
++
++/// Return this thread's heap, creating it (from raw `mmap`, never the global
++/// allocator) on first use.
++#[inline]
++fn heap() -> *mut Heap {
++    let h = tls::heap() as *mut Heap;
++    if !h.is_null() { h } else { heap_init() }
++}
++
++#[cold]
++fn heap_init() -> *mut Heap {
++    // One OS page holds the Heap struct; it is zero from a fresh mapping, so all
++    // `active` heads and `segments` start null.
++    let mem = os_mmap(round_up(core::mem::size_of::<Heap>(), OS_PAGE));
++    if mem.is_null() {
++        return ptr::null_mut();
++    }
++    let h = mem as *mut Heap;
++    tls::set_heap(h as *mut u8);
++    h
++}
++
++/// Pop one block from a page, folding in cross-thread frees and bumping a fresh
++/// block as needed. Returns null if the page is full.
++#[inline]
++unsafe fn page_alloc(p: *mut Page) -> *mut u8 {
++    let page = unsafe { &mut *p };
++    // Fast path: local free list.
++    let b = page.free;
++    if !b.is_null() {
++        page.free = unsafe { (*b).next };
++        page.used += 1;
++        return b as *mut u8;
++    }
++    // Local list empty: adopt any cross-thread frees.
++    let tf = page.thread_free.swap(ptr::null_mut(), Ordering::Acquire);
++    if !tf.is_null() {
++        // Count the adopted chain so `used` stays exact (those blocks were
++        // handed out but their frees haven't been subtracted yet).
++        let mut n: u32 = 0;
++        let mut node = tf;
++        while !node.is_null() {
++            n += 1;
++            node = unsafe { (*node).next };
++        }
++        page.used -= n;
++        let head = tf;
++        page.free = unsafe { (*head).next };
++        page.used += 1;
++        return head as *mut u8;
++    }
++    // Nothing freed: hand out a never-used block.
++    if page.bump.addr() < page.bump_end.addr() {
++        let b = page.bump;
++        page.bump = unsafe { page.bump.add(page.block_size as usize) };
++        page.used += 1;
++        return b;
++    }
++    ptr::null_mut()
++}
++
++/// Find a usable page slot in `h`'s segments (or a reclaimed/new segment) and
++/// initialize it for `class`, linking it as the head of the class list.
++#[cold]
++unsafe fn heap_alloc_page(h: *mut Heap, class: usize) -> *mut Page {
++    let heap = unsafe { &mut *h };
++    let bsize = CLASS_SIZES[class];
++
++    loop {
++        // Look for a free page slot (block_size == 0) in an owned segment. A
++        // reclaimed segment may have *live* pages re-queued at any slot, so we
++        // must take a genuinely free slot rather than assuming slot 1.
++        let mut seg = heap.segments;
++        while !seg.is_null() {
++            let s = unsafe { &mut *seg };
++            let mut i = 1;
++            while i < PAGES_PER_SEGMENT {
++                if s.pages[i].block_size == 0 {
++                    return unsafe { init_page(seg, i, class, bsize, h) };
++                }
++                i += 1;
++            }
++            seg = s.next;
++        }
++
++        // No free slot anywhere: adopt an abandoned segment, else map a new one.
++        // Both link the segment into `heap.segments`; loop back to claim a slot
++        // in it (a reclaimed segment can be full, in which case we try again).
++        let seg = unsafe { reclaim_segment(h) };
++        if seg.is_null() {
++            let seg = unsafe { new_segment(h) };
++            if seg.is_null() {
++                return ptr::null_mut();
++            }
++        }
++    }
++}
++
++/// Initialize page slot `i` of `seg` for `class` and push it to the head of the
++/// owning heap's class list.
++#[inline]
++unsafe fn init_page(
++    seg: *mut Segment,
++    i: usize,
++    class: usize,
++    bsize: u32,
++    h: *mut Heap,
++) -> *mut Page {
++    let s = unsafe { &mut *seg };
++    let data = page_data(seg, i);
++    let pg = &mut s.pages[i] as *mut Page;
++    let page = unsafe { &mut *pg };
++    page.free = ptr::null_mut();
++    page.thread_free = AtomicPtr::new(ptr::null_mut());
++    page.bump = data;
++    // Whole-number block count for this page.
++    let blocks = PAGE_SIZE / bsize as usize;
++    page.bump_end = unsafe { data.add(blocks * bsize as usize) };
++    page.used = 0;
++    page.block_size = bsize;
++    s.used_pages += 1;
++
++    // Push to the head of the class list.
++    let heap = unsafe { &mut *h };
++    page.prev = ptr::null_mut();
++    page.next = heap.active[class];
++    if !page.next.is_null() {
++        unsafe { (*page.next).prev = pg };
++    }
++    heap.active[class] = pg;
++    pg
++}
++
++/// Map and register a new segment owned by `h`.
++#[cold]
++unsafe fn new_segment(h: *mut Heap) -> *mut Segment {
++    let base = os_alloc_segment();
++    if base.is_null() {
++        return ptr::null_mut();
++    }
++    // Fresh mapping is zero: all Page fields, used_pages, links start cleared.
++    let seg = base as *mut Segment;
++    let s = unsafe { &mut *seg };
++    s.owner = AtomicPtr::new(h);
++    s.used_pages = 0;
++    s.abandoned_next = ptr::null_mut();
++    // Link into the heap's segment list.
++    let heap = unsafe { &mut *h };
++    s.prev = ptr::null_mut();
++    s.next = heap.segments;
++    if !s.next.is_null() {
++        unsafe { (*s.next).prev = seg };
++    }
++    heap.segments = seg;
++    seg
++}
++
++/// Try to take an abandoned segment off the global stack and adopt it into `h`:
++/// re-own it, re-queue its live pages, and fold in any cross-thread frees.
++#[cold]
++unsafe fn reclaim_segment(h: *mut Heap) -> *mut Segment {
++    lock_abandon();
++    let seg = ABANDONED.load(Ordering::Acquire);
++    if seg.is_null() {
++        unlock_abandon();
++        return ptr::null_mut();
++    }
++    let s = unsafe { &mut *seg };
++    ABANDONED.store(s.abandoned_next, Ordering::Release);
++    unlock_abandon();
++
++    s.abandoned_next = ptr::null_mut();
++    s.owner.store(h, Ordering::Release);
++
++    // Re-queue every live page into this heap's class lists and recount.
++    let heap = unsafe { &mut *h };
++    s.used_pages = 0;
++    let mut i = 1;
++    while i < PAGES_PER_SEGMENT {
++        let pg = &mut s.pages[i] as *mut Page;
++        let page = unsafe { &mut *pg };
++        if page.block_size != 0 {
++            // Fold cross-thread frees collected while abandoned.
++            let tf = page.thread_free.swap(ptr::null_mut(), Ordering::Acquire);
++            if !tf.is_null() {
++                let mut n: u32 = 0;
++                let mut node = tf;
++                let mut last = tf;
++                while !node.is_null() {
++                    n += 1;
++                    last = node;
++                    node = unsafe { (*node).next };
++                }
++                page.used -= n;
++                unsafe { (*last).next = page.free };
++                page.free = tf;
++            }
++            if page.used == 0 {
++                // Became fully free while abandoned: reset to an empty slot.
++                page.block_size = 0;
++                page.free = ptr::null_mut();
++            } else {
++                s.used_pages += 1;
++                let class = class_of(page.block_size as usize);
++                page.prev = ptr::null_mut();
++                page.next = heap.active[class];
++                if !page.next.is_null() {
++                    unsafe { (*page.next).prev = pg };
++                }
++                heap.active[class] = pg;
++            }
++        }
++        i += 1;
++    }
++
++    // Link the segment into the heap.
++    s.prev = ptr::null_mut();
++    s.next = heap.segments;
++    if !s.next.is_null() {
++        unsafe { (*s.next).prev = seg };
++    }
++    heap.segments = seg;
++    seg
++}
++
++/// Small (page-served) allocation for `class`.
++#[inline]
++unsafe fn alloc_small(class: usize) -> *mut u8 {
++    let h = heap();
++    if h.is_null() {
++        return ptr::null_mut();
++    }
++    let heap = unsafe { &mut *h };
++
++    // Try the active page for this class.
++    let head = heap.active[class];
++    if !head.is_null() {
++        let b = unsafe { page_alloc(head) };
++        if !b.is_null() {
++            return b;
++        }
++        // Active page full: scan the class list for one with space (folding in
++        // cross-thread frees), and promote it to the head.
++        let mut p = unsafe { (*head).next };
++        while !p.is_null() {
++            let b = unsafe { page_alloc(p) };
++            if !b.is_null() {
++                unsafe { promote(heap, class, p) };
++                return b;
++            }
++            p = unsafe { (*p).next };
++        }
++    }
++
++    // No page with space: get a fresh one.
++    let pg = unsafe { heap_alloc_page(h, class) };
++    if pg.is_null() {
++        return ptr::null_mut();
++    }
++    unsafe { page_alloc(pg) }
++}
++
++/// Move page `p` to the head of its class list.
++#[inline]
++unsafe fn promote(heap: &mut Heap, class: usize, p: *mut Page) {
++    if heap.active[class] == p {
++        return;
++    }
++    let page = unsafe { &mut *p };
++    // Unlink.
++    if !page.prev.is_null() {
++        unsafe { (*page.prev).next = page.next };
++    }
++    if !page.next.is_null() {
++        unsafe { (*page.next).prev = page.prev };
++    }
++    // Push front.
++    page.prev = ptr::null_mut();
++    page.next = heap.active[class];
++    if !page.next.is_null() {
++        unsafe { (*page.next).prev = p };
++    }
++    heap.active[class] = p;
++}
++
++/// Free a small (page-served) block back to its page.
++#[inline]
++unsafe fn free_small(block: *mut u8) {
++    let seg = segment_of(block);
++    let i = page_index(seg, block);
++    let s = unsafe { &mut *seg };
++    let pg = &mut s.pages[i] as *mut Page;
++
++    // Integrity check (debug only, zero release cost): the freed pointer must
++    // land on its page's current size-class grid. A miss means a double free, a
++    // free of a foreign/stale pointer, or a use-after-free — fail loudly here
++    // rather than corrupt the heap. (Caught the segment-reuse bug during bring-up.)
++    #[cfg(debug_assertions)]
++    {
++        let page = unsafe { &*pg };
++        let data = page_data(seg, i);
++        let off = block.addr().wrapping_sub(data.addr());
++        debug_assert!(
++            page.block_size != 0
++                && off < PAGE_SIZE
++                && off % page.block_size as usize == 0,
++            "invalid free: pointer not on its page's size-class grid",
++        );
++    }
++
++    let owner = s.owner.load(Ordering::Relaxed);
++    let me = tls::heap() as *mut Heap;
++    if owner == me && !owner.is_null() {
++        // Owner-thread free: push to the local free list, no atomics.
++        let page = unsafe { &mut *pg };
++        let b = block as *mut Block;
++        unsafe { (*b).next = page.free };
++        page.free = b;
++        page.used -= 1;
++        if page.used == 0 {
++            unsafe { retire_page(seg, i) };
++        }
++    } else {
++        // Cross-thread (or abandoned-segment) free: push atomically.
++        let page = unsafe { &*pg };
++        let b = block as *mut Block;
++        let mut head = page.thread_free.load(Ordering::Relaxed);
++        loop {
++            unsafe { (*b).next = head };
++            match page.thread_free.compare_exchange_weak(
++                head,
++                b,
++                Ordering::Release,
++                Ordering::Relaxed,
++            ) {
++                Ok(_) => break,
++                Err(h) => head = h,
++            }
++        }
++    }
++}
++
++/// A page just emptied (owner thread): drop its physical pages and mark the slot
++/// reusable; if its segment is now fully empty, return the whole segment.
++#[cold]
++unsafe fn retire_page(seg: *mut Segment, i: usize) {
++    let s = unsafe { &mut *seg };
++    let pg = &mut s.pages[i];
++    // Reset to an empty, reusable slot.
++    let class = class_of(pg.block_size as usize);
++    // Unlink from the class list.
++    let me = s.owner.load(Ordering::Relaxed);
++    if !me.is_null() {
++        let heap = unsafe { &mut *me };
++        if heap.active[class] == (pg as *mut Page) {
++            heap.active[class] = pg.next;
++        }
++        if !pg.prev.is_null() {
++            unsafe { (*pg.prev).next = pg.next };
++        }
++        if !pg.next.is_null() {
++            unsafe { (*pg.next).prev = pg.prev };
++        }
++    }
++    pg.next = ptr::null_mut();
++    pg.prev = ptr::null_mut();
++    pg.free = ptr::null_mut();
++    pg.block_size = 0;
++    // Drop the page's physical memory; the virtual range stays mapped for reuse.
++    let data = page_data(seg, i);
++    unsafe { os_madvise(data.addr(), PAGE_SIZE, sysc::MADV_FREE) };
++
++    s.used_pages -= 1;
++    if s.used_pages == 0 {
++        unsafe { free_segment(seg) };
++    }
++}
++
++/// Unlink a fully-empty segment from its heap and return it to the OS.
++#[cold]
++unsafe fn free_segment(seg: *mut Segment) {
++    let s = unsafe { &mut *seg };
++    let owner = s.owner.load(Ordering::Relaxed);
++    if !owner.is_null() {
++        let heap = unsafe { &mut *owner };
++        if heap.segments == seg {
++            heap.segments = s.next;
++        }
++        if !s.prev.is_null() {
++            unsafe { (*s.prev).next = s.next };
++        }
++        if !s.next.is_null() {
++            unsafe { (*s.next).prev = s.prev };
++        }
++    }
++    unsafe { os_munmap((seg as *mut u8).addr(), SEGMENT_SIZE) };
++}
++
++// --- huge (dedicated mmap) path ------------------------------------------
++
++/// Length of the dedicated mapping backing a huge/over-aligned allocation of
++/// `layout`. Recomputable from the `Layout` alone, so free needs no header.
++#[inline]
++fn huge_len(size: usize) -> usize {
++    round_up(size.max(1), OS_PAGE)
++}
++
++#[inline]
++unsafe fn alloc_huge(size: usize, align: usize) -> *mut u8 {
++    let len = huge_len(size);
++    if align <= OS_PAGE {
++        // mmap is already page-aligned, which covers any align up to a page.
++        os_mmap(len)
++    } else {
++        // Over-map and trim to an `align`-aligned region of exactly `len`.
++        let over = len + align;
++        let raw = os_mmap(over);
++        if raw.is_null() {
++            return ptr::null_mut();
++        }
++        let raw_addr = raw.addr();
++        let base = round_up(raw_addr, align);
++        if base > raw_addr {
++            unsafe { os_munmap(raw_addr, base - raw_addr) };
++        }
++        let end = raw_addr + over;
++        let tail = base + len;
++        if end > tail {
++            unsafe { os_munmap(tail, end - tail) };
++        }
++        ptr::with_exposed_provenance_mut(base)
++    }
++}
++
++#[inline]
++unsafe fn free_huge(ptr: *mut u8, size: usize) {
++    unsafe { os_munmap(ptr.addr(), huge_len(size)) };
++}
++
++// --- public entry points (called by the GlobalAlloc impl) -----------------
++
++/// Route by `Layout`: small page-served, or huge/over-aligned dedicated mmap.
++#[inline]
++fn need_of(size: usize, align: usize) -> usize {
++    round_up(size.max(1), align.max(1))
++}
++
++#[inline]
++pub unsafe fn alloc(size: usize, align: usize) -> *mut u8 {
++    if align <= 16 {
++        let need = need_of(size, align);
++        if need <= MAX_SMALL {
++            return unsafe { alloc_small(class_of(need)) };
++        }
++    }
++    unsafe { alloc_huge(size, align) }
++}
++
++#[inline]
++pub unsafe fn alloc_zeroed(size: usize, align: usize) -> *mut u8 {
++    if align <= 16 {
++        let need = need_of(size, align);
++        if need <= MAX_SMALL {
++            let p = unsafe { alloc_small(class_of(need)) };
++            if !p.is_null() {
++                unsafe { ptr::write_bytes(p, 0, size) };
++            }
++            return p;
++        }
++    }
++    // Huge path is a fresh mmap, already zero.
++    unsafe { alloc_huge(size, align) }
++}
++
++#[inline]
++pub unsafe fn dealloc(ptr: *mut u8, size: usize, align: usize) {
++    if ptr.is_null() {
++        return;
++    }
++    if align <= 16 && need_of(size, align) <= MAX_SMALL {
++        unsafe { free_small(ptr) };
++    } else {
++        unsafe { free_huge(ptr, size) };
++    }
++}
++
++#[inline]
++pub unsafe fn realloc(ptr: *mut u8, old_size: usize, align: usize, new_size: usize) -> *mut u8 {
++    // In-place when old and new map to the same small size class.
++    if align <= 16 {
++        let on = need_of(old_size, align);
++        let nn = need_of(new_size, align);
++        if on <= MAX_SMALL && nn <= MAX_SMALL && class_of(on) == class_of(nn) {
++            return ptr;
++        }
++    }
++    let new = unsafe { alloc(new_size, align) };
++    if new.is_null() {
++        return ptr::null_mut();
++    }
++    let n = if old_size < new_size { old_size } else { new_size };
++    unsafe { ptr::copy_nonoverlapping(ptr, new, n) };
++    unsafe { dealloc(ptr, old_size, align) };
++    new
++}
++
++/// Tear down the calling thread's heap at thread exit: fold pending cross-thread
++/// frees, return fully-empty segments to the OS, and abandon the rest for other
++/// threads to reclaim. The `Heap` struct itself is then unmapped.
++pub unsafe fn thread_exit() {
++    let h = tls::heap() as *mut Heap;
++    if h.is_null() {
++        return;
++    }
++    let heap = unsafe { &mut *h };
++
++    let mut seg = heap.segments;
++    while !seg.is_null() {
++        let s = unsafe { &mut *seg };
++        let next = s.next;
++
++        // Recount live pages after folding in cross-thread frees.
++        let mut live = 0u32;
++        let mut i = 1;
++        while i < PAGES_PER_SEGMENT {
++            let pg = &mut s.pages[i];
++            if pg.block_size != 0 {
++                let tf = pg.thread_free.swap(ptr::null_mut(), Ordering::Acquire);
++                if !tf.is_null() {
++                    let mut n: u32 = 0;
++                    let mut node = tf;
++                    let mut last = tf;
++                    while !node.is_null() {
++                        n += 1;
++                        last = node;
++                        node = unsafe { (*node).next };
++                    }
++                    pg.used -= n;
++                    unsafe { (*last).next = pg.free };
++                    pg.free = tf;
++                }
++                if pg.used == 0 {
++                    pg.block_size = 0;
++                } else {
++                    live += 1;
++                }
++            }
++            i += 1;
++        }
++        s.used_pages = live;
++
++        if live == 0 {
++            unsafe { os_munmap((seg as *mut u8).addr(), SEGMENT_SIZE) };
++        } else {
++            // Abandon: clear owner, push onto the global stack.
++            s.owner.store(ptr::null_mut(), Ordering::Release);
++            s.next = ptr::null_mut();
++            s.prev = ptr::null_mut();
++            lock_abandon();
++            s.abandoned_next = ABANDONED.load(Ordering::Acquire);
++            ABANDONED.store(seg, Ordering::Release);
++            unlock_abandon();
++        }
++        seg = next;
++    }
++
++    // Free the Heap struct and clear the TLS slot.
++    unsafe { os_munmap(h.addr(), round_up(core::mem::size_of::<Heap>(), OS_PAGE)) };
++    tls::set_heap(ptr::null_mut());
++}
 diff --git a/library/std/src/sys/pal/fullrust/mod.rs b/library/std/src/sys/pal/fullrust/mod.rs
 new file mode 100644
-index 00000000..bd1b8a86
+index 00000000..87cf7db7
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/mod.rs
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,158 @@
 +//! The `fullrust` platform abstraction layer: libc-free Linux on raw syscalls.
 +//!
 +//! This pal provides what a hosted std gets from libc + crt0: the process entry
@@ -441,10 +1224,12 @@ index 00000000..bd1b8a86
 +#![deny(unsafe_op_in_unsafe_fn)]
 +
 +pub mod futex;
++pub mod heap;
 +pub mod os;
 +pub mod pipe;
 +pub mod thread;
 +pub mod time;
++pub mod tls;
 +
 +mod common;
 +pub use common::*;
@@ -506,11 +1291,17 @@ index 00000000..bd1b8a86
 +    pub const NANOSLEEP: usize = 35;
 +    pub const MMAP: usize = 9;
 +    pub const MUNMAP: usize = 11;
++    pub const MADVISE: usize = 28;
 +
 +    pub const PROT_READ: usize = 0x1;
 +    pub const PROT_WRITE: usize = 0x2;
 +    pub const MAP_PRIVATE: usize = 0x2;
 +    pub const MAP_ANONYMOUS: usize = 0x20;
++
++    // madvise(2) advice values.
++    #[allow(dead_code)]
++    pub const MADV_DONTNEED: usize = 4;
++    pub const MADV_FREE: usize = 8;
 +
 +    /// Interpret a raw return as `Result<usize, i32>` (Err is the errno).
 +    #[inline]
@@ -546,9 +1337,20 @@ index 00000000..bd1b8a86
 +
 +unsafe extern "C" fn rust_start(stack: *const usize) -> ! {
 +    // [argc][argv0..argv(argc-1)][NULL][envp0..][NULL][auxv...]
++    // Install native `%fs` thread-local storage for the main thread *first*:
++    // it parses the auxv that follows envp, and everything below (the allocator,
++    // any `#[thread_local]`) depends on `%fs` already pointing at a valid TCB.
++    unsafe { tls::init_main(stack) };
 +    let argc = unsafe { *stack } as core::ffi::c_int;
 +    let argv = unsafe { stack.add(1) } as *const *const u8;
 +    let code = unsafe { main(argc, argv) };
++    // Run the main thread's `#[thread_local]` destructors and per-thread runtime
++    // cleanup before exiting (fullrust's `guard::enable` is a no-op, so std
++    // relies on the pal to invoke these — same as hermit's entry).
++    unsafe {
++        crate::sys::thread_local::destructors::run();
++    }
++    crate::rt::thread_cleanup();
 +    os::exit(code as i32)
 +}
 +
@@ -735,10 +1537,10 @@ index 00000000..30a4cbfa
 +}
 diff --git a/library/std/src/sys/pal/fullrust/thread.rs b/library/std/src/sys/pal/fullrust/thread.rs
 new file mode 100644
-index 00000000..8d7112c9
+index 00000000..bb57a358
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/thread.rs
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,255 @@
 +use super::sysc;
 +use crate::ffi::CStr;
 +use crate::io;
@@ -752,8 +1554,11 @@ index 00000000..8d7112c9
 +// Child-stack-launching clone wrapper (musl-style): the child begins on the new
 +// stack and calls `entry(arg)`, then exits. `ctid` is passed as the child-tid
 +// pointer so the kernel can clear it (CLONE_CHILD_CLEARTID) once the thread has
-+// fully left its stack — the join handshake.
-+//   rdi=entry, rsi=stack_top, rdx=flags, rcx=arg, r8=ctid
++// fully left its stack — the join handshake. `tls` is the child's thread pointer
++// (`%fs` base), installed by the kernel via CLONE_SETTLS before the child runs a
++// single instruction, so the child's first allocation/`#[thread_local]` access
++// already has a valid TCB.
++//   rdi=entry, rsi=stack_top, rdx=flags, rcx=arg, r8=ctid, r9=tls
 +core::arch::global_asm!(
 +    ".text",
 +    ".globl __fullrust_clone",
@@ -764,9 +1569,9 @@ index 00000000..8d7112c9
 +    "  mov [rsi], rdi",   // save entry on child stack
 +    "  mov [rsi+8], rcx", // save arg
 +    "  mov r10, r8",      // child_tid = ctid
++    "  mov r8, r9",       // tls = thread pointer (for CLONE_SETTLS)
 +    "  mov rdi, rdx",     // clone arg1 = flags (rsi already = child stack)
 +    "  xor edx, edx",     // parent_tid = 0
-+    "  xor r8d, r8d",     // tls = 0
 +    "  mov eax, 56",      // SYS_clone
 +    "  syscall",
 +    "  test rax, rax",
@@ -789,6 +1594,7 @@ index 00000000..8d7112c9
 +        flags: usize,
 +        arg: *mut u8,
 +        ctid: *mut u32,
++        tls: *mut u8,
 +    ) -> isize;
 +}
 +
@@ -799,6 +1605,7 @@ index 00000000..8d7112c9
 +const CLONE_SIGHAND: usize = 0x00000800;
 +const CLONE_THREAD: usize = 0x00010000;
 +const CLONE_SYSVSEM: usize = 0x00040000;
++const CLONE_SETTLS: usize = 0x00080000;
 +const CLONE_CHILD_CLEARTID: usize = 0x00200000;
 +
 +struct Inner {
@@ -812,6 +1619,10 @@ index 00000000..8d7112c9
 +    inner: Arc<Inner>,
 +    stack_base: *mut u8,
 +    stack_size: usize,
++    /// The thread's native-TLS mapping (`%fs` block), freed alongside the stack
++    /// once the kernel reports the thread gone. Null if it had no TLS block.
++    tls_base: *mut u8,
++    tls_size: usize,
 +}
 +
 +// The handle is moved between threads; the stack pointer is only used (munmap)
@@ -826,6 +1637,20 @@ index 00000000..8d7112c9
 +    let payload = unsafe { Box::from_raw(arg as *mut Payload) };
 +    let (f, inner) = *payload;
 +    f();
++    // Run this thread's `#[thread_local]` destructors and the runtime's
++    // per-thread cleanup before we leave — `%fs` is still valid here, so native
++    // TLS access works. (`guard::enable` is a no-op for fullrust; std relies on
++    // us calling these explicitly, as hermit/xous do.)
++    unsafe {
++        crate::sys::thread_local::destructors::run();
++    }
++    crate::rt::thread_cleanup();
++    // Tear down this thread's allocator heap last, once nothing else will
++    // allocate: return its empty segments to the OS and abandon any still
++    // holding blocks freed (or to be freed) by other threads.
++    unsafe {
++        super::heap::thread_exit();
++    }
 +    // Keep `Inner` (and thus the `ctid` word) alive past our exit: the kernel
 +    // writes 0 to it *after* this thread is gone. The joiner owns the other Arc
 +    // ref and frees `Inner` once it has observed the clear.
@@ -875,6 +1700,18 @@ index 00000000..8d7112c9
 +            return Err(io::Error::from_raw_os_error(12)); // ENOMEM
 +        }
 +
++        // Build the child's native-TLS block (`%fs` data + TCB) here in the
++        // parent and hand its thread pointer to clone via CLONE_SETTLS, so the
++        // kernel installs `%fs` before the child's first instruction runs.
++        let (tp, tls_base, tls_size) = super::tls::build_thread_block();
++        if tp.is_null() {
++            drop(unsafe { Box::from_raw(arg as *mut Payload) });
++            unsafe {
++                sysc::syscall2(sysc::MUNMAP, base as usize, size);
++            }
++            return Err(io::Error::from_raw_os_error(12)); // ENOMEM
++        }
++
 +        let stack_top = unsafe { base.add(size) };
 +        let ctid = inner.ctid.as_ptr();
 +        let flags = CLONE_VM
@@ -883,17 +1720,21 @@ index 00000000..8d7112c9
 +            | CLONE_SIGHAND
 +            | CLONE_THREAD
 +            | CLONE_SYSVSEM
++            | CLONE_SETTLS
 +            | CLONE_CHILD_CLEARTID;
-+        let r = unsafe { __fullrust_clone(thread_start, stack_top, flags, arg, ctid) };
++        let r = unsafe { __fullrust_clone(thread_start, stack_top, flags, arg, ctid, tp as *mut u8) };
 +        if r <= 0 {
 +            drop(unsafe { Box::from_raw(arg as *mut Payload) });
 +            unsafe {
 +                sysc::syscall2(sysc::MUNMAP, base as usize, size);
++                if !tls_base.is_null() {
++                    sysc::syscall2(sysc::MUNMAP, tls_base as usize, tls_size);
++                }
 +            }
 +            return Err(io::Error::from_raw_os_error(if r < 0 { -r as i32 } else { 11 }));
 +        }
 +
-+        Ok(Thread { inner, stack_base: base, stack_size: size })
++        Ok(Thread { inner, stack_base: base, stack_size: size, tls_base, tls_size })
 +    }
 +
 +    pub fn yield_now() {
@@ -930,9 +1771,14 @@ index 00000000..8d7112c9
 +                sysc::syscall6(202, ptr, FUTEX_WAIT, v as usize, 0, 0, 0);
 +            }
 +        }
-+        // Safe now: the thread is no longer executing on its stack.
++        // Safe now: the thread is no longer executing on its stack, and the
++        // kernel has finished writing the TLS exit handshake, so its `%fs` block
++        // is dead too. Free both.
 +        unsafe {
 +            sysc::syscall2(sysc::MUNMAP, self.stack_base as usize, self.stack_size);
++            if !self.tls_base.is_null() {
++                sysc::syscall2(sysc::MUNMAP, self.tls_base as usize, self.tls_size);
++            }
 +        }
 +    }
 +}
@@ -1010,6 +1856,271 @@ index 00000000..6c0ae184
 +    pub fn checked_sub_duration(&self, other: &Duration) -> Option<SystemTime> {
 +        Some(SystemTime(self.0.checked_sub(*other)?))
 +    }
++}
+diff --git a/library/std/src/sys/pal/fullrust/tls.rs b/library/std/src/sys/pal/fullrust/tls.rs
+new file mode 100644
+index 00000000..ef5ae7ca
+--- /dev/null
++++ b/library/std/src/sys/pal/fullrust/tls.rs
+@@ -0,0 +1,259 @@
++//! Native ELF thread-local storage (`%fs`-based, variant II) for the fullrust
++//! target — the libc-free equivalent of glibc/musl's `__init_tls`/`__copy_tls`.
++//!
++//! x86-64 uses TLS **variant 2**: the thread pointer (`%fs` base) points at the
++//! Thread Control Block (TCB); the static TLS data block sits *immediately
++//! below* it, so a `#[thread_local]` at segment offset `s` is read as
++//! `%fs:(s - tls_size)` — a single instruction with a link-time-fixed offset
++//! (the *local-exec* model, which a static non-PIE executable always uses).
++//!
++//! We own the TCB. Word 0 is the psABI-mandated self-pointer (`%fs:0` == TP);
++//! the rest carries runtime state that must be reachable without ever calling
++//! the allocator — most importantly the per-thread allocator heap pointer, so
++//! the allocator fast path is a couple of loads off `%fs` with no lock and no
++//! syscall.
++//!
++//! The TLS image (`.tdata` init bytes + `.tbss` size + alignment) is discovered
++//! once, from the `PT_TLS` program header found via the auxiliary vector at
++//! process entry, and cached for every thread spawned afterwards.
++
++use super::sysc;
++use crate::ptr;
++use crate::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
++
++const PAGE: usize = 4096;
++
++// arch_prctl(2)
++const ARCH_PRCTL: usize = 158;
++const ARCH_SET_FS: usize = 0x1002;
++
++// Auxiliary-vector entry types we care about.
++const AT_NULL: u64 = 0;
++const AT_PHDR: u64 = 3;
++const AT_PHENT: u64 = 4;
++const AT_PHNUM: u64 = 5;
++
++// Elf64_Phdr field offsets (the struct is 56 bytes).
++const PT_TLS: u32 = 7;
++const PH_TYPE: usize = 0; // u32
++const PH_VADDR: usize = 16; // u64
++const PH_FILESZ: usize = 32; // u64
++const PH_MEMSZ: usize = 40; // u64
++const PH_ALIGN: usize = 48; // u64
++
++/// Per-thread control block. `%fs` (the thread pointer) points here. The layout
++/// of the first word is fixed by the x86-64 psABI; the rest is ours.
++#[repr(C)]
++pub struct Tcb {
++    /// `%fs:0` — self-pointer (TP). Required by the ABI; some TLS access models
++    /// and a stray stack-canary read expect a sane value here.
++    self_ptr: *mut Tcb,
++    /// `%fs:8` — the current thread's allocator heap, or null until first use.
++    /// Read on every allocation, so it lives one load off the thread pointer.
++    pub heap: *mut u8,
++    /// `%fs:16` — head of this thread's `#[thread_local]` destructor list, run
++    /// at thread exit (see `thread_local`'s native dtor registration).
++    pub dtors: *mut u8,
++    /// Padding so the TCB spans the canary slot (`%fs:0x28`) and stays a clean
++    /// 64-byte, 16-aligned block.
++    _reserved: [usize; 5],
++}
++
++/// The discovered static-TLS image, captured once on the main thread and reused
++/// to build every spawned thread's block. Written before any thread is created,
++/// then only read — so plain atomics (no lock) are enough.
++static TLS_IMAGE: AtomicUsize = AtomicUsize::new(0); // *const u8 (.tdata source), or 0
++static TLS_FILESZ: AtomicUsize = AtomicUsize::new(0);
++static TLS_MEMSZ: AtomicUsize = AtomicUsize::new(0);
++static TLS_ALIGN: AtomicUsize = AtomicUsize::new(16);
++static TLS_READY: AtomicU8 = AtomicU8::new(0);
++
++const TCB_SIZE: usize = core::mem::size_of::<Tcb>();
++
++#[inline]
++fn round_up(v: usize, to: usize) -> usize {
++    (v + to - 1) & !(to - 1)
++}
++
++// The program headers and the TLS init image live in the process's own loaded
++// image, at addresses the kernel reported via the auxv — not memory we
++// allocated. Reach them through exposed provenance (the strict-provenance escape
++// hatch for addresses that originate outside Rust's allocation model).
++#[inline]
++unsafe fn rd_u32(addr: usize) -> u32 {
++    unsafe { *ptr::with_exposed_provenance::<u32>(addr) }
++}
++#[inline]
++unsafe fn rd_u64(addr: usize) -> u64 {
++    unsafe { *ptr::with_exposed_provenance::<u64>(addr) }
++}
++
++#[inline]
++fn mmap(len: usize) -> *mut u8 {
++    let r = unsafe {
++        sysc::syscall6(
++            sysc::MMAP,
++            0,
++            len,
++            sysc::PROT_READ | sysc::PROT_WRITE,
++            sysc::MAP_PRIVATE | sysc::MAP_ANONYMOUS,
++            usize::MAX,
++            0,
++        )
++    };
++    match sysc::ret(r) {
++        Ok(p) => ptr::with_exposed_provenance_mut(p),
++        Err(_) => ptr::null_mut(),
++    }
++}
++
++/// Read the current thread's TCB via the `%fs:0` self-pointer. The thread
++/// pointer is constant for the life of a thread, so this is `pure`/`readonly`.
++#[inline]
++pub fn tcb() -> *mut Tcb {
++    let p: *mut Tcb;
++    // SAFETY: `%fs` was set by `init_main`/`init_thread` before any Rust code on
++    // this thread ran; `%fs:0` holds the self-pointer we stored there.
++    unsafe {
++        core::arch::asm!(
++            "mov {}, fs:[0]",
++            out(reg) p,
++            options(nostack, preserves_flags, readonly, pure),
++        );
++    }
++    p
++}
++
++/// The current thread's allocator heap pointer (null until first allocation).
++#[inline]
++pub fn heap() -> *mut u8 {
++    // SAFETY: `tcb()` returns this thread's valid TCB.
++    unsafe { (*tcb()).heap }
++}
++
++/// Install this thread's allocator heap pointer.
++#[inline]
++pub fn set_heap(h: *mut u8) {
++    // SAFETY: as above; the field is only ever touched by the owning thread.
++    unsafe { (*tcb()).heap = h };
++}
++
++#[inline]
++unsafe fn set_fs(tp: *mut Tcb) {
++    unsafe {
++        sysc::syscall2(ARCH_PRCTL, ARCH_SET_FS, tp as usize);
++    }
++}
++
++/// Build a fresh TLS block (TLS data below the TCB) from the captured image and
++/// return its thread pointer plus the mapping to free at thread exit.
++///
++/// Returns `(tp, block_base, block_len)`. `block_base`/`block_len` describe the
++/// whole mapping for `munmap`; `tp` is what goes into `%fs`.
++fn build_block() -> (*mut Tcb, *mut u8, usize) {
++    let memsz = TLS_MEMSZ.load(Ordering::Relaxed);
++    let filesz = TLS_FILESZ.load(Ordering::Relaxed);
++    let align = TLS_ALIGN.load(Ordering::Relaxed).max(16);
++    let image_addr = TLS_IMAGE.load(Ordering::Relaxed);
++    let image = ptr::with_exposed_provenance::<u8>(image_addr);
++
++    // TLS data occupies `tls_size` bytes just below TP; the TCB sits at TP.
++    let tls_size = round_up(memsz, align);
++    let total = tls_size + TCB_SIZE;
++    let map_len = round_up(total + align, PAGE);
++    let raw = mmap(map_len);
++    if raw.is_null() {
++        return (ptr::null_mut(), ptr::null_mut(), 0);
++    }
++
++    // Align the TLS block base up to `align`; TP lands `tls_size` above it (and
++    // is therefore also `align`-aligned, since `tls_size` is a multiple).
++    let base = ptr::with_exposed_provenance_mut::<u8>(round_up(raw.expose_provenance(), align));
++    // SAFETY: `base + tls_size + TCB_SIZE <= raw + map_len` by construction.
++    let tp = unsafe { base.add(tls_size) } as *mut Tcb;
++
++    // Copy the `.tdata` init image into [base, base+filesz); the rest of the
++    // block (`.tbss` and rounding pad) is already zero from the fresh mapping.
++    if !image.is_null() && filesz > 0 {
++        // SAFETY: `image..image+filesz` is the loaded PT_TLS file image; `base`
++        // has room for `tls_size >= memsz >= filesz` bytes.
++        unsafe { ptr::copy_nonoverlapping(image, base, filesz) };
++    }
++
++    // Initialize the TCB: self-pointer first (ABI), the rest is already zeroed.
++    // SAFETY: `tp` points at TCB_SIZE writable, fresh bytes.
++    unsafe {
++        (*tp).self_ptr = tp;
++        (*tp).heap = ptr::null_mut();
++        (*tp).dtors = ptr::null_mut();
++    }
++    (tp, raw, map_len)
++}
++
++/// Walk the process stack image to the auxiliary vector, find `PT_TLS`, and
++/// capture the static-TLS template. Then build the main thread's TLS block and
++/// install it in `%fs`. Must run before any allocation or thread-local access.
++///
++/// `stack` points at `argc`, as the kernel left it for `_start`.
++pub unsafe fn init_main(stack: *const usize) {
++    // Layout: [argc][argv...][NULL][envp...][NULL][auxv pairs...][AT_NULL].
++    let argc = unsafe { *stack } as usize;
++    // Step past argv (argc entries + NULL) to envp.
++    let mut p = unsafe { stack.add(1 + argc + 1) };
++    // Step past envp to the auxv.
++    while unsafe { *p } != 0 {
++        p = unsafe { p.add(1) };
++    }
++    let mut aux = unsafe { p.add(1) } as *const u64;
++
++    let (mut phdr, mut phent, mut phnum) = (0usize, 56usize, 0usize);
++    loop {
++        let a_type = unsafe { *aux };
++        let a_val = unsafe { *aux.add(1) };
++        match a_type {
++            AT_NULL => break,
++            AT_PHDR => phdr = a_val as usize,
++            AT_PHENT => phent = a_val as usize,
++            AT_PHNUM => phnum = a_val as usize,
++            _ => {}
++        }
++        aux = unsafe { aux.add(2) };
++    }
++
++    // Scan the program headers for PT_TLS. Non-PIE → load bias 0, so p_vaddr is
++    // already the absolute address of the init image.
++    if phdr != 0 {
++        for i in 0..phnum {
++            let ph = phdr + i * phent;
++            let ty = unsafe { rd_u32(ph + PH_TYPE) };
++            if ty == PT_TLS {
++                let vaddr = unsafe { rd_u64(ph + PH_VADDR) } as usize;
++                let filesz = unsafe { rd_u64(ph + PH_FILESZ) } as usize;
++                let memsz = unsafe { rd_u64(ph + PH_MEMSZ) } as usize;
++                let align = unsafe { rd_u64(ph + PH_ALIGN) } as usize;
++                TLS_IMAGE.store(vaddr, Ordering::Relaxed);
++                TLS_FILESZ.store(filesz, Ordering::Relaxed);
++                TLS_MEMSZ.store(memsz, Ordering::Relaxed);
++                TLS_ALIGN.store(align.max(16), Ordering::Relaxed);
++                break;
++            }
++        }
++    }
++    TLS_READY.store(1, Ordering::Release);
++
++    let (tp, _, _) = build_block();
++    if !tp.is_null() {
++        unsafe { set_fs(tp) };
++    }
++}
++
++/// Build a spawned thread's TLS block for the *parent* to hand to `clone` via
++/// `CLONE_SETTLS`, so the kernel installs `%fs` before the child runs a single
++/// instruction (the child trampoline allocates immediately, which reads `%fs`).
++///
++/// Returns `(tp, block_base, block_len)`: `tp` is the `CLONE_SETTLS` argument;
++/// `block_base`/`block_len` are the mapping the joiner `munmap`s once the thread
++/// has exited. All-null on allocation failure.
++pub fn build_thread_block() -> (*mut Tcb, *mut u8, usize) {
++    build_block()
 +}
 diff --git a/library/std/src/sys/pal/mod.rs b/library/std/src/sys/pal/mod.rs
 index fbefc62a..518bb2a7 100644
@@ -1212,85 +2323,36 @@ index f4d8fa0a..2b9885cc 100644
          target_os = "linux",
          target_os = "android",
          all(target_arch = "wasm32", target_feature = "atomics"),
-diff --git a/library/std/src/sys/thread_local/key/fullrust.rs b/library/std/src/sys/thread_local/key/fullrust.rs
-new file mode 100644
-index 00000000..0b7c19ae
---- /dev/null
-+++ b/library/std/src/sys/thread_local/key/fullrust.rs
-@@ -0,0 +1,46 @@
-+//! Key-based TLS for the fullrust target.
-+//!
-+//! There is no libc and (for now) no ELF `#[thread_local]`, so thread-locals are
-+//! stored in a global registry keyed by `(thread id, key)`. A `Key` is just a
-+//! monotonically increasing id; `set`/`get` look up the current thread's slot.
-+//! Destructors are not run at thread exit (the value is leaked) — the common
-+//! `FOO.with(..)` access pattern works; this mirrors purestd's approach.
-+
-+use crate::collections::BTreeMap;
-+use crate::sync::Mutex;
-+use crate::sync::atomic::{AtomicUsize, Ordering};
-+
-+pub type Key = usize;
-+
-+static NEXT_KEY: AtomicUsize = AtomicUsize::new(1); // 0 is KEY_SENTVAL; never hand it out
-+static REGISTRY: Mutex<BTreeMap<(u64, Key), usize>> = Mutex::new(BTreeMap::new());
-+
-+#[inline]
-+fn tid() -> u64 {
-+    // gettid(2) = 186 on x86-64; returns this thread's kernel id.
-+    unsafe { crate::sys::pal::sysc::syscall1(186, 0) as u64 }
-+}
-+
-+#[inline]
-+pub fn create(_dtor: Option<unsafe extern "C" fn(*mut u8)>) -> Key {
-+    NEXT_KEY.fetch_add(1, Ordering::Relaxed)
-+}
-+
-+#[inline]
-+pub unsafe fn set(key: Key, value: *mut u8) {
-+    let v = value.expose_provenance();
-+    REGISTRY.lock().unwrap().insert((tid(), key), v);
-+}
-+
-+#[inline]
-+pub unsafe fn get(key: Key) -> *mut u8 {
-+    match REGISTRY.lock().unwrap().get(&(tid(), key)).copied() {
-+        Some(v) => crate::ptr::with_exposed_provenance_mut(v),
-+        None => crate::ptr::null_mut(),
-+    }
-+}
-+
-+#[inline]
-+pub unsafe fn destroy(_key: Key) {
-+    // Keys are never reused; nothing to free.
-+}
 diff --git a/library/std/src/sys/thread_local/mod.rs b/library/std/src/sys/thread_local/mod.rs
-index 9fafac3a..a0eed36b 100644
+index 9fafac3a..4630f37c 100644
 --- a/library/std/src/sys/thread_local/mod.rs
 +++ b/library/std/src/sys/thread_local/mod.rs
-@@ -90,6 +90,7 @@ pub(crate) mod guard {
-             all(target_family = "wasm", not(
-                 all(target_os = "wasi", target_env = "p1", target_feature = "atomics")
-             )),
+@@ -108,11 +108,13 @@ pub(crate) fn enable() {
+                 use crate::rt::thread_cleanup;
+             }
+         } else if #[cfg(any(
 +            target_os = "fullrust",
-             target_os = "uefi",
-             target_os = "zkvm",
-             target_os = "trusty",
-@@ -132,7 +133,13 @@ pub(crate) fn enable() {}
+             target_os = "hermit",
+             target_os = "xous",
+         ))] {
+             // `std` is the only runtime, so it just calls the destructor functions
+-            // itself when the time comes.
++            // itself when the time comes. For fullrust that is `thread_start`
++            // (spawned threads) and `rust_start` (main thread); see the pal.
+             pub(crate) fn enable() {}
+         } else if #[cfg(target_os = "solid_asp3")] {
+             mod solid;
+@@ -132,6 +134,10 @@ pub(crate) fn enable() {}
  /// with a pointer which we can get and set to store our data.
  pub(crate) mod key {
      cfg_if::cfg_if! {
--        if #[cfg(any(
-+        if #[cfg(target_os = "fullrust")] {
-+            mod racy;
-+            mod fullrust;
-+            pub(super) use fullrust::{Key, get, set};
-+            pub(super) use racy::LazyKey;
-+            use fullrust::{create, destroy};
-+        } else if #[cfg(any(
++        // `target_os = "fullrust"` is intentionally absent here: with native
++        // `#[thread_local]` TLS (`has_thread_local`), std uses the `native` impl
++        // and the no-op fullrust `guard`, so this key/registry path is unused.
++        // See `sys::pal::fullrust::tls` for the `%fs`/TCB setup.
+         if #[cfg(any(
              all(
                  not(target_vendor = "apple"),
-                 not(target_family = "wasm"),
 diff --git a/src/bootstrap/src/core/build_steps/compile.rs b/src/bootstrap/src/core/build_steps/compile.rs
 index 2e5865e5..db03deb7 100644
 --- a/src/bootstrap/src/core/build_steps/compile.rs
