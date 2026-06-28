@@ -134,14 +134,22 @@ read/write, `getrandom`, the **mimalloc-class allocator** above, **threads**
 thread-locals**. `strlen` is provided in the pal; `mem*` come from
 `compiler-builtins-mem` (enabled for the target in `std_cargo`).
 
+**Full std subsystems on raw syscalls** (no libc): `std::env` (loader-`envp`
+backed vars + cwd + `current_exe`), `std::fs` (`File`/metadata via `statx`/dir
+iteration via `getdents64`/the `*at` family — read, write, seek, permissions,
+symlinks, hard links, `canonicalize`, copy, file locks, recursive removal),
+`std::process` (`Command` via `fork`+`execve` with `PATH` search, pipe stdio,
+concurrent stdout/stderr capture, `wait4` exit status, signals), and `std::net`
+(TCP/UDP on the socket syscalls + a self-contained DNS resolver: `/etc/hosts` +
+`/etc/resolv.conf` + UDP A/AAAA queries). Each has a dedicated `test-*` crate.
+
 Extra changes beyond the target spec / pal: `build.rs` (check-cfg + restricted_std
 allowlist), `cc_detect.rs` (probe via the gnu triple), `compile.rs`
 (`compiler-builtins-mem`), the `sys/{stdio,args,random,alloc,thread_local}`
-dispatchers, and `fullrust` branches in the `sys/sync/*` + `thread_local` guards.
+dispatchers, `fullrust` branches in the `sys/{fs,net,process,env,path}` +
+`sys/sync/*` + `thread_local` guards, and a real fd-backed `pal::pipe`.
 
 ### Known limitations (next steps)
-- **No fs/net/process** yet — those pal pieces are still `unsupported`; wire them
-  to real syscalls (reuse purestd) next.
 - **Allocator**: large (>8 KiB) and over-aligned allocations take a dedicated
   `mmap` each (correct, but not cached); a medium/large segment tier and finer
   decommit hysteresis are future work. Abandoned segments are reclaimed on

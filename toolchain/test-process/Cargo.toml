@@ -1,0 +1,14 @@
+[package]
+name = "process-fullrust"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "process-fullrust"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true
+strip = true

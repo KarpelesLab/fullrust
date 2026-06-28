@@ -262,30 +262,1913 @@ index 0011f55d..3333896a 100644
          all(target_family = "unix", not(any(target_os = "espidf", target_os = "vita"))),
          target_os = "hermit",
      ))] {
+diff --git a/library/std/src/sys/env/fullrust.rs b/library/std/src/sys/env/fullrust.rs
+new file mode 100644
+index 00000000..4d663e03
+--- /dev/null
++++ b/library/std/src/sys/env/fullrust.rs
+@@ -0,0 +1,88 @@
++//! Environment variables for the fullrust target.
++//!
++//! There is no libc `environ`/`setenv`, so we own the environment: a map seeded
++//! once (lazily) from the loader's `envp` — captured at startup by the pal's
++//! `init` — and then mutated by `set_var`/`remove_var`. Names/values are decoded
++//! lossily as UTF-8, matching how `std::env::args()` treats non-Unicode here.
++
++pub use super::common::Env;
++use crate::collections::BTreeMap;
++use crate::ffi::{CStr, OsStr, OsString, c_char};
++use crate::io;
++use crate::ptr;
++use crate::sync::Mutex;
++use crate::sync::atomic::{AtomicPtr, Ordering};
++
++/// The loader's `envp` (a NULL-terminated `char**`), captured at startup.
++static ENVP: AtomicPtr<*const c_char> = AtomicPtr::new(ptr::null_mut());
++
++/// The owned environment, seeded lazily from `ENVP` on first access.
++static ENV: Mutex<Option<BTreeMap<OsString, OsString>>> = Mutex::new(None);
++
++/// Record the loader-provided environment vector. Called once at startup by the
++/// pal (`pal::fullrust::common::init`).
++///
++/// # Safety
++/// `envp` must be a valid NULL-terminated array of C strings (or null), valid
++/// for the life of the process.
++pub unsafe fn init(envp: *const *const c_char) {
++    ENVP.store(envp as *mut *const c_char, Ordering::Relaxed);
++}
++
++/// Run `f` with the owned environment map, seeding it from `envp` on first use.
++fn with_env<T>(f: impl FnOnce(&mut BTreeMap<OsString, OsString>) -> T) -> T {
++    let mut guard = ENV.lock().unwrap();
++    if guard.is_none() {
++        let mut map = BTreeMap::new();
++        let envp = ENVP.load(Ordering::Relaxed) as *const *const c_char;
++        if !envp.is_null() {
++            let mut i = 0;
++            // SAFETY: `envp` is a NULL-terminated array of valid C strings.
++            loop {
++                let p = unsafe { *envp.add(i) };
++                if p.is_null() {
++                    break;
++                }
++                i += 1;
++                let bytes = unsafe { CStr::from_ptr(p).to_bytes() };
++                if let Some((k, v)) = parse(bytes) {
++                    map.insert(k, v);
++                }
++            }
++        }
++        *guard = Some(map);
++    }
++    f(guard.as_mut().unwrap())
++}
++
++/// Split a `KEY=VALUE` entry. A leading `=` is allowed in the value-less form
++/// (glibc strategy): names must be non-empty, so search for `=` past the first
++/// byte. Malformed entries (no `=`) are skipped.
++fn parse(input: &[u8]) -> Option<(OsString, OsString)> {
++    if input.is_empty() {
++        return None;
++    }
++    let eq = input[1..].iter().position(|&b| b == b'=').map(|p| p + 1)?;
++    let key = String::from_utf8_lossy(&input[..eq]).into_owned();
++    let val = String::from_utf8_lossy(&input[eq + 1..]).into_owned();
++    Some((OsString::from(key), OsString::from(val)))
++}
++
++pub fn env() -> Env {
++    let snapshot = with_env(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
++    Env::new(snapshot)
++}
++
++pub fn getenv(k: &OsStr) -> Option<OsString> {
++    with_env(|m| m.get(k).cloned())
++}
++
++pub unsafe fn setenv(k: &OsStr, v: &OsStr) -> io::Result<()> {
++    with_env(|m| m.insert(k.to_owned(), v.to_owned()));
++    Ok(())
++}
++
++pub unsafe fn unsetenv(k: &OsStr) -> io::Result<()> {
++    with_env(|m| m.remove(k));
++    Ok(())
++}
+diff --git a/library/std/src/sys/env/mod.rs b/library/std/src/sys/env/mod.rs
+index d81ff875..4b96582c 100644
+--- a/library/std/src/sys/env/mod.rs
++++ b/library/std/src/sys/env/mod.rs
+@@ -4,6 +4,7 @@
+ 
+ #[cfg(any(
+     target_family = "unix",
++    target_os = "fullrust",
+     target_os = "hermit",
+     all(target_vendor = "fortanix", target_env = "sgx"),
+     target_os = "solid_asp3",
+@@ -17,6 +18,9 @@
+     if #[cfg(target_family = "unix")] {
+         mod unix;
+         pub use unix::*;
++    } else if #[cfg(target_os = "fullrust")] {
++        mod fullrust;
++        pub use fullrust::*;
+     } else if #[cfg(target_family = "windows")] {
+         mod windows;
+         pub use windows::*;
+diff --git a/library/std/src/sys/fs/fullrust.rs b/library/std/src/sys/fs/fullrust.rs
+new file mode 100644
+index 00000000..1729ae56
+--- /dev/null
++++ b/library/std/src/sys/fs/fullrust.rs
+@@ -0,0 +1,777 @@
++//! Filesystem for the fullrust target, on raw Linux syscalls (no libc).
++//!
++//! `File` is a thin owner of a raw kernel fd. Metadata comes from `statx(2)`
++//! (which uniquely also yields btime/creation time); directory iteration from
++//! `getdents64(2)`; everything else from the `*at` family rooted at `AT_FDCWD`.
++//! Paths are byte-exact: the `fullrust` `OsStr` encoding *is* the raw path bytes,
++//! so we round-trip through `CString` with no lossy decode (see `os::cstr`).
++
++#![allow(dead_code)]
++
++pub use super::common::{copy, exists, remove_dir_all};
++use crate::ffi::{CStr, OsString};
++use crate::fmt;
++use crate::fs::TryLockError;
++use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut, SeekFrom};
++use crate::mem;
++use crate::path::{Path, PathBuf};
++use crate::sync::Arc;
++use crate::sys::pal::os;
++use crate::sys::pal::sysc;
++use crate::sys::time::SystemTime;
++
++// `AT_FDCWD` as the raw kernel value (-100), passed in a register as `usize`.
++const AT_FDCWD: usize = (-100isize) as usize;
++const AT_SYMLINK_NOFOLLOW: usize = 0x100;
++const AT_EMPTY_PATH: usize = 0x1000;
++const AT_REMOVEDIR: usize = 0x200;
++
++// open(2) flags.
++const O_RDONLY: i32 = 0;
++const O_WRONLY: i32 = 1;
++const O_RDWR: i32 = 2;
++const O_CREAT: i32 = 0o100;
++const O_EXCL: i32 = 0o200;
++const O_TRUNC: i32 = 0o1000;
++const O_APPEND: i32 = 0o2000;
++const O_DIRECTORY: i32 = 0o200000;
++const O_CLOEXEC: i32 = 0o2000000;
++const O_PATH: i32 = 0o10000000;
++
++// lseek(2) whence.
++const SEEK_SET: usize = 0;
++const SEEK_CUR: usize = 1;
++const SEEK_END: usize = 2;
++
++// flock(2) operations.
++const LOCK_SH: usize = 1;
++const LOCK_EX: usize = 2;
++const LOCK_NB: usize = 4;
++const LOCK_UN: usize = 8;
++
++// fcntl(2) command.
++const F_DUPFD_CLOEXEC: usize = 1030;
++
++// st_mode type bits.
++const S_IFMT: u16 = 0o170000;
++const S_IFDIR: u16 = 0o040000;
++const S_IFREG: u16 = 0o100000;
++const S_IFLNK: u16 = 0o120000;
++
++// statx(2) request mask and the btime-present bit.
++const STATX_BASIC_STATS: usize = 0x7ff;
++const STATX_BTIME: u32 = 0x800;
++const STATX_MASK: usize = STATX_BASIC_STATS | (STATX_BTIME as usize);
++const STATX_SIZE: usize = 256;
++
++// getdents64 d_type values.
++const DT_UNKNOWN: u8 = 0;
++const DT_DIR: u8 = 4;
++const DT_REG: u8 = 8;
++const DT_LNK: u8 = 10;
++
++// utimensat(2) sentinel nanoseconds.
++const UTIME_OMIT: i64 = (1 << 30) - 2;
++
++#[inline]
++fn cvt(r: usize) -> io::Result<usize> {
++    sysc::ret(r).map_err(io::Error::from_raw_os_error)
++}
++
++// ---------------------------------------------------------------------------
++// File
++// ---------------------------------------------------------------------------
++
++pub struct File {
++    fd: i32,
++}
++
++impl File {
++    pub fn open(path: &Path, opts: &OpenOptions) -> io::Result<File> {
++        let c = os::cstr(path)?;
++        let mut flags = opts.get_access_mode()?;
++        flags |= opts.get_creation_mode()?;
++        flags |= O_CLOEXEC;
++        let mode = if flags & O_CREAT != 0 { opts.mode } else { 0 };
++        let fd = cvt(unsafe {
++            sysc::syscall4(
++                sysc::OPENAT,
++                AT_FDCWD,
++                c.as_ptr() as usize,
++                flags as usize,
++                mode as usize,
++            )
++        })?;
++        Ok(File { fd: fd as i32 })
++    }
++
++    pub fn file_attr(&self) -> io::Result<FileAttr> {
++        do_statx(self.fd as usize, c"", AT_EMPTY_PATH)
++    }
++
++    pub fn fsync(&self) -> io::Result<()> {
++        cvt(unsafe { sysc::syscall1(sysc::FSYNC, self.fd as usize) }).map(drop)
++    }
++
++    pub fn datasync(&self) -> io::Result<()> {
++        cvt(unsafe { sysc::syscall1(sysc::FDATASYNC, self.fd as usize) }).map(drop)
++    }
++
++    fn flock(&self, op: usize) -> io::Result<()> {
++        cvt(unsafe { sysc::syscall2(sysc::FLOCK, self.fd as usize, op) }).map(drop)
++    }
++
++    pub fn lock(&self) -> io::Result<()> {
++        self.flock(LOCK_EX)
++    }
++
++    pub fn lock_shared(&self) -> io::Result<()> {
++        self.flock(LOCK_SH)
++    }
++
++    fn try_flock(&self, op: usize) -> Result<(), TryLockError> {
++        match sysc::ret(unsafe { sysc::syscall2(sysc::FLOCK, self.fd as usize, op | LOCK_NB) }) {
++            Ok(_) => Ok(()),
++            // flock(LOCK_NB) reports contention as EWOULDBLOCK (== EAGAIN, 11).
++            Err(11) => Err(TryLockError::WouldBlock),
++            Err(e) => Err(TryLockError::Error(io::Error::from_raw_os_error(e))),
++        }
++    }
++
++    pub fn try_lock(&self) -> Result<(), TryLockError> {
++        self.try_flock(LOCK_EX)
++    }
++
++    pub fn try_lock_shared(&self) -> Result<(), TryLockError> {
++        self.try_flock(LOCK_SH)
++    }
++
++    pub fn unlock(&self) -> io::Result<()> {
++        self.flock(LOCK_UN)
++    }
++
++    pub fn truncate(&self, size: u64) -> io::Result<()> {
++        cvt(unsafe { sysc::syscall2(sysc::FTRUNCATE, self.fd as usize, size as usize) }).map(drop)
++    }
++
++    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
++        cvt(unsafe {
++            sysc::syscall3(sysc::READ, self.fd as usize, buf.as_mut_ptr() as usize, buf.len())
++        })
++    }
++
++    pub fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
++        match bufs.iter_mut().find(|b| !b.is_empty()) {
++            Some(b) => self.read(b),
++            None => Ok(0),
++        }
++    }
++
++    #[inline]
++    pub fn is_read_vectored(&self) -> bool {
++        false
++    }
++
++    pub fn read_buf(&self, mut cursor: BorrowedCursor<'_>) -> io::Result<()> {
++        // SAFETY: `read` writes initialized bytes into the buffer head; we then
++        // advance the cursor by exactly that many, never claiming uninit bytes.
++        let n = cvt(unsafe {
++            let dst = cursor.as_mut().as_mut_ptr() as usize;
++            sysc::syscall3(sysc::READ, self.fd as usize, dst, cursor.capacity())
++        })?;
++        unsafe { cursor.advance_unchecked(n) };
++        Ok(())
++    }
++
++    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
++        cvt(unsafe {
++            sysc::syscall3(sysc::WRITE, self.fd as usize, buf.as_ptr() as usize, buf.len())
++        })
++    }
++
++    pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
++        match bufs.iter().find(|b| !b.is_empty()) {
++            Some(b) => self.write(b),
++            None => Ok(0),
++        }
++    }
++
++    #[inline]
++    pub fn is_write_vectored(&self) -> bool {
++        false
++    }
++
++    #[inline]
++    pub fn flush(&self) -> io::Result<()> {
++        Ok(())
++    }
++
++    pub fn seek(&self, pos: SeekFrom) -> io::Result<u64> {
++        let (whence, off) = match pos {
++            SeekFrom::Start(n) => (SEEK_SET, n as i64),
++            SeekFrom::End(n) => (SEEK_END, n),
++            SeekFrom::Current(n) => (SEEK_CUR, n),
++        };
++        cvt(unsafe { sysc::syscall3(sysc::LSEEK, self.fd as usize, off as usize, whence) })
++            .map(|n| n as u64)
++    }
++
++    pub fn tell(&self) -> io::Result<u64> {
++        self.seek(SeekFrom::Current(0))
++    }
++
++    pub fn duplicate(&self) -> io::Result<File> {
++        let fd = cvt(unsafe {
++            sysc::syscall3(sysc::FCNTL, self.fd as usize, F_DUPFD_CLOEXEC, 0)
++        })?;
++        Ok(File { fd: fd as i32 })
++    }
++
++    pub fn set_permissions(&self, perm: FilePermissions) -> io::Result<()> {
++        cvt(unsafe { sysc::syscall2(sysc::FCHMOD, self.fd as usize, perm.mode as usize) }).map(drop)
++    }
++
++    pub fn set_times(&self, times: FileTimes) -> io::Result<()> {
++        let ts = [to_timespec(times.accessed), to_timespec(times.modified)];
++        cvt(unsafe {
++            sysc::syscall4(sysc::UTIMENSAT, self.fd as usize, 0, ts.as_ptr() as usize, 0)
++        })
++        .map(drop)
++    }
++
++    pub(crate) fn as_raw_fd(&self) -> i32 {
++        self.fd
++    }
++
++    pub(crate) fn into_raw_fd(self) -> i32 {
++        let fd = self.fd;
++        mem::forget(self);
++        fd
++    }
++
++    pub(crate) unsafe fn from_raw_fd(fd: i32) -> File {
++        File { fd }
++    }
++}
++
++impl Drop for File {
++    fn drop(&mut self) {
++        unsafe {
++            sysc::syscall1(sysc::CLOSE, self.fd as usize);
++        }
++    }
++}
++
++impl fmt::Debug for File {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("File").field("fd", &self.fd).finish()
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Metadata (statx)
++// ---------------------------------------------------------------------------
++
++#[derive(Clone)]
++pub struct FileAttr {
++    size: u64,
++    mode: u16,
++    mask: u32,
++    atime: (i64, u32),
++    mtime: (i64, u32),
++    ctime: (i64, u32),
++    btime: (i64, u32),
++}
++
++fn rd_u16(b: &[u8], off: usize) -> u16 {
++    u16::from_ne_bytes(b[off..off + 2].try_into().unwrap())
++}
++fn rd_u32(b: &[u8], off: usize) -> u32 {
++    u32::from_ne_bytes(b[off..off + 4].try_into().unwrap())
++}
++fn rd_u64(b: &[u8], off: usize) -> u64 {
++    u64::from_ne_bytes(b[off..off + 8].try_into().unwrap())
++}
++fn rd_i64(b: &[u8], off: usize) -> i64 {
++    i64::from_ne_bytes(b[off..off + 8].try_into().unwrap())
++}
++
++fn do_statx(dirfd: usize, path: &CStr, flags: usize) -> io::Result<FileAttr> {
++    let mut buf = [0u8; STATX_SIZE];
++    cvt(unsafe {
++        sysc::syscall5(
++            sysc::STATX,
++            dirfd,
++            path.as_ptr() as usize,
++            flags,
++            STATX_MASK,
++            buf.as_mut_ptr() as usize,
++        )
++    })?;
++    // statx struct field offsets (linux/stat.h); timestamps are
++    // { i64 tv_sec @+0; u32 tv_nsec @+8 }.
++    Ok(FileAttr {
++        mask: rd_u32(&buf, 0),
++        mode: rd_u16(&buf, 28),
++        size: rd_u64(&buf, 40),
++        atime: (rd_i64(&buf, 64), rd_u32(&buf, 72)),
++        btime: (rd_i64(&buf, 80), rd_u32(&buf, 88)),
++        ctime: (rd_i64(&buf, 96), rd_u32(&buf, 104)),
++        mtime: (rd_i64(&buf, 112), rd_u32(&buf, 120)),
++    })
++}
++
++impl FileAttr {
++    pub fn size(&self) -> u64 {
++        self.size
++    }
++
++    pub fn perm(&self) -> FilePermissions {
++        FilePermissions { mode: self.mode & 0o7777 }
++    }
++
++    pub fn file_type(&self) -> FileType {
++        FileType { mode: self.mode & S_IFMT }
++    }
++
++    pub fn modified(&self) -> io::Result<SystemTime> {
++        Ok(SystemTime::new(self.mtime.0, self.mtime.1))
++    }
++
++    pub fn accessed(&self) -> io::Result<SystemTime> {
++        Ok(SystemTime::new(self.atime.0, self.atime.1))
++    }
++
++    pub fn created(&self) -> io::Result<SystemTime> {
++        if self.mask & STATX_BTIME != 0 {
++            Ok(SystemTime::new(self.btime.0, self.btime.1))
++        } else {
++            Err(io::const_error!(
++                io::ErrorKind::Unsupported,
++                "creation time is not available for the filesystem",
++            ))
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Permissions / type / times
++// ---------------------------------------------------------------------------
++
++#[derive(Clone, PartialEq, Eq, Debug)]
++pub struct FilePermissions {
++    mode: u16,
++}
++
++impl FilePermissions {
++    pub fn readonly(&self) -> bool {
++        // No write bit set for owner, group, or others.
++        self.mode & 0o222 == 0
++    }
++
++    pub fn set_readonly(&mut self, readonly: bool) {
++        if readonly {
++            self.mode &= !0o222;
++        } else {
++            self.mode |= 0o222;
++        }
++    }
++}
++
++#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
++pub struct FileType {
++    mode: u16,
++}
++
++impl FileType {
++    pub fn is_dir(&self) -> bool {
++        self.mode == S_IFDIR
++    }
++    pub fn is_file(&self) -> bool {
++        self.mode == S_IFREG
++    }
++    pub fn is_symlink(&self) -> bool {
++        self.mode == S_IFLNK
++    }
++}
++
++#[derive(Copy, Clone, Debug, Default)]
++pub struct FileTimes {
++    accessed: Option<SystemTime>,
++    modified: Option<SystemTime>,
++}
++
++impl FileTimes {
++    pub fn set_accessed(&mut self, t: SystemTime) {
++        self.accessed = Some(t);
++    }
++    pub fn set_modified(&mut self, t: SystemTime) {
++        self.modified = Some(t);
++    }
++}
++
++/// Render an optional time as a `timespec` for `utimensat`, using `UTIME_OMIT`
++/// for the fields the caller left unset.
++fn to_timespec(t: Option<SystemTime>) -> [i64; 2] {
++    match t {
++        Some(st) => {
++            let d = st.sub_time(&crate::sys::time::UNIX_EPOCH).unwrap_or_default();
++            [d.as_secs() as i64, d.subsec_nanos() as i64]
++        }
++        None => [0, UTIME_OMIT],
++    }
++}
++
++// ---------------------------------------------------------------------------
++// OpenOptions / DirBuilder
++// ---------------------------------------------------------------------------
++
++#[derive(Clone, Debug)]
++pub struct OpenOptions {
++    read: bool,
++    write: bool,
++    append: bool,
++    truncate: bool,
++    create: bool,
++    create_new: bool,
++    mode: u32,
++}
++
++impl OpenOptions {
++    pub fn new() -> OpenOptions {
++        OpenOptions {
++            read: false,
++            write: false,
++            append: false,
++            truncate: false,
++            create: false,
++            create_new: false,
++            mode: 0o666,
++        }
++    }
++
++    pub fn read(&mut self, read: bool) {
++        self.read = read;
++    }
++    pub fn write(&mut self, write: bool) {
++        self.write = write;
++    }
++    pub fn append(&mut self, append: bool) {
++        self.append = append;
++    }
++    pub fn truncate(&mut self, truncate: bool) {
++        self.truncate = truncate;
++    }
++    pub fn create(&mut self, create: bool) {
++        self.create = create;
++    }
++    pub fn create_new(&mut self, create_new: bool) {
++        self.create_new = create_new;
++    }
++
++    fn get_access_mode(&self) -> io::Result<i32> {
++        match (self.read, self.write, self.append) {
++            (true, false, false) => Ok(O_RDONLY),
++            (false, true, false) => Ok(O_WRONLY),
++            (true, true, false) => Ok(O_RDWR),
++            (false, _, true) => Ok(O_WRONLY | O_APPEND),
++            (true, _, true) => Ok(O_RDWR | O_APPEND),
++            (false, false, false) => {
++                Err(io::const_error!(io::ErrorKind::InvalidInput, "invalid access mode"))
++            }
++        }
++    }
++
++    fn get_creation_mode(&self) -> io::Result<i32> {
++        match (self.write, self.append) {
++            (true, false) => {}
++            (false, false) => {
++                if self.truncate || self.create || self.create_new {
++                    return Err(io::const_error!(
++                        io::ErrorKind::InvalidInput,
++                        "invalid creation mode",
++                    ));
++                }
++            }
++            (_, true) => {
++                if self.truncate && !self.create_new {
++                    return Err(io::const_error!(
++                        io::ErrorKind::InvalidInput,
++                        "invalid creation mode",
++                    ));
++                }
++            }
++        }
++
++        Ok(match (self.create, self.truncate, self.create_new) {
++            (false, false, false) => 0,
++            (true, false, false) => O_CREAT,
++            (false, true, false) => O_TRUNC,
++            (true, true, false) => O_CREAT | O_TRUNC,
++            (_, _, true) => O_CREAT | O_EXCL,
++        })
++    }
++}
++
++#[derive(Debug)]
++pub struct DirBuilder {
++    mode: u32,
++}
++
++impl DirBuilder {
++    pub fn new() -> DirBuilder {
++        DirBuilder { mode: 0o777 }
++    }
++
++    pub fn mkdir(&self, path: &Path) -> io::Result<()> {
++        let c = os::cstr(path)?;
++        cvt(unsafe {
++            sysc::syscall3(sysc::MKDIRAT, AT_FDCWD, c.as_ptr() as usize, self.mode as usize)
++        })
++        .map(drop)
++    }
++
++    pub fn set_mode(&mut self, mode: u32) {
++        self.mode = mode;
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Directory iteration (getdents64)
++// ---------------------------------------------------------------------------
++
++struct InnerReadDir {
++    root: PathBuf,
++    dir: Vec<u8>,
++}
++
++pub struct ReadDir {
++    inner: Arc<InnerReadDir>,
++    pos: usize,
++}
++
++impl fmt::Debug for ReadDir {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        fmt::Debug::fmt(&*self.inner.root, f)
++    }
++}
++
++impl Iterator for ReadDir {
++    type Item = io::Result<DirEntry>;
++
++    fn next(&mut self) -> Option<io::Result<DirEntry>> {
++        let buf = &self.inner.dir;
++        while self.pos < buf.len() {
++            let off = self.pos;
++            // struct linux_dirent64 { u64 d_ino; i64 d_off; u16 d_reclen;
++            //                         u8 d_type; char d_name[]; }
++            let reclen = rd_u16(buf, off + 16) as usize;
++            let d_type = buf[off + 18];
++            self.pos += reclen;
++
++            // d_name is NUL-terminated; take bytes up to the first NUL.
++            let name_start = off + 19;
++            let name_end = buf[name_start..off + reclen]
++                .iter()
++                .position(|&b| b == 0)
++                .map(|p| name_start + p)
++                .unwrap_or(off + reclen);
++            let name = &buf[name_start..name_end];
++
++            // Skip the "." and ".." pseudo-entries, like the unix backend.
++            if name == b"." || name == b".." {
++                continue;
++            }
++
++            return Some(Ok(DirEntry {
++                root: self.inner.clone(),
++                name: os::os_string_from_bytes(name),
++                d_type,
++            }));
++        }
++        None
++    }
++}
++
++pub struct DirEntry {
++    root: Arc<InnerReadDir>,
++    name: OsString,
++    d_type: u8,
++}
++
++impl DirEntry {
++    pub fn path(&self) -> PathBuf {
++        self.root.root.join(&self.name)
++    }
++
++    pub fn file_name(&self) -> OsString {
++        self.name.clone()
++    }
++
++    pub fn metadata(&self) -> io::Result<FileAttr> {
++        lstat(&self.path())
++    }
++
++    pub fn file_type(&self) -> io::Result<FileType> {
++        match self.d_type {
++            DT_DIR => Ok(FileType { mode: S_IFDIR }),
++            DT_REG => Ok(FileType { mode: S_IFREG }),
++            DT_LNK => Ok(FileType { mode: S_IFLNK }),
++            // Filesystems that don't report a d_type (DT_UNKNOWN) need a stat.
++            _ => Ok(self.metadata()?.file_type()),
++        }
++    }
++}
++
++pub fn readdir(path: &Path) -> io::Result<ReadDir> {
++    let c = os::cstr(path)?;
++    let fd = cvt(unsafe {
++        sysc::syscall4(
++            sysc::OPENAT,
++            AT_FDCWD,
++            c.as_ptr() as usize,
++            (O_RDONLY | O_DIRECTORY | O_CLOEXEC) as usize,
++            0,
++        )
++    })? as i32;
++    let guard = File { fd }; // closes the dir fd on the way out
++
++    let mut dir = Vec::new();
++    let mut buf = [0u8; 4096];
++    loop {
++        let n = cvt(unsafe {
++            sysc::syscall3(sysc::GETDENTS64, fd as usize, buf.as_mut_ptr() as usize, buf.len())
++        })?;
++        if n == 0 {
++            break;
++        }
++        dir.extend_from_slice(&buf[..n]);
++    }
++    drop(guard);
++
++    Ok(ReadDir {
++        inner: Arc::new(InnerReadDir { root: path.to_path_buf(), dir }),
++        pos: 0,
++    })
++}
++
++// ---------------------------------------------------------------------------
++// Path operations (the *at family, rooted at AT_FDCWD)
++// ---------------------------------------------------------------------------
++
++pub fn unlink(path: &Path) -> io::Result<()> {
++    let c = os::cstr(path)?;
++    cvt(unsafe { sysc::syscall3(sysc::UNLINKAT, AT_FDCWD, c.as_ptr() as usize, 0) }).map(drop)
++}
++
++pub fn rmdir(path: &Path) -> io::Result<()> {
++    let c = os::cstr(path)?;
++    cvt(unsafe { sysc::syscall3(sysc::UNLINKAT, AT_FDCWD, c.as_ptr() as usize, AT_REMOVEDIR) })
++        .map(drop)
++}
++
++pub fn rename(old: &Path, new: &Path) -> io::Result<()> {
++    let o = os::cstr(old)?;
++    let n = os::cstr(new)?;
++    cvt(unsafe {
++        sysc::syscall4(
++            sysc::RENAMEAT,
++            AT_FDCWD,
++            o.as_ptr() as usize,
++            AT_FDCWD,
++            n.as_ptr() as usize,
++        )
++    })
++    .map(drop)
++}
++
++pub fn set_perm(path: &Path, perm: FilePermissions) -> io::Result<()> {
++    let c = os::cstr(path)?;
++    cvt(unsafe {
++        sysc::syscall3(sysc::FCHMODAT, AT_FDCWD, c.as_ptr() as usize, perm.mode as usize)
++    })
++    .map(drop)
++}
++
++pub fn readlink(path: &Path) -> io::Result<PathBuf> {
++    let c = os::cstr(path)?;
++    let mut buf = vec![0u8; 256];
++    loop {
++        let n = cvt(unsafe {
++            sysc::syscall4(
++                sysc::READLINKAT,
++                AT_FDCWD,
++                c.as_ptr() as usize,
++                buf.as_mut_ptr() as usize,
++                buf.len(),
++            )
++        })?;
++        // A full buffer means the target may be truncated; grow and retry.
++        if n < buf.len() {
++            buf.truncate(n);
++            return Ok(PathBuf::from(os::os_string_from_bytes(&buf)));
++        }
++        let len = buf.len() * 2;
++        buf.resize(len, 0);
++    }
++}
++
++pub fn symlink(original: &Path, link: &Path) -> io::Result<()> {
++    let target = os::cstr(original)?;
++    let linkpath = os::cstr(link)?;
++    cvt(unsafe {
++        sysc::syscall3(
++            sysc::SYMLINKAT,
++            target.as_ptr() as usize,
++            AT_FDCWD,
++            linkpath.as_ptr() as usize,
++        )
++    })
++    .map(drop)
++}
++
++pub fn link(original: &Path, link: &Path) -> io::Result<()> {
++    let o = os::cstr(original)?;
++    let l = os::cstr(link)?;
++    cvt(unsafe {
++        sysc::syscall5(
++            sysc::LINKAT,
++            AT_FDCWD,
++            o.as_ptr() as usize,
++            AT_FDCWD,
++            l.as_ptr() as usize,
++            0,
++        )
++    })
++    .map(drop)
++}
++
++pub fn stat(path: &Path) -> io::Result<FileAttr> {
++    let c = os::cstr(path)?;
++    do_statx(AT_FDCWD, &c, 0)
++}
++
++pub fn lstat(path: &Path) -> io::Result<FileAttr> {
++    let c = os::cstr(path)?;
++    do_statx(AT_FDCWD, &c, AT_SYMLINK_NOFOLLOW)
++}
++
++pub fn canonicalize(path: &Path) -> io::Result<PathBuf> {
++    // No `realpath(3)` without libc: open the path with `O_PATH` and read back
++    // the kernel's canonical name via `/proc/self/fd/<n>`.
++    let c = os::cstr(path)?;
++    let fd = cvt(unsafe {
++        sysc::syscall4(
++            sysc::OPENAT,
++            AT_FDCWD,
++            c.as_ptr() as usize,
++            (O_PATH | O_CLOEXEC) as usize,
++            0,
++        )
++    })? as i32;
++    let guard = File { fd };
++    let proc = PathBuf::from(format!("/proc/self/fd/{fd}"));
++    let real = readlink(&proc);
++    drop(guard);
++    real
++}
+diff --git a/library/std/src/sys/fs/mod.rs b/library/std/src/sys/fs/mod.rs
+index d55e2807..6430cb12 100644
+--- a/library/std/src/sys/fs/mod.rs
++++ b/library/std/src/sys/fs/mod.rs
+@@ -33,6 +33,9 @@
+     } else if #[cfg(target_os = "wasi")] {
+         mod wasi;
+         use wasi as imp;
++    } else if #[cfg(target_os = "fullrust")] {
++        mod fullrust;
++        use fullrust as imp;
+     } else {
+         mod unsupported;
+         use unsupported as imp;
+diff --git a/library/std/src/sys/net/connection/fullrust.rs b/library/std/src/sys/net/connection/fullrust.rs
+new file mode 100644
+index 00000000..81cc1ac3
+--- /dev/null
++++ b/library/std/src/sys/net/connection/fullrust.rs
+@@ -0,0 +1,937 @@
++//! TCP/UDP sockets and DNS for the fullrust target, on raw Linux syscalls.
++//!
++//! A single `Socket` (an owned fd) backs `TcpStream`, `TcpListener`, and
++//! `UdpSocket`; the public types are thin wrappers exposing the std interface.
++//! Addresses are marshalled to/from raw `sockaddr_in`/`sockaddr_in6` bytes. All
++//! sends use `MSG_NOSIGNAL` because this target installs no `SIGPIPE` handler —
++//! a write to a closed peer must return `EPIPE`, not kill the process. Name
++//! resolution is a self-contained DNS client (`/etc/hosts` + `/etc/resolv.conf`
++//! + UDP queries), since there is no libc `getaddrinfo`.
++
++use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
++use crate::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6};
++use crate::sys::pal::sysc;
++use crate::time::Duration;
++use crate::{fmt, mem};
++
++// Address families / socket types / protocols.
++const AF_INET: usize = 2;
++const AF_INET6: usize = 10;
++const SOCK_STREAM: usize = 1;
++const SOCK_DGRAM: usize = 2;
++const SOCK_CLOEXEC: usize = 0o2000000;
++
++const SOL_SOCKET: usize = 1;
++const IPPROTO_IP: usize = 0;
++const IPPROTO_TCP: usize = 6;
++const IPPROTO_IPV6: usize = 41;
++
++// Socket options.
++const SO_REUSEADDR: usize = 2;
++const SO_ERROR: usize = 4;
++const SO_BROADCAST: usize = 6;
++const SO_LINGER: usize = 13;
++const SO_RCVTIMEO: usize = 20;
++const SO_SNDTIMEO: usize = 21;
++const TCP_NODELAY: usize = 1;
++const IP_TTL: usize = 2;
++const IP_MULTICAST_TTL: usize = 33;
++const IP_MULTICAST_LOOP: usize = 34;
++const IP_ADD_MEMBERSHIP: usize = 35;
++const IP_DROP_MEMBERSHIP: usize = 36;
++const IPV6_MULTICAST_LOOP: usize = 19;
++const IPV6_ADD_MEMBERSHIP: usize = 20;
++const IPV6_DROP_MEMBERSHIP: usize = 21;
++const IPV6_V6ONLY: usize = 26;
++
++// send/recv flags and shutdown / fcntl bits.
++const MSG_PEEK: usize = 2;
++const MSG_NOSIGNAL: usize = 0x4000;
++const O_NONBLOCK: usize = 0o4000;
++const F_GETFL: usize = 3;
++const F_SETFL: usize = 4;
++const F_DUPFD_CLOEXEC: usize = 1030;
++const POLLOUT: i16 = 0x4;
++const EINPROGRESS: i32 = 115;
++
++#[inline]
++fn cvt(r: usize) -> io::Result<usize> {
++    sysc::ret(r).map_err(io::Error::from_raw_os_error)
++}
++
++// ---------------------------------------------------------------------------
++// sockaddr marshalling
++// ---------------------------------------------------------------------------
++
++/// Serialize a `SocketAddr` into a raw `sockaddr_in`/`sockaddr_in6`, returning
++/// the significant length.
++fn addr_to_raw(addr: &SocketAddr, buf: &mut [u8; 28]) -> usize {
++    *buf = [0; 28];
++    match addr {
++        SocketAddr::V4(a) => {
++            buf[0..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes());
++            buf[2..4].copy_from_slice(&a.port().to_be_bytes());
++            buf[4..8].copy_from_slice(&a.ip().octets());
++            16
++        }
++        SocketAddr::V6(a) => {
++            buf[0..2].copy_from_slice(&(AF_INET6 as u16).to_ne_bytes());
++            buf[2..4].copy_from_slice(&a.port().to_be_bytes());
++            buf[4..8].copy_from_slice(&a.flowinfo().to_ne_bytes());
++            buf[8..24].copy_from_slice(&a.ip().octets());
++            buf[24..28].copy_from_slice(&a.scope_id().to_ne_bytes());
++            28
++        }
++    }
++}
++
++fn raw_to_addr(buf: &[u8]) -> io::Result<SocketAddr> {
++    let family = u16::from_ne_bytes([buf[0], buf[1]]) as usize;
++    match family {
++        AF_INET => {
++            let port = u16::from_be_bytes([buf[2], buf[3]]);
++            let ip = Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
++            Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)))
++        }
++        AF_INET6 => {
++            let port = u16::from_be_bytes([buf[2], buf[3]]);
++            let flowinfo = u32::from_ne_bytes(buf[4..8].try_into().unwrap());
++            let mut octets = [0u8; 16];
++            octets.copy_from_slice(&buf[8..24]);
++            let scope = u32::from_ne_bytes(buf[24..28].try_into().unwrap());
++            Ok(SocketAddr::V6(SocketAddrV6::new(octets.into(), port, flowinfo, scope)))
++        }
++        _ => Err(io::const_error!(io::ErrorKind::InvalidInput, "unrecognized address family")),
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Socket
++// ---------------------------------------------------------------------------
++
++pub struct Socket {
++    fd: i32,
++}
++
++impl Socket {
++    fn new_raw(family: usize, ty: usize) -> io::Result<Socket> {
++        let fd = cvt(unsafe { sysc::syscall3(sysc::SOCKET, family, ty | SOCK_CLOEXEC, 0) })?;
++        Ok(Socket { fd: fd as i32 })
++    }
++
++    fn new(addr: &SocketAddr, ty: usize) -> io::Result<Socket> {
++        let family = match addr {
++            SocketAddr::V4(..) => AF_INET,
++            SocketAddr::V6(..) => AF_INET6,
++        };
++        Socket::new_raw(family, ty)
++    }
++
++    fn setsockopt<T>(&self, level: usize, name: usize, value: T) -> io::Result<()> {
++        cvt(unsafe {
++            sysc::syscall5(
++                sysc::SETSOCKOPT,
++                self.fd as usize,
++                level,
++                name,
++                &value as *const T as usize,
++                mem::size_of::<T>(),
++            )
++        })?;
++        Ok(())
++    }
++
++    fn getsockopt<T: Copy>(&self, level: usize, name: usize) -> io::Result<T> {
++        // SAFETY: the kernel fills `val` with `len` bytes of plain option data.
++        unsafe {
++            let mut val: T = mem::zeroed();
++            let mut len = mem::size_of::<T>() as u32;
++            cvt(sysc::syscall5(
++                sysc::GETSOCKOPT,
++                self.fd as usize,
++                level,
++                name,
++                &mut val as *mut T as usize,
++                &mut len as *mut u32 as usize,
++            ))?;
++            Ok(val)
++        }
++    }
++
++    fn connect(&self, addr: &SocketAddr) -> io::Result<()> {
++        let mut raw = [0u8; 28];
++        let len = addr_to_raw(addr, &mut raw);
++        cvt(unsafe {
++            sysc::syscall3(sysc::CONNECT, self.fd as usize, raw.as_ptr() as usize, len)
++        })?;
++        Ok(())
++    }
++
++    fn connect_timeout(&self, addr: &SocketAddr, timeout: Duration) -> io::Result<()> {
++        self.set_nonblocking(true)?;
++        let mut raw = [0u8; 28];
++        let len = addr_to_raw(addr, &mut raw);
++        let r = sysc::ret(unsafe {
++            sysc::syscall3(sysc::CONNECT, self.fd as usize, raw.as_ptr() as usize, len)
++        });
++        let result = match r {
++            Ok(_) => Ok(()),
++            Err(e) if e == EINPROGRESS => {
++                if timeout.as_secs() == 0 && timeout.subsec_nanos() == 0 {
++                    return Err(io::const_error!(
++                        io::ErrorKind::InvalidInput,
++                        "cannot set a 0 duration timeout",
++                    ));
++                }
++                self.poll_connect(timeout)
++            }
++            Err(e) => Err(io::Error::from_raw_os_error(e)),
++        };
++        self.set_nonblocking(false)?;
++        result
++    }
++
++    fn poll_connect(&self, timeout: Duration) -> io::Result<()> {
++        #[repr(C)]
++        struct PollFd {
++            fd: i32,
++            events: i16,
++            revents: i16,
++        }
++        let mut ms = timeout.as_millis();
++        if ms == 0 {
++            ms = 1;
++        }
++        let ms = ms.min(i32::MAX as u128) as i32;
++        let mut pfd = PollFd { fd: self.fd, events: POLLOUT, revents: 0 };
++        loop {
++            match sysc::ret(unsafe {
++                sysc::syscall3(sysc::POLL, &mut pfd as *mut PollFd as usize, 1, ms as usize)
++            }) {
++                Ok(0) => {
++                    return Err(io::const_error!(
++                        io::ErrorKind::TimedOut,
++                        "connection timed out",
++                    ));
++                }
++                Ok(_) => break,
++                Err(4) => continue, // EINTR
++                Err(e) => return Err(io::Error::from_raw_os_error(e)),
++            }
++        }
++        // Connection result is reported via SO_ERROR.
++        let err: i32 = self.getsockopt(SOL_SOCKET, SO_ERROR)?;
++        if err == 0 { Ok(()) } else { Err(io::Error::from_raw_os_error(err)) }
++    }
++
++    fn accept(&self) -> io::Result<(Socket, SocketAddr)> {
++        let mut storage = [0u8; 28];
++        let mut len = storage.len() as u32;
++        let fd = cvt(unsafe {
++            sysc::syscall4(
++                sysc::ACCEPT4,
++                self.fd as usize,
++                storage.as_mut_ptr() as usize,
++                &mut len as *mut u32 as usize,
++                SOCK_CLOEXEC,
++            )
++        })?;
++        Ok((Socket { fd: fd as i32 }, raw_to_addr(&storage)?))
++    }
++
++    fn duplicate(&self) -> io::Result<Socket> {
++        let fd = cvt(unsafe {
++            sysc::syscall3(sysc::FCNTL, self.fd as usize, F_DUPFD_CLOEXEC, 0)
++        })?;
++        Ok(Socket { fd: fd as i32 })
++    }
++
++    fn recv_with_flags(&self, buf: &mut [u8], flags: usize) -> io::Result<usize> {
++        cvt(unsafe {
++            sysc::syscall6(
++                sysc::RECVFROM,
++                self.fd as usize,
++                buf.as_mut_ptr() as usize,
++                buf.len(),
++                flags,
++                0,
++                0,
++            )
++        })
++    }
++
++    fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
++        self.recv_with_flags(buf, 0)
++    }
++
++    fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
++        self.recv_with_flags(buf, MSG_PEEK)
++    }
++
++    fn read_buf(&self, mut cursor: BorrowedCursor<'_>) -> io::Result<()> {
++        let n = cvt(unsafe {
++            let dst = cursor.as_mut().as_mut_ptr() as usize;
++            sysc::syscall6(sysc::RECVFROM, self.fd as usize, dst, cursor.capacity(), 0, 0, 0)
++        })?;
++        unsafe { cursor.advance_unchecked(n) };
++        Ok(())
++    }
++
++    fn recv_from_with_flags(
++        &self,
++        buf: &mut [u8],
++        flags: usize,
++    ) -> io::Result<(usize, SocketAddr)> {
++        let mut storage = [0u8; 28];
++        let mut len = storage.len() as u32;
++        let n = cvt(unsafe {
++            sysc::syscall6(
++                sysc::RECVFROM,
++                self.fd as usize,
++                buf.as_mut_ptr() as usize,
++                buf.len(),
++                flags,
++                storage.as_mut_ptr() as usize,
++                &mut len as *mut u32 as usize,
++            )
++        })?;
++        Ok((n, raw_to_addr(&storage)?))
++    }
++
++    fn write(&self, buf: &[u8]) -> io::Result<usize> {
++        cvt(unsafe {
++            sysc::syscall6(
++                sysc::SENDTO,
++                self.fd as usize,
++                buf.as_ptr() as usize,
++                buf.len(),
++                MSG_NOSIGNAL,
++                0,
++                0,
++            )
++        })
++    }
++
++    fn send_to(&self, buf: &[u8], addr: &SocketAddr) -> io::Result<usize> {
++        let mut raw = [0u8; 28];
++        let len = addr_to_raw(addr, &mut raw);
++        cvt(unsafe {
++            sysc::syscall6(
++                sysc::SENDTO,
++                self.fd as usize,
++                buf.as_ptr() as usize,
++                buf.len(),
++                MSG_NOSIGNAL,
++                raw.as_ptr() as usize,
++                len,
++            )
++        })
++    }
++
++    fn sockname(&self, which: usize) -> io::Result<SocketAddr> {
++        let mut storage = [0u8; 28];
++        let mut len = storage.len() as u32;
++        cvt(unsafe {
++            sysc::syscall3(which, self.fd as usize, storage.as_mut_ptr() as usize, &mut len
++                as *mut u32 as usize)
++        })?;
++        raw_to_addr(&storage)
++    }
++
++    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
++        let how = match how {
++            Shutdown::Read => 0,
++            Shutdown::Write => 1,
++            Shutdown::Both => 2,
++        };
++        cvt(unsafe { sysc::syscall2(sysc::SHUTDOWN, self.fd as usize, how) })?;
++        Ok(())
++    }
++
++    fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
++        let flags = cvt(unsafe { sysc::syscall3(sysc::FCNTL, self.fd as usize, F_GETFL, 0) })?;
++        let new = if nonblocking { flags | O_NONBLOCK } else { flags & !O_NONBLOCK };
++        cvt(unsafe { sysc::syscall3(sysc::FCNTL, self.fd as usize, F_SETFL, new) })?;
++        Ok(())
++    }
++
++    fn set_timeout(&self, dur: Option<Duration>, opt: usize) -> io::Result<()> {
++        let tv: [i64; 2] = match dur {
++            Some(d) => {
++                if d.as_secs() == 0 && d.subsec_nanos() == 0 {
++                    return Err(io::const_error!(
++                        io::ErrorKind::InvalidInput,
++                        "cannot set a 0 duration timeout",
++                    ));
++                }
++                let secs = d.as_secs().min(i64::MAX as u64) as i64;
++                let mut usecs = d.subsec_micros() as i64;
++                // Never round a non-zero timeout down to "no timeout".
++                if secs == 0 && usecs == 0 {
++                    usecs = 1;
++                }
++                [secs, usecs]
++            }
++            None => [0, 0],
++        };
++        self.setsockopt(SOL_SOCKET, opt, tv)
++    }
++
++    fn timeout(&self, opt: usize) -> io::Result<Option<Duration>> {
++        let tv: [i64; 2] = self.getsockopt(SOL_SOCKET, opt)?;
++        if tv[0] == 0 && tv[1] == 0 {
++            Ok(None)
++        } else {
++            Ok(Some(Duration::new(tv[0] as u64, (tv[1] * 1000) as u32)))
++        }
++    }
++
++    fn take_error(&self) -> io::Result<Option<io::Error>> {
++        let err: i32 = self.getsockopt(SOL_SOCKET, SO_ERROR)?;
++        if err == 0 { Ok(None) } else { Ok(Some(io::Error::from_raw_os_error(err))) }
++    }
++}
++
++impl Drop for Socket {
++    fn drop(&mut self) {
++        unsafe {
++            sysc::syscall1(sysc::CLOSE, self.fd as usize);
++        }
++    }
++}
++
++impl fmt::Debug for Socket {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("Socket").field("fd", &self.fd).finish()
++    }
++}
++
++// `read_vectored`/`write_vectored` fall back to a single non-empty buffer.
++fn first_mut<'a>(bufs: &'a mut [IoSliceMut<'_>]) -> Option<&'a mut [u8]> {
++    bufs.iter_mut().find(|b| !b.is_empty()).map(|b| &mut **b)
++}
++fn first_ref<'a>(bufs: &'a [IoSlice<'_>]) -> Option<&'a [u8]> {
++    bufs.iter().find(|b| !b.is_empty()).map(|b| &**b)
++}
++
++// ---------------------------------------------------------------------------
++// TcpStream
++// ---------------------------------------------------------------------------
++
++pub struct TcpStream {
++    inner: Socket,
++}
++
++impl TcpStream {
++    pub fn connect(addr: io::Result<&SocketAddr>) -> io::Result<TcpStream> {
++        let addr = addr?;
++        let sock = Socket::new(addr, SOCK_STREAM)?;
++        sock.connect(addr)?;
++        Ok(TcpStream { inner: sock })
++    }
++
++    pub fn connect_timeout(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
++        let sock = Socket::new(addr, SOCK_STREAM)?;
++        sock.connect_timeout(addr, timeout)?;
++        Ok(TcpStream { inner: sock })
++    }
++
++    pub fn set_read_timeout(&self, t: Option<Duration>) -> io::Result<()> {
++        self.inner.set_timeout(t, SO_RCVTIMEO)
++    }
++    pub fn set_write_timeout(&self, t: Option<Duration>) -> io::Result<()> {
++        self.inner.set_timeout(t, SO_SNDTIMEO)
++    }
++    pub fn read_timeout(&self) -> io::Result<Option<Duration>> {
++        self.inner.timeout(SO_RCVTIMEO)
++    }
++    pub fn write_timeout(&self) -> io::Result<Option<Duration>> {
++        self.inner.timeout(SO_SNDTIMEO)
++    }
++    pub fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
++        self.inner.peek(buf)
++    }
++    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
++        self.inner.read(buf)
++    }
++    pub fn read_buf(&self, cursor: BorrowedCursor<'_>) -> io::Result<()> {
++        self.inner.read_buf(cursor)
++    }
++    pub fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
++        match first_mut(bufs) {
++            Some(b) => self.inner.read(b),
++            None => Ok(0),
++        }
++    }
++    pub fn is_read_vectored(&self) -> bool {
++        false
++    }
++    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
++        self.inner.write(buf)
++    }
++    pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
++        match first_ref(bufs) {
++            Some(b) => self.inner.write(b),
++            None => Ok(0),
++        }
++    }
++    pub fn is_write_vectored(&self) -> bool {
++        false
++    }
++    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
++        self.inner.sockname(sysc::GETPEERNAME)
++    }
++    pub fn socket_addr(&self) -> io::Result<SocketAddr> {
++        self.inner.sockname(sysc::GETSOCKNAME)
++    }
++    pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
++        self.inner.shutdown(how)
++    }
++    pub fn duplicate(&self) -> io::Result<TcpStream> {
++        Ok(TcpStream { inner: self.inner.duplicate()? })
++    }
++    pub fn set_linger(&self, linger: Option<Duration>) -> io::Result<()> {
++        // struct linger { i32 l_onoff; i32 l_linger; }
++        let l: [i32; 2] = match linger {
++            Some(d) => [1, d.as_secs().min(i32::MAX as u64) as i32],
++            None => [0, 0],
++        };
++        self.inner.setsockopt(SOL_SOCKET, SO_LINGER, l)
++    }
++    pub fn linger(&self) -> io::Result<Option<Duration>> {
++        let l: [i32; 2] = self.inner.getsockopt(SOL_SOCKET, SO_LINGER)?;
++        Ok(if l[0] == 0 { None } else { Some(Duration::from_secs(l[1] as u64)) })
++    }
++    pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
++        self.inner.setsockopt(IPPROTO_TCP, TCP_NODELAY, nodelay as i32)
++    }
++    pub fn nodelay(&self) -> io::Result<bool> {
++        let v: i32 = self.inner.getsockopt(IPPROTO_TCP, TCP_NODELAY)?;
++        Ok(v != 0)
++    }
++    pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
++        self.inner.setsockopt(IPPROTO_IP, IP_TTL, ttl as i32)
++    }
++    pub fn ttl(&self) -> io::Result<u32> {
++        let v: i32 = self.inner.getsockopt(IPPROTO_IP, IP_TTL)?;
++        Ok(v as u32)
++    }
++    pub fn take_error(&self) -> io::Result<Option<io::Error>> {
++        self.inner.take_error()
++    }
++    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
++        self.inner.set_nonblocking(nonblocking)
++    }
++}
++
++impl fmt::Debug for TcpStream {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("TcpStream").field("fd", &self.inner.fd).finish()
++    }
++}
++
++// ---------------------------------------------------------------------------
++// TcpListener
++// ---------------------------------------------------------------------------
++
++pub struct TcpListener {
++    inner: Socket,
++}
++
++impl TcpListener {
++    pub fn bind(addr: io::Result<&SocketAddr>) -> io::Result<TcpListener> {
++        let addr = addr?;
++        let sock = Socket::new(addr, SOCK_STREAM)?;
++        // Match the BSD/std default so a restarted listener can rebind promptly.
++        sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1i32)?;
++        let mut raw = [0u8; 28];
++        let len = addr_to_raw(addr, &mut raw);
++        cvt(unsafe {
++            sysc::syscall3(sysc::BIND, sock.fd as usize, raw.as_ptr() as usize, len)
++        })?;
++        cvt(unsafe { sysc::syscall2(sysc::LISTEN, sock.fd as usize, 128) })?;
++        Ok(TcpListener { inner: sock })
++    }
++
++    pub fn socket_addr(&self) -> io::Result<SocketAddr> {
++        self.inner.sockname(sysc::GETSOCKNAME)
++    }
++    pub fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
++        let (sock, addr) = self.inner.accept()?;
++        Ok((TcpStream { inner: sock }, addr))
++    }
++    pub fn duplicate(&self) -> io::Result<TcpListener> {
++        Ok(TcpListener { inner: self.inner.duplicate()? })
++    }
++    pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
++        self.inner.setsockopt(IPPROTO_IP, IP_TTL, ttl as i32)
++    }
++    pub fn ttl(&self) -> io::Result<u32> {
++        let v: i32 = self.inner.getsockopt(IPPROTO_IP, IP_TTL)?;
++        Ok(v as u32)
++    }
++    pub fn set_only_v6(&self, only_v6: bool) -> io::Result<()> {
++        self.inner.setsockopt(IPPROTO_IPV6, IPV6_V6ONLY, only_v6 as i32)
++    }
++    pub fn only_v6(&self) -> io::Result<bool> {
++        let v: i32 = self.inner.getsockopt(IPPROTO_IPV6, IPV6_V6ONLY)?;
++        Ok(v != 0)
++    }
++    pub fn take_error(&self) -> io::Result<Option<io::Error>> {
++        self.inner.take_error()
++    }
++    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
++        self.inner.set_nonblocking(nonblocking)
++    }
++}
++
++impl fmt::Debug for TcpListener {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("TcpListener").field("fd", &self.inner.fd).finish()
++    }
++}
++
++// ---------------------------------------------------------------------------
++// UdpSocket
++// ---------------------------------------------------------------------------
++
++pub struct UdpSocket {
++    inner: Socket,
++}
++
++impl UdpSocket {
++    pub fn bind(addr: io::Result<&SocketAddr>) -> io::Result<UdpSocket> {
++        let addr = addr?;
++        let sock = Socket::new(addr, SOCK_DGRAM)?;
++        let mut raw = [0u8; 28];
++        let len = addr_to_raw(addr, &mut raw);
++        cvt(unsafe {
++            sysc::syscall3(sysc::BIND, sock.fd as usize, raw.as_ptr() as usize, len)
++        })?;
++        Ok(UdpSocket { inner: sock })
++    }
++
++    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
++        self.inner.sockname(sysc::GETPEERNAME)
++    }
++    pub fn socket_addr(&self) -> io::Result<SocketAddr> {
++        self.inner.sockname(sysc::GETSOCKNAME)
++    }
++    pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
++        self.inner.recv_from_with_flags(buf, 0)
++    }
++    pub fn peek_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
++        self.inner.recv_from_with_flags(buf, MSG_PEEK)
++    }
++    pub fn send_to(&self, buf: &[u8], addr: &SocketAddr) -> io::Result<usize> {
++        self.inner.send_to(buf, addr)
++    }
++    pub fn duplicate(&self) -> io::Result<UdpSocket> {
++        Ok(UdpSocket { inner: self.inner.duplicate()? })
++    }
++    pub fn set_read_timeout(&self, t: Option<Duration>) -> io::Result<()> {
++        self.inner.set_timeout(t, SO_RCVTIMEO)
++    }
++    pub fn set_write_timeout(&self, t: Option<Duration>) -> io::Result<()> {
++        self.inner.set_timeout(t, SO_SNDTIMEO)
++    }
++    pub fn read_timeout(&self) -> io::Result<Option<Duration>> {
++        self.inner.timeout(SO_RCVTIMEO)
++    }
++    pub fn write_timeout(&self) -> io::Result<Option<Duration>> {
++        self.inner.timeout(SO_SNDTIMEO)
++    }
++    pub fn set_broadcast(&self, broadcast: bool) -> io::Result<()> {
++        self.inner.setsockopt(SOL_SOCKET, SO_BROADCAST, broadcast as i32)
++    }
++    pub fn broadcast(&self) -> io::Result<bool> {
++        let v: i32 = self.inner.getsockopt(SOL_SOCKET, SO_BROADCAST)?;
++        Ok(v != 0)
++    }
++    pub fn set_multicast_loop_v4(&self, on: bool) -> io::Result<()> {
++        self.inner.setsockopt(IPPROTO_IP, IP_MULTICAST_LOOP, on as i32)
++    }
++    pub fn multicast_loop_v4(&self) -> io::Result<bool> {
++        let v: i32 = self.inner.getsockopt(IPPROTO_IP, IP_MULTICAST_LOOP)?;
++        Ok(v != 0)
++    }
++    pub fn set_multicast_ttl_v4(&self, ttl: u32) -> io::Result<()> {
++        self.inner.setsockopt(IPPROTO_IP, IP_MULTICAST_TTL, ttl as i32)
++    }
++    pub fn multicast_ttl_v4(&self) -> io::Result<u32> {
++        let v: i32 = self.inner.getsockopt(IPPROTO_IP, IP_MULTICAST_TTL)?;
++        Ok(v as u32)
++    }
++    pub fn set_multicast_loop_v6(&self, on: bool) -> io::Result<()> {
++        self.inner.setsockopt(IPPROTO_IPV6, IPV6_MULTICAST_LOOP, on as i32)
++    }
++    pub fn multicast_loop_v6(&self) -> io::Result<bool> {
++        let v: i32 = self.inner.getsockopt(IPPROTO_IPV6, IPV6_MULTICAST_LOOP)?;
++        Ok(v != 0)
++    }
++    pub fn join_multicast_v4(&self, multiaddr: &Ipv4Addr, interface: &Ipv4Addr) -> io::Result<()> {
++        // struct ip_mreq { in_addr imr_multiaddr; in_addr imr_interface; }
++        let mut mreq = [0u8; 8];
++        mreq[0..4].copy_from_slice(&multiaddr.octets());
++        mreq[4..8].copy_from_slice(&interface.octets());
++        self.inner.setsockopt(IPPROTO_IP, IP_ADD_MEMBERSHIP, mreq)
++    }
++    pub fn leave_multicast_v4(&self, multiaddr: &Ipv4Addr, interface: &Ipv4Addr) -> io::Result<()> {
++        let mut mreq = [0u8; 8];
++        mreq[0..4].copy_from_slice(&multiaddr.octets());
++        mreq[4..8].copy_from_slice(&interface.octets());
++        self.inner.setsockopt(IPPROTO_IP, IP_DROP_MEMBERSHIP, mreq)
++    }
++    pub fn join_multicast_v6(&self, multiaddr: &Ipv6Addr, interface: u32) -> io::Result<()> {
++        // struct ipv6_mreq { in6_addr ipv6mr_multiaddr; u32 ipv6mr_interface; }
++        let mut mreq = [0u8; 20];
++        mreq[0..16].copy_from_slice(&multiaddr.octets());
++        mreq[16..20].copy_from_slice(&interface.to_ne_bytes());
++        self.inner.setsockopt(IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP, mreq)
++    }
++    pub fn leave_multicast_v6(&self, multiaddr: &Ipv6Addr, interface: u32) -> io::Result<()> {
++        let mut mreq = [0u8; 20];
++        mreq[0..16].copy_from_slice(&multiaddr.octets());
++        mreq[16..20].copy_from_slice(&interface.to_ne_bytes());
++        self.inner.setsockopt(IPPROTO_IPV6, IPV6_DROP_MEMBERSHIP, mreq)
++    }
++    pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
++        self.inner.setsockopt(IPPROTO_IP, IP_TTL, ttl as i32)
++    }
++    pub fn ttl(&self) -> io::Result<u32> {
++        let v: i32 = self.inner.getsockopt(IPPROTO_IP, IP_TTL)?;
++        Ok(v as u32)
++    }
++    pub fn take_error(&self) -> io::Result<Option<io::Error>> {
++        self.inner.take_error()
++    }
++    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
++        self.inner.set_nonblocking(nonblocking)
++    }
++    pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
++        self.inner.read(buf)
++    }
++    pub fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
++        self.inner.peek(buf)
++    }
++    pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
++        self.inner.write(buf)
++    }
++    pub fn connect(&self, addr: io::Result<&SocketAddr>) -> io::Result<()> {
++        self.inner.connect(addr?)
++    }
++}
++
++impl fmt::Debug for UdpSocket {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("UdpSocket").field("fd", &self.inner.fd).finish()
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Name resolution (LookupHost)
++// ---------------------------------------------------------------------------
++
++pub struct LookupHost {
++    iter: crate::vec::IntoIter<SocketAddr>,
++    port: u16,
++}
++
++impl LookupHost {
++    pub fn port(&self) -> u16 {
++        self.port
++    }
++}
++
++impl Iterator for LookupHost {
++    type Item = SocketAddr;
++    fn next(&mut self) -> Option<SocketAddr> {
++        self.iter.next()
++    }
++}
++
++impl TryFrom<&str> for LookupHost {
++    type Error = io::Error;
++
++    fn try_from(v: &str) -> io::Result<LookupHost> {
++        // Split "host:port" from the right (host may itself contain ':' for v6,
++        // but those forms are caught as IP literals before reaching here).
++        let (host, port_str) = v
++            .rsplit_once(':')
++            .ok_or_else(|| io::const_error!(io::ErrorKind::InvalidInput, "invalid socket address"))?;
++        let port: u16 = port_str
++            .parse()
++            .map_err(|_| io::const_error!(io::ErrorKind::InvalidInput, "invalid port value"))?;
++        (host, port).try_into()
++    }
++}
++
++impl TryFrom<(&str, u16)> for LookupHost {
++    type Error = io::Error;
++
++    fn try_from((host, port): (&str, u16)) -> io::Result<LookupHost> {
++        let addrs = resolve(host, port)?;
++        Ok(LookupHost { iter: addrs.into_iter(), port })
++    }
++}
++
++/// Resolve `host` to a set of `SocketAddr`s: IP literals directly, `localhost`
++/// and `/etc/hosts` entries locally, everything else via DNS.
++fn resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
++    if let Ok(ip) = host.parse::<IpAddr>() {
++        return Ok(vec![SocketAddr::new(ip, port)]);
++    }
++    if host.eq_ignore_ascii_case("localhost") {
++        return Ok(vec![
++            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
++            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port),
++        ]);
++    }
++    if let Some(addrs) = hosts_lookup(host, port) {
++        if !addrs.is_empty() {
++            return Ok(addrs);
++        }
++    }
++
++    let mut addrs = Vec::new();
++    if let Some(server) = resolv_conf_nameserver() {
++        // Prefer IPv4 (A) but include IPv6 (AAAA) when present.
++        for &qtype in &[1u16, 28u16] {
++            if let Ok(ips) = dns_query(&server, host, qtype) {
++                for ip in ips {
++                    addrs.push(SocketAddr::new(ip, port));
++                }
++            }
++        }
++    }
++    if addrs.is_empty() {
++        Err(io::const_error!(io::ErrorKind::Uncategorized, "failed to resolve host"))
++    } else {
++        Ok(addrs)
++    }
++}
++
++/// Scan `/etc/hosts` for `host`, returning any matching addresses.
++fn hosts_lookup(host: &str, port: u16) -> Option<Vec<SocketAddr>> {
++    let text = crate::fs::read_to_string("/etc/hosts").ok()?;
++    let mut out = Vec::new();
++    for line in text.lines() {
++        let line = line.split('#').next().unwrap_or("");
++        let mut fields = line.split_whitespace();
++        let Some(ip_str) = fields.next() else { continue };
++        let Ok(ip) = ip_str.parse::<IpAddr>() else { continue };
++        if fields.any(|name| name.eq_ignore_ascii_case(host)) {
++            out.push(SocketAddr::new(ip, port));
++        }
++    }
++    Some(out)
++}
++
++/// Read the first `nameserver` from `/etc/resolv.conf`.
++fn resolv_conf_nameserver() -> Option<SocketAddr> {
++    let text = crate::fs::read_to_string("/etc/resolv.conf").ok()?;
++    for line in text.lines() {
++        let line = line.trim();
++        if let Some(rest) = line.strip_prefix("nameserver") {
++            if let Ok(ip) = rest.trim().parse::<IpAddr>() {
++                return Some(SocketAddr::new(ip, 53));
++            }
++        }
++    }
++    None
++}
++
++/// Issue one DNS query (`qtype` = 1 for A, 28 for AAAA) over UDP and return the
++/// addresses in the answer section.
++fn dns_query(server: &SocketAddr, host: &str, qtype: u16) -> io::Result<Vec<IpAddr>> {
++    let mut q: Vec<u8> = Vec::with_capacity(host.len() + 32);
++    q.extend_from_slice(&0x4652u16.to_be_bytes()); // id ("FR")
++    q.extend_from_slice(&[0x01, 0x00]); // flags: recursion desired
++    q.extend_from_slice(&1u16.to_be_bytes()); // qdcount
++    q.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // an/ns/ar counts
++    for label in host.split('.') {
++        if label.is_empty() {
++            continue;
++        }
++        if label.len() > 63 {
++            return Err(io::const_error!(io::ErrorKind::InvalidInput, "dns label too long"));
++        }
++        q.push(label.len() as u8);
++        q.extend_from_slice(label.as_bytes());
++    }
++    q.push(0); // root label
++    q.extend_from_slice(&qtype.to_be_bytes());
++    q.extend_from_slice(&1u16.to_be_bytes()); // class IN
++
++    let bind: SocketAddr = match server {
++        SocketAddr::V4(..) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
++        SocketAddr::V6(..) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
++    };
++    let sock = UdpSocket::bind(Ok(&bind))?;
++    sock.set_read_timeout(Some(Duration::from_secs(5)))?;
++    sock.send_to(&q, server)?;
++
++    let mut resp = [0u8; 1500];
++    let (n, _) = sock.recv_from(&mut resp)?;
++    parse_dns_answers(&resp[..n], qtype)
++}
++
++/// Advance past a (possibly compressed) DNS name, returning the offset just
++/// after it in the record stream.
++fn skip_name(buf: &[u8], mut pos: usize) -> Option<usize> {
++    loop {
++        let len = *buf.get(pos)?;
++        if len & 0xc0 == 0xc0 {
++            // Compression pointer: two bytes, name ends here.
++            return Some(pos + 2);
++        }
++        if len == 0 {
++            return Some(pos + 1);
++        }
++        pos += 1 + len as usize;
++    }
++}
++
++fn parse_dns_answers(buf: &[u8], qtype: u16) -> io::Result<Vec<IpAddr>> {
++    let bad = || io::const_error!(io::ErrorKind::InvalidData, "malformed DNS response");
++    if buf.len() < 12 {
++        return Err(bad());
++    }
++    let qdcount = u16::from_be_bytes([buf[4], buf[5]]);
++    let ancount = u16::from_be_bytes([buf[6], buf[7]]);
++    let mut pos = 12;
++    // Skip the questions.
++    for _ in 0..qdcount {
++        pos = skip_name(buf, pos).ok_or_else(bad)?;
++        pos += 4; // qtype + qclass
++    }
++    let mut out = Vec::new();
++    for _ in 0..ancount {
++        pos = skip_name(buf, pos).ok_or_else(bad)?;
++        if pos + 10 > buf.len() {
++            return Err(bad());
++        }
++        let rtype = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
++        let rdlen = u16::from_be_bytes([buf[pos + 8], buf[pos + 9]]) as usize;
++        pos += 10;
++        if pos + rdlen > buf.len() {
++            return Err(bad());
++        }
++        if rtype == qtype {
++            if qtype == 1 && rdlen == 4 {
++                out.push(IpAddr::V4(Ipv4Addr::new(
++                    buf[pos],
++                    buf[pos + 1],
++                    buf[pos + 2],
++                    buf[pos + 3],
++                )));
++            } else if qtype == 28 && rdlen == 16 {
++                let mut o = [0u8; 16];
++                o.copy_from_slice(&buf[pos..pos + 16]);
++                out.push(IpAddr::V6(o.into()));
++            }
++        }
++        pos += rdlen;
++    }
++    Ok(out)
++}
+diff --git a/library/std/src/sys/net/mod.rs b/library/std/src/sys/net/mod.rs
+index 646679a1..411f126d 100644
+--- a/library/std/src/sys/net/mod.rs
++++ b/library/std/src/sys/net/mod.rs
+@@ -30,6 +30,11 @@ mod connection {
+             mod uefi;
+             pub use uefi::*;
+         }
++    } else if #[cfg(target_os = "fullrust")] {
++        mod connection {
++            mod fullrust;
++            pub use fullrust::*;
++        }
+     } else {
+         mod connection {
+             mod unsupported;
 diff --git a/library/std/src/sys/pal/fullrust/common.rs b/library/std/src/sys/pal/fullrust/common.rs
 new file mode 100644
-index 00000000..cf8c20ca
+index 00000000..5f04b788
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/common.rs
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,61 @@
 +use crate::io as std_io;
 +
 +// Called once by `rt::init` via `sys::init`, with the real argc/argv that the
 +// compiler-emitted `main` passed to `lang_start`. We hand them to the args
-+// machinery so `std::env::args()` works.
++// machinery so `std::env::args()` works, and derive `envp` (which follows the
++// NULL-terminated `argv` on the stack) for `std::env::var()`.
 +//
 +// SAFETY: must be called only once during runtime initialization.
 +pub unsafe fn init(argc: isize, argv: *const *const u8, _sigpipe: u8) {
 +    unsafe { crate::sys::args::init(argc, argv) };
++    // Stack layout: [argv0..argv(argc-1)][NULL][envp0..][NULL]. So `envp` begins
++    // one past the argv NULL terminator, i.e. at `argv[argc + 1]`.
++    if !argv.is_null() && argc >= 0 {
++        let envp = unsafe { argv.add(argc as usize + 1) } as *const *const core::ffi::c_char;
++        unsafe { crate::sys::env::init(envp) };
++    }
 +}
 +
 +// SAFETY: must be called only once during runtime cleanup.
 +pub unsafe fn cleanup() {}
 +
++// Retained for parity with other pals and any subsystem not yet ported to raw
++// syscalls; the ported fs/process/net paths no longer reach for it.
++#[allow(dead_code)]
 +pub fn unsupported<T>() -> std_io::Result<T> {
 +    Err(unsupported_err())
 +}
 +
++#[allow(dead_code)]
 +pub fn unsupported_err() -> std_io::Error {
 +    std_io::Error::UNSUPPORTED_PLATFORM
 +}
@@ -1209,10 +3092,10 @@ index 00000000..887454d8
 +}
 diff --git a/library/std/src/sys/pal/fullrust/mod.rs b/library/std/src/sys/pal/fullrust/mod.rs
 new file mode 100644
-index 00000000..87cf7db7
+index 00000000..07744bd9
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/mod.rs
-@@ -0,0 +1,158 @@
+@@ -0,0 +1,219 @@
 +//! The `fullrust` platform abstraction layer: libc-free Linux on raw syscalls.
 +//!
 +//! This pal provides what a hosted std gets from libc + crt0: the process entry
@@ -1269,6 +3152,26 @@ index 00000000..87cf7db7
 +        r
 +    }
 +    #[inline]
++    pub unsafe fn syscall4(n: usize, a: usize, b: usize, c: usize, d: usize) -> usize {
++        let r;
++        unsafe {
++            asm!("syscall", inlateout("rax") n => r, in("rdi") a, in("rsi") b, in("rdx") c,
++                 in("r10") d,
++                 lateout("rcx") _, lateout("r11") _, options(nostack, preserves_flags));
++        }
++        r
++    }
++    #[inline]
++    pub unsafe fn syscall5(n: usize, a: usize, b: usize, c: usize, d: usize, e: usize) -> usize {
++        let r;
++        unsafe {
++            asm!("syscall", inlateout("rax") n => r, in("rdi") a, in("rsi") b, in("rdx") c,
++                 in("r10") d, in("r8") e,
++                 lateout("rcx") _, lateout("r11") _, options(nostack, preserves_flags));
++        }
++        r
++    }
++    #[inline]
 +    pub unsafe fn syscall6(
 +        n: usize, a: usize, b: usize, c: usize, d: usize, e: usize, f: usize,
 +    ) -> usize {
@@ -1283,7 +3186,48 @@ index 00000000..87cf7db7
 +
 +    pub const READ: usize = 0;
 +    pub const WRITE: usize = 1;
++    pub const CLOSE: usize = 3;
++    pub const POLL: usize = 7;
++    pub const LSEEK: usize = 8;
++    pub const DUP2: usize = 33;
++    pub const FORK: usize = 57;
++    pub const EXECVE: usize = 59;
++    pub const WAIT4: usize = 61;
++    pub const KILL: usize = 62;
++    pub const PIPE2: usize = 293;
++    pub const FCNTL: usize = 72;
++    pub const SOCKET: usize = 41;
++    pub const CONNECT: usize = 42;
++    pub const SENDTO: usize = 44;
++    pub const RECVFROM: usize = 45;
++    pub const SHUTDOWN: usize = 48;
++    pub const BIND: usize = 49;
++    pub const LISTEN: usize = 50;
++    pub const GETSOCKNAME: usize = 51;
++    pub const GETPEERNAME: usize = 52;
++    pub const SETSOCKOPT: usize = 54;
++    pub const GETSOCKOPT: usize = 55;
++    pub const ACCEPT4: usize = 288;
++    pub const FLOCK: usize = 73;
++    pub const FSYNC: usize = 74;
++    pub const FDATASYNC: usize = 75;
++    pub const FTRUNCATE: usize = 77;
++    pub const GETCWD: usize = 79;
++    pub const CHDIR: usize = 80;
++    pub const FCHMOD: usize = 91;
++    pub const READLINK: usize = 89;
 +    pub const GETPID: usize = 39;
++    pub const GETDENTS64: usize = 217;
++    pub const OPENAT: usize = 257;
++    pub const MKDIRAT: usize = 258;
++    pub const UNLINKAT: usize = 263;
++    pub const RENAMEAT: usize = 264;
++    pub const LINKAT: usize = 265;
++    pub const SYMLINKAT: usize = 266;
++    pub const READLINKAT: usize = 267;
++    pub const FCHMODAT: usize = 268;
++    pub const UTIMENSAT: usize = 280;
++    pub const STATX: usize = 332;
 +    pub const EXIT_GROUP: usize = 231;
 +    pub const CLOCK_GETTIME: usize = 228;
 +    pub const GETRANDOM: usize = 318;
@@ -1373,13 +3317,13 @@ index 00000000..87cf7db7
 +}
 diff --git a/library/std/src/sys/pal/fullrust/os.rs b/library/std/src/sys/pal/fullrust/os.rs
 new file mode 100644
-index 00000000..905c78ec
+index 00000000..f210c9c3
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/os.rs
-@@ -0,0 +1,83 @@
-+use super::{sysc, unsupported};
+@@ -0,0 +1,123 @@
++use super::sysc;
 +use crate::error::Error as StdError;
-+use crate::ffi::{OsStr, OsString};
++use crate::ffi::{CString, OsStr, OsString};
 +use crate::marker::PhantomData;
 +use crate::path::{self, PathBuf};
 +use crate::{fmt, io};
@@ -1392,12 +3336,38 @@ index 00000000..905c78ec
 +    format!("os error {errno}")
 +}
 +
-+pub fn getcwd() -> io::Result<PathBuf> {
-+    unsupported()
++/// Build a NUL-terminated C string from a path's raw bytes. On the fullrust
++/// target `OsStr` is the byte representation, so the encoded bytes are the path
++/// bytes verbatim.
++pub(crate) fn cstr(path: &path::Path) -> io::Result<CString> {
++    CString::new(path.as_os_str().as_encoded_bytes())
++        .map_err(|_| io::const_error!(io::ErrorKind::InvalidInput, "path contains a NUL byte"))
 +}
 +
-+pub fn chdir(_: &path::Path) -> io::Result<()> {
-+    unsupported()
++/// Materialize an `OsString` from raw path bytes (byte-exact, no lossy decode).
++pub(crate) fn os_string_from_bytes(b: &[u8]) -> OsString {
++    // SAFETY: on this target the `OsStr` encoding *is* the raw byte sequence, so
++    // any byte slice is valid encoded content.
++    unsafe { OsStr::from_encoded_bytes_unchecked(b).to_os_string() }
++}
++
++pub fn getcwd() -> io::Result<PathBuf> {
++    let mut buf = [0u8; 4096];
++    let r = unsafe { sysc::syscall2(sysc::GETCWD, buf.as_mut_ptr() as usize, buf.len()) };
++    match sysc::ret(r) {
++        // getcwd writes the path plus a trailing NUL and returns the total length.
++        Ok(len) => {
++            let n = len.min(buf.len()).saturating_sub(1);
++            Ok(PathBuf::from(os_string_from_bytes(&buf[..n])))
++        }
++        Err(e) => Err(io::Error::from_raw_os_error(e)),
++    }
++}
++
++pub fn chdir(path: &path::Path) -> io::Result<()> {
++    let p = cstr(path)?;
++    let r = unsafe { sysc::syscall1(sysc::CHDIR, p.as_ptr() as usize) };
++    sysc::ret(r).map(|_| ()).map_err(io::Error::from_raw_os_error)
 +}
 +
 +pub struct SplitPaths<'a>(!, PhantomData<&'a ()>);
@@ -1438,7 +3408,21 @@ index 00000000..905c78ec
 +}
 +
 +pub fn current_exe() -> io::Result<PathBuf> {
-+    unsupported()
++    let link = c"/proc/self/exe";
++    let mut buf = [0u8; 4096];
++    let r = unsafe {
++        sysc::syscall3(
++            sysc::READLINK,
++            link.as_ptr() as usize,
++            buf.as_mut_ptr() as usize,
++            buf.len(),
++        )
++    };
++    match sysc::ret(r) {
++        // readlink returns the byte count written and does not NUL-terminate.
++        Ok(n) => Ok(PathBuf::from(os_string_from_bytes(&buf[..n.min(buf.len())]))),
++        Err(e) => Err(io::Error::from_raw_os_error(e)),
++    }
 +}
 +
 +pub fn temp_dir() -> PathBuf {
@@ -1462,78 +3446,192 @@ index 00000000..905c78ec
 +}
 diff --git a/library/std/src/sys/pal/fullrust/pipe.rs b/library/std/src/sys/pal/fullrust/pipe.rs
 new file mode 100644
-index 00000000..30a4cbfa
+index 00000000..919386c6
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/pipe.rs
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,183 @@
++//! Anonymous pipes for the fullrust target, on raw Linux syscalls.
++//!
++//! `AnonPipe` owns one end of a kernel pipe (an fd) and closes it on drop. Pipes
++//! are created `O_CLOEXEC` so they don't leak across an `execve`; the child end
++//! is explicitly `dup2`'d onto a stdio slot (which clears cloexec) by the process
++//! spawner. `read2` drains two pipes concurrently via `poll` so capturing both a
++//! child's stdout and stderr can't deadlock.
++
++use super::sysc;
 +use crate::fmt;
 +use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
-+use crate::sys_common::{FromInner, IntoInner};
 +
-+pub struct AnonPipe(!);
++// open/fcntl flags used here.
++const O_CLOEXEC: usize = 0o2000000;
++const O_NONBLOCK: usize = 0o4000;
++const F_GETFL: usize = 3;
++const F_SETFL: usize = 4;
++const F_DUPFD_CLOEXEC: usize = 1030;
++// poll(2) events.
++const POLLIN: i16 = 0x1;
 +
-+impl fmt::Debug for AnonPipe {
-+    fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
-+        self.0
-+    }
++#[inline]
++fn cvt(r: usize) -> io::Result<usize> {
++    sysc::ret(r).map_err(io::Error::from_raw_os_error)
++}
++
++pub struct AnonPipe {
++    fd: i32,
 +}
 +
 +impl AnonPipe {
++    pub(crate) fn from_fd(fd: i32) -> AnonPipe {
++        AnonPipe { fd }
++    }
++
++    pub(crate) fn as_raw_fd(&self) -> i32 {
++        self.fd
++    }
++
 +    pub fn try_clone(&self) -> io::Result<Self> {
-+        self.0
++        let fd = cvt(unsafe {
++            sysc::syscall3(sysc::FCNTL, self.fd as usize, F_DUPFD_CLOEXEC, 0)
++        })?;
++        Ok(AnonPipe { fd: fd as i32 })
 +    }
 +
-+    pub fn read(&self, _buf: &mut [u8]) -> io::Result<usize> {
-+        self.0
++    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
++        cvt(unsafe {
++            sysc::syscall3(sysc::READ, self.fd as usize, buf.as_mut_ptr() as usize, buf.len())
++        })
 +    }
 +
-+    pub fn read_buf(&self, _buf: BorrowedCursor<'_>) -> io::Result<()> {
-+        self.0
++    pub fn read_buf(&self, mut cursor: BorrowedCursor<'_>) -> io::Result<()> {
++        let n = cvt(unsafe {
++            let dst = cursor.as_mut().as_mut_ptr() as usize;
++            sysc::syscall3(sysc::READ, self.fd as usize, dst, cursor.capacity())
++        })?;
++        unsafe { cursor.advance_unchecked(n) };
++        Ok(())
 +    }
 +
-+    pub fn read_vectored(&self, _bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
-+        self.0
++    pub fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
++        match bufs.iter_mut().find(|b| !b.is_empty()) {
++            Some(b) => self.read(b),
++            None => Ok(0),
++        }
 +    }
 +
 +    pub fn is_read_vectored(&self) -> bool {
-+        self.0
++        false
 +    }
 +
-+    pub fn read_to_end(&self, _buf: &mut Vec<u8>) -> io::Result<usize> {
-+        self.0
++    pub fn read_to_end(&self, buf: &mut Vec<u8>) -> io::Result<usize> {
++        let mut total = 0;
++        let mut tmp = [0u8; 8192];
++        loop {
++            match self.read(&mut tmp) {
++                Ok(0) => break,
++                Ok(n) => {
++                    buf.extend_from_slice(&tmp[..n]);
++                    total += n;
++                }
++                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
++                Err(e) => return Err(e),
++            }
++        }
++        Ok(total)
 +    }
 +
-+    pub fn write(&self, _buf: &[u8]) -> io::Result<usize> {
-+        self.0
++    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
++        cvt(unsafe {
++            sysc::syscall3(sysc::WRITE, self.fd as usize, buf.as_ptr() as usize, buf.len())
++        })
 +    }
 +
-+    pub fn write_vectored(&self, _bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-+        self.0
++    pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
++        match bufs.iter().find(|b| !b.is_empty()) {
++            Some(b) => self.write(b),
++            None => Ok(0),
++        }
 +    }
 +
 +    pub fn is_write_vectored(&self) -> bool {
-+        self.0
-+    }
-+
-+    pub fn diverge(&self) -> ! {
-+        self.0
++        false
 +    }
 +}
 +
-+pub fn read2(p1: AnonPipe, _v1: &mut Vec<u8>, _p2: AnonPipe, _v2: &mut Vec<u8>) -> io::Result<()> {
-+    match p1.0 {}
-+}
-+
-+impl FromInner<!> for AnonPipe {
-+    fn from_inner(inner: !) -> Self {
-+        inner
++impl Drop for AnonPipe {
++    fn drop(&mut self) {
++        unsafe {
++            sysc::syscall1(sysc::CLOSE, self.fd as usize);
++        }
 +    }
 +}
 +
-+impl IntoInner<!> for AnonPipe {
-+    fn into_inner(self) -> ! {
-+        self.0
++impl fmt::Debug for AnonPipe {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("AnonPipe").field("fd", &self.fd).finish()
 +    }
++}
++
++/// Create a `(read, write)` pair of pipe ends, both close-on-exec.
++pub fn pipe() -> io::Result<(AnonPipe, AnonPipe)> {
++    let mut fds = [0i32; 2];
++    cvt(unsafe { sysc::syscall2(sysc::PIPE2, fds.as_mut_ptr() as usize, O_CLOEXEC) })?;
++    Ok((AnonPipe { fd: fds[0] }, AnonPipe { fd: fds[1] }))
++}
++
++#[repr(C)]
++struct PollFd {
++    fd: i32,
++    events: i16,
++    revents: i16,
++}
++
++fn set_nonblocking(fd: i32) -> io::Result<()> {
++    let flags = cvt(unsafe { sysc::syscall3(sysc::FCNTL, fd as usize, F_GETFL, 0) })?;
++    cvt(unsafe { sysc::syscall3(sysc::FCNTL, fd as usize, F_SETFL, flags | O_NONBLOCK) })?;
++    Ok(())
++}
++
++/// Drain one pipe into `v` until it would block; returns `true` at end-of-file.
++fn drain(p: &AnonPipe, v: &mut Vec<u8>) -> io::Result<bool> {
++    let mut tmp = [0u8; 8192];
++    loop {
++        match p.read(&mut tmp) {
++            Ok(0) => return Ok(true),
++            Ok(n) => v.extend_from_slice(&tmp[..n]),
++            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
++            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
++            Err(e) => return Err(e),
++        }
++    }
++}
++
++/// Read two pipes to EOF concurrently, so a child that fills one stream while we
++/// drain the other cannot deadlock.
++pub fn read2(p1: AnonPipe, v1: &mut Vec<u8>, p2: AnonPipe, v2: &mut Vec<u8>) -> io::Result<()> {
++    set_nonblocking(p1.fd)?;
++    set_nonblocking(p2.fd)?;
++    let mut done = [false, false];
++    while !(done[0] && done[1]) {
++        let mut fds = [
++            PollFd { fd: if done[0] { -1 } else { p1.fd }, events: POLLIN, revents: 0 },
++            PollFd { fd: if done[1] { -1 } else { p2.fd }, events: POLLIN, revents: 0 },
++        ];
++        // poll(fds, 2, -1): wait indefinitely until at least one is readable.
++        match sysc::ret(unsafe {
++            sysc::syscall3(sysc::POLL, fds.as_mut_ptr() as usize, 2, (-1isize) as usize)
++        }) {
++            Ok(_) => {}
++            Err(4) => continue, // EINTR
++            Err(e) => return Err(io::Error::from_raw_os_error(e)),
++        }
++        if !done[0] && fds[0].revents != 0 && drain(&p1, v1)? {
++            done[0] = true;
++        }
++        if !done[1] && fds[1].revents != 0 && drain(&p2, v2)? {
++            done[1] = true;
++        }
++    }
++    Ok(())
 +}
 diff --git a/library/std/src/sys/pal/fullrust/thread.rs b/library/std/src/sys/pal/fullrust/thread.rs
 new file mode 100644
@@ -1798,10 +3896,10 @@ index 00000000..bb57a358
 +}
 diff --git a/library/std/src/sys/pal/fullrust/time.rs b/library/std/src/sys/pal/fullrust/time.rs
 new file mode 100644
-index 00000000..6c0ae184
+index 00000000..8ee3776b
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/time.rs
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,67 @@
 +use super::sysc;
 +use crate::time::Duration;
 +
@@ -1843,6 +3941,18 @@ index 00000000..6c0ae184
 +impl SystemTime {
 +    pub fn now() -> SystemTime {
 +        SystemTime(clock(0)) // CLOCK_REALTIME
++    }
++
++    /// Build a `SystemTime` from a `(seconds, nanoseconds)` pair measured against
++    /// the Unix epoch (e.g. a `statx`/`timespec` field). This target represents
++    /// `SystemTime` as an unsigned offset from `UNIX_EPOCH`, so pre-epoch instants
++    /// (negative seconds) cannot be represented and clamp to the epoch.
++    pub(crate) fn new(secs: i64, nsecs: u32) -> SystemTime {
++        if secs >= 0 {
++            SystemTime(Duration::new(secs as u64, nsecs))
++        } else {
++            SystemTime(Duration::ZERO)
++        }
 +    }
 +
 +    pub fn sub_time(&self, other: &SystemTime) -> Result<Duration, Duration> {
@@ -2138,6 +4248,656 @@ index fbefc62a..518bb2a7 100644
          mod unix;
          pub use self::unix::*;
      } else if #[cfg(windows)] {
+diff --git a/library/std/src/sys/path/unix.rs b/library/std/src/sys/path/unix.rs
+index faa2616a..3a89024a 100644
+--- a/library/std/src/sys/path/unix.rs
++++ b/library/std/src/sys/path/unix.rs
+@@ -62,7 +62,9 @@ pub(crate) fn absolute(path: &Path) -> io::Result<PathBuf> {
+ }
+ 
+ pub(crate) fn is_absolute(path: &Path) -> bool {
+-    if cfg!(any(unix, target_os = "hermit", target_os = "wasi")) {
++    // `fullrust` is not in the `unix` family but uses unix path semantics, so a
++    // leading `/` is absolute (no Windows-style prefix to require).
++    if cfg!(any(unix, target_os = "fullrust", target_os = "hermit", target_os = "wasi")) {
+         path.has_root()
+     } else {
+         path.has_root() && path.prefix().is_some()
+diff --git a/library/std/src/sys/process/fullrust.rs b/library/std/src/sys/process/fullrust.rs
+new file mode 100644
+index 00000000..9f33ede5
+--- /dev/null
++++ b/library/std/src/sys/process/fullrust.rs
+@@ -0,0 +1,615 @@
++//! Process spawning for the fullrust target, on raw Linux syscalls (no libc).
++//!
++//! `spawn` is the classic `fork` + `execve`. All allocation-bearing work — the
++//! `argv`/`envp` pointer arrays, the `PATH` candidate list, the cwd — is done in
++//! the parent *before* forking, so the child touches only async-signal-safe
++//! syscalls (`dup2`, `chdir`, `execve`) and never the allocator or a lock it may
++//! have inherited mid-acquisition. `PATH` resolution happens by `execve`-ing each
++//! candidate in turn, exactly like `execvp`.
++
++use super::env::{CommandEnv, CommandEnvs};
++pub use crate::ffi::OsString as EnvKey;
++use crate::ffi::{CStr, CString, OsStr, OsString};
++use crate::num::NonZero;
++use crate::path::Path;
++use crate::sys::fs::File;
++use crate::sys::pal::sysc;
++use crate::sys::pipe::{self, AnonPipe};
++use crate::{fmt, io};
++
++// AT_FDCWD and the open/poll flags the spawner needs directly.
++const AT_FDCWD: usize = (-100isize) as usize;
++const O_RDONLY: i32 = 0;
++const O_WRONLY: i32 = 1;
++const O_CLOEXEC: i32 = 0o2000000;
++const SIGKILL: usize = 9;
++const WNOHANG: usize = 1;
++
++fn to_cstring(os: &OsStr) -> io::Result<CString> {
++    CString::new(os.as_encoded_bytes())
++        .map_err(|_| io::const_error!(io::ErrorKind::InvalidInput, "nul byte in command component"))
++}
++
++////////////////////////////////////////////////////////////////////////////////
++// Command
++////////////////////////////////////////////////////////////////////////////////
++
++pub struct Command {
++    program: OsString,
++    args: Vec<OsString>,
++    env: CommandEnv,
++    cwd: Option<OsString>,
++    stdin: Option<Stdio>,
++    stdout: Option<Stdio>,
++    stderr: Option<Stdio>,
++}
++
++pub struct StdioPipes {
++    pub stdin: Option<AnonPipe>,
++    pub stdout: Option<AnonPipe>,
++    pub stderr: Option<AnonPipe>,
++}
++
++pub enum Stdio {
++    Inherit,
++    Null,
++    MakePipe,
++    ParentStdout,
++    ParentStderr,
++    InheritFile(File),
++    Fd(AnonPipe),
++}
++
++/// What the child should install on a given stdio slot.
++enum Theirs {
++    /// Leave the inherited fd in place.
++    Inherit,
++    /// `dup2` this owned fd onto the slot; closed in the parent after the fork.
++    Owned(AnonPipe),
++    /// `dup2` this borrowed fd (a `File`/parent stdio) onto the slot.
++    Raw(i32),
++}
++
++impl Command {
++    pub fn new(program: &OsStr) -> Command {
++        Command {
++            program: program.to_owned(),
++            args: vec![program.to_owned()],
++            env: Default::default(),
++            cwd: None,
++            stdin: None,
++            stdout: None,
++            stderr: None,
++        }
++    }
++
++    pub fn arg(&mut self, arg: &OsStr) {
++        self.args.push(arg.to_owned());
++    }
++
++    pub fn env_mut(&mut self) -> &mut CommandEnv {
++        &mut self.env
++    }
++
++    pub fn cwd(&mut self, dir: &OsStr) {
++        self.cwd = Some(dir.to_owned());
++    }
++
++    pub fn stdin(&mut self, stdin: Stdio) {
++        self.stdin = Some(stdin);
++    }
++
++    pub fn stdout(&mut self, stdout: Stdio) {
++        self.stdout = Some(stdout);
++    }
++
++    pub fn stderr(&mut self, stderr: Stdio) {
++        self.stderr = Some(stderr);
++    }
++
++    pub fn get_program(&self) -> &OsStr {
++        &self.program
++    }
++
++    pub fn get_args(&self) -> CommandArgs<'_> {
++        let mut iter = self.args.iter();
++        iter.next();
++        CommandArgs { iter }
++    }
++
++    pub fn get_envs(&self) -> CommandEnvs<'_> {
++        self.env.iter()
++    }
++
++    pub fn get_current_dir(&self) -> Option<&Path> {
++        self.cwd.as_ref().map(|cs| Path::new(cs))
++    }
++
++    pub fn spawn(
++        &mut self,
++        default: Stdio,
++        needs_stdin: bool,
++    ) -> io::Result<(Process, StdioPipes)> {
++        // Resolve each stdio slot to a child-side fd plan plus an optional
++        // parent-side pipe end. Unset slots fall back to `default` (stdin only
++        // inherits when the caller needs it; otherwise it is `/dev/null`).
++        let null = Stdio::Null;
++        let default_stdin = if needs_stdin { &default } else { &null };
++        let stdin = self.stdin.as_ref().unwrap_or(default_stdin);
++        let stdout = self.stdout.as_ref().unwrap_or(&default);
++        let stderr = self.stderr.as_ref().unwrap_or(&default);
++        let (child_stdin, our_stdin) = to_child(stdin, true)?;
++        let (child_stdout, our_stdout) = to_child(stdout, false)?;
++        let (child_stderr, our_stderr) = to_child(stderr, false)?;
++
++        // Build everything the child will need *before* forking: argv, envp,
++        // the cwd, and the list of executables to try.
++        let argv: Vec<CString> =
++            self.args.iter().map(|a| to_cstring(a)).collect::<io::Result<_>>()?;
++        let mut argv_ptrs: Vec<*const i8> = argv.iter().map(|c| c.as_ptr()).collect();
++        argv_ptrs.push(crate::ptr::null());
++
++        let env_map = self.env.capture();
++        let mut env_cstrings: Vec<CString> = Vec::with_capacity(env_map.len());
++        for (k, v) in &env_map {
++            let mut buf = Vec::with_capacity(k.len() + v.len() + 1);
++            buf.extend_from_slice(k.as_encoded_bytes());
++            buf.push(b'=');
++            buf.extend_from_slice(v.as_encoded_bytes());
++            env_cstrings.push(CString::new(buf).map_err(|_| {
++                io::const_error!(io::ErrorKind::InvalidInput, "nul byte in environment")
++            })?);
++        }
++        let mut envp_ptrs: Vec<*const i8> = env_cstrings.iter().map(|c| c.as_ptr()).collect();
++        envp_ptrs.push(crate::ptr::null());
++
++        let candidates = resolve_candidates(&self.program, &env_map)?;
++        let cwd = self.cwd.as_ref().map(|c| to_cstring(c)).transpose()?;
++
++        // SAFETY: fork(2). In the child we only call async-signal-safe syscalls.
++        let pid = sysc::ret(unsafe { sysc::syscall1(sysc::FORK, 0) })
++            .map_err(io::Error::from_raw_os_error)?;
++        if pid == 0 {
++            // CHILD: no allocation, no locks — only syscalls on prebuilt data.
++            unsafe {
++                child_exec(
++                    &child_stdin,
++                    &child_stdout,
++                    &child_stderr,
++                    cwd.as_deref(),
++                    &candidates,
++                    argv_ptrs.as_ptr(),
++                    envp_ptrs.as_ptr(),
++                )
++            }
++        }
++
++        // PARENT: drop the child-side owned ends so only the child holds them.
++        drop((child_stdin, child_stdout, child_stderr));
++        Ok((
++            Process { pid: pid as i32, status: None },
++            StdioPipes { stdin: our_stdin, stdout: our_stdout, stderr: our_stderr },
++        ))
++    }
++}
++
++/// Resolve `program` into the list of paths the child should try to `execve`.
++/// A program containing `/` is used verbatim; otherwise each `PATH` entry is
++/// tried in order (an empty entry meaning the current directory).
++fn resolve_candidates(
++    program: &OsStr,
++    env_map: &crate::collections::BTreeMap<EnvKey, OsString>,
++) -> io::Result<Vec<CString>> {
++    let prog = program.as_encoded_bytes();
++    if prog.contains(&b'/') {
++        return Ok(vec![to_cstring(program)?]);
++    }
++    let path = env_map
++        .get(OsStr::new("PATH"))
++        .map(|p| p.as_encoded_bytes().to_vec())
++        .unwrap_or_else(|| b"/usr/local/bin:/usr/bin:/bin".to_vec());
++
++    let mut out = Vec::new();
++    for dir in path.split(|&b| b == b':') {
++        let mut full = Vec::with_capacity(dir.len() + 1 + prog.len());
++        if dir.is_empty() {
++            full.extend_from_slice(prog);
++        } else {
++            full.extend_from_slice(dir);
++            full.push(b'/');
++            full.extend_from_slice(prog);
++        }
++        if let Ok(c) = CString::new(full) {
++            out.push(c);
++        }
++    }
++    if out.is_empty() {
++        return Err(io::const_error!(io::ErrorKind::NotFound, "no candidate paths for program"));
++    }
++    Ok(out)
++}
++
++/// Lower a `Stdio` into the child's fd plan and the parent's pipe end (if any).
++fn to_child(stdio: &Stdio, readable: bool) -> io::Result<(Theirs, Option<AnonPipe>)> {
++    match stdio {
++        Stdio::Inherit => Ok((Theirs::Inherit, None)),
++        Stdio::Null => Ok((Theirs::Owned(open_devnull(readable)?), None)),
++        Stdio::MakePipe => {
++            let (read, write) = pipe::pipe()?;
++            if readable {
++                // child reads its stdin; parent keeps the write end
++                Ok((Theirs::Owned(read), Some(write)))
++            } else {
++                // child writes; parent reads
++                Ok((Theirs::Owned(write), Some(read)))
++            }
++        }
++        Stdio::ParentStdout => Ok((Theirs::Raw(1), None)),
++        Stdio::ParentStderr => Ok((Theirs::Raw(2), None)),
++        Stdio::InheritFile(f) => Ok((Theirs::Raw(f.as_raw_fd()), None)),
++        Stdio::Fd(p) => Ok((Theirs::Raw(p.as_raw_fd()), None)),
++    }
++}
++
++fn open_devnull(readable: bool) -> io::Result<AnonPipe> {
++    let flags = (if readable { O_RDONLY } else { O_WRONLY }) | O_CLOEXEC;
++    let fd = sysc::ret(unsafe {
++        sysc::syscall4(sysc::OPENAT, AT_FDCWD, c"/dev/null".as_ptr() as usize, flags as usize, 0)
++    })
++    .map_err(io::Error::from_raw_os_error)?;
++    Ok(AnonPipe::from_fd(fd as i32))
++}
++
++/// The post-fork child: install stdio, change directory, and `execve` the first
++/// candidate that works. Never returns to Rust.
++///
++/// # Safety
++/// Must run only in the forked child and call nothing but the syscalls below.
++unsafe fn child_exec(
++    stdin: &Theirs,
++    stdout: &Theirs,
++    stderr: &Theirs,
++    cwd: Option<&CStr>,
++    candidates: &[CString],
++    argv: *const *const i8,
++    envp: *const *const i8,
++) -> ! {
++    unsafe {
++        install(stdin, 0);
++        install(stdout, 1);
++        install(stderr, 2);
++        if let Some(cwd) = cwd {
++            sysc::syscall1(sysc::CHDIR, cwd.as_ptr() as usize);
++        }
++        for cand in candidates {
++            sysc::syscall3(
++                sysc::EXECVE,
++                cand.as_ptr() as usize,
++                argv as usize,
++                envp as usize,
++            );
++            // If execve returned, this candidate failed; try the next one.
++        }
++        // Nothing executed: mirror the shell's "command not found" code.
++        sysc::syscall1(sysc::EXIT_GROUP, 127);
++        // exit_group never returns.
++        core::hint::unreachable_unchecked()
++    }
++}
++
++/// `dup2` a `Theirs` fd onto `slot` (clearing close-on-exec so it survives exec).
++unsafe fn install(theirs: &Theirs, slot: usize) {
++    let fd = match theirs {
++        Theirs::Inherit => return,
++        Theirs::Owned(p) => p.as_raw_fd(),
++        Theirs::Raw(fd) => *fd,
++    };
++    unsafe {
++        sysc::syscall2(sysc::DUP2, fd as usize, slot);
++    }
++}
++
++pub fn output(cmd: &mut Command) -> io::Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
++    let (mut process, mut pipes) = cmd.spawn(Stdio::MakePipe, false)?;
++    drop(pipes.stdin.take());
++    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
++    match (pipes.stdout.take(), pipes.stderr.take()) {
++        (None, None) => {}
++        (Some(out), None) => {
++            out.read_to_end(&mut stdout)?;
++        }
++        (None, Some(err)) => {
++            err.read_to_end(&mut stderr)?;
++        }
++        (Some(out), Some(err)) => {
++            pipe::read2(out, &mut stdout, err, &mut stderr)?;
++        }
++    }
++    let status = process.wait()?;
++    Ok((status, stdout, stderr))
++}
++
++impl From<AnonPipe> for Stdio {
++    fn from(pipe: AnonPipe) -> Stdio {
++        Stdio::Fd(pipe)
++    }
++}
++
++impl From<io::Stdout> for Stdio {
++    fn from(_: io::Stdout) -> Stdio {
++        Stdio::ParentStdout
++    }
++}
++
++impl From<io::Stderr> for Stdio {
++    fn from(_: io::Stderr) -> Stdio {
++        Stdio::ParentStderr
++    }
++}
++
++impl From<File> for Stdio {
++    fn from(file: File) -> Stdio {
++        Stdio::InheritFile(file)
++    }
++}
++
++impl fmt::Debug for Stdio {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Stdio::Inherit => f.write_str("Inherit"),
++            Stdio::Null => f.write_str("Null"),
++            Stdio::MakePipe => f.write_str("MakePipe"),
++            Stdio::ParentStdout => f.write_str("ParentStdout"),
++            Stdio::ParentStderr => f.write_str("ParentStderr"),
++            Stdio::InheritFile(file) => f.debug_tuple("InheritFile").field(file).finish(),
++            Stdio::Fd(p) => f.debug_tuple("Fd").field(p).finish(),
++        }
++    }
++}
++
++impl fmt::Debug for Command {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        if f.alternate() {
++            let mut debug_command = f.debug_struct("Command");
++            debug_command.field("program", &self.program).field("args", &self.args);
++            if !self.env.is_unchanged() {
++                debug_command.field("env", &self.env);
++            }
++            if self.cwd.is_some() {
++                debug_command.field("cwd", &self.cwd);
++            }
++            if self.stdin.is_some() {
++                debug_command.field("stdin", &self.stdin);
++            }
++            if self.stdout.is_some() {
++                debug_command.field("stdout", &self.stdout);
++            }
++            if self.stderr.is_some() {
++                debug_command.field("stderr", &self.stderr);
++            }
++            debug_command.finish()
++        } else {
++            if let Some(ref cwd) = self.cwd {
++                write!(f, "cd {cwd:?} && ")?;
++            }
++            if self.env.does_clear() {
++                write!(f, "env -i ")?;
++            } else {
++                let mut any_removed = false;
++                for (key, value_opt) in self.get_envs() {
++                    if value_opt.is_none() {
++                        if !any_removed {
++                            write!(f, "env ")?;
++                            any_removed = true;
++                        }
++                        write!(f, "-u {} ", key.to_string_lossy())?;
++                    }
++                }
++            }
++            for (key, value_opt) in self.get_envs() {
++                if let Some(value) = value_opt {
++                    write!(f, "{}={value:?} ", key.to_string_lossy())?;
++                }
++            }
++            if self.program != self.args[0] {
++                write!(f, "[{:?}] ", self.program)?;
++            }
++            write!(f, "{:?}", self.args[0])?;
++            for arg in &self.args[1..] {
++                write!(f, " {:?}", arg)?;
++            }
++            Ok(())
++        }
++    }
++}
++
++////////////////////////////////////////////////////////////////////////////////
++// Process / exit status
++////////////////////////////////////////////////////////////////////////////////
++
++pub struct Process {
++    pid: i32,
++    /// Cached once the child has been reaped, so repeated `wait`s are cheap and
++    /// the pid is never reused out from under us.
++    status: Option<ExitStatus>,
++}
++
++impl Process {
++    pub fn id(&self) -> u32 {
++        self.pid as u32
++    }
++
++    pub fn kill(&mut self) -> io::Result<()> {
++        if self.status.is_some() {
++            return Err(io::const_error!(
++                io::ErrorKind::InvalidInput,
++                "invalid argument: can't kill an exited process",
++            ));
++        }
++        sysc::ret(unsafe { sysc::syscall2(sysc::KILL, self.pid as usize, SIGKILL) })
++            .map(drop)
++            .map_err(io::Error::from_raw_os_error)
++    }
++
++    pub fn wait(&mut self) -> io::Result<ExitStatus> {
++        if let Some(s) = self.status {
++            return Ok(s);
++        }
++        let mut status: i32 = 0;
++        loop {
++            match sysc::ret(unsafe {
++                sysc::syscall4(
++                    sysc::WAIT4,
++                    self.pid as usize,
++                    &mut status as *mut i32 as usize,
++                    0,
++                    0,
++                )
++            }) {
++                Ok(_) => break,
++                Err(4) => continue, // EINTR
++                Err(e) => return Err(io::Error::from_raw_os_error(e)),
++            }
++        }
++        let s = ExitStatus(status);
++        self.status = Some(s);
++        Ok(s)
++    }
++
++    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
++        if let Some(s) = self.status {
++            return Ok(Some(s));
++        }
++        let mut status: i32 = 0;
++        match sysc::ret(unsafe {
++            sysc::syscall4(
++                sysc::WAIT4,
++                self.pid as usize,
++                &mut status as *mut i32 as usize,
++                WNOHANG,
++                0,
++            )
++        }) {
++            Ok(0) => Ok(None), // still running
++            Ok(_) => {
++                let s = ExitStatus(status);
++                self.status = Some(s);
++                Ok(Some(s))
++            }
++            Err(4) => Ok(None), // EINTR — treat as not-yet
++            Err(e) => Err(io::Error::from_raw_os_error(e)),
++        }
++    }
++}
++
++/// A raw Linux wait status (the `int` filled in by `wait4`).
++#[derive(PartialEq, Eq, Clone, Copy, Default)]
++pub struct ExitStatus(i32);
++
++impl ExitStatus {
++    pub fn exit_ok(&self) -> Result<(), ExitStatusError> {
++        // A wait status of 0 is the only success.
++        match NonZero::<i32>::try_from(self.0) {
++            Ok(failure) => Err(ExitStatusError(failure)),
++            Err(_) => Ok(()),
++        }
++    }
++
++    pub fn code(&self) -> Option<i32> {
++        // WIFEXITED: low 7 bits zero. Exit code is bits 8..16.
++        (self.0 & 0x7f == 0).then(|| (self.0 >> 8) & 0xff)
++    }
++
++    fn signal(&self) -> Option<i32> {
++        let term = self.0 & 0x7f;
++        (term != 0 && term != 0x7f).then_some(term)
++    }
++
++    fn core_dumped(&self) -> bool {
++        self.0 & 0x80 != 0
++    }
++}
++
++impl fmt::Display for ExitStatus {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        if let Some(code) = self.code() {
++            write!(f, "exit status: {code}")
++        } else if let Some(signal) = self.signal() {
++            if self.core_dumped() {
++                write!(f, "signal: {signal} (core dumped)")
++            } else {
++                write!(f, "signal: {signal}")
++            }
++        } else {
++            write!(f, "unrecognised wait status: {}", self.0)
++        }
++    }
++}
++
++impl fmt::Debug for ExitStatus {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_tuple("unix_wait_status").field(&self.0).finish()
++    }
++}
++
++#[derive(PartialEq, Eq, Clone, Copy, Debug)]
++pub struct ExitStatusError(NonZero<i32>);
++
++impl Into<ExitStatus> for ExitStatusError {
++    fn into(self) -> ExitStatus {
++        ExitStatus(self.0.into())
++    }
++}
++
++impl ExitStatusError {
++    pub fn code(self) -> Option<NonZero<i32>> {
++        ExitStatus(self.0.into()).code().map(|st| NonZero::new(st).unwrap())
++    }
++}
++
++#[derive(PartialEq, Eq, Clone, Copy, Debug)]
++pub struct ExitCode(u8);
++
++impl ExitCode {
++    pub const SUCCESS: ExitCode = ExitCode(0);
++    pub const FAILURE: ExitCode = ExitCode(1);
++
++    pub fn as_i32(&self) -> i32 {
++        self.0 as i32
++    }
++}
++
++impl From<u8> for ExitCode {
++    fn from(code: u8) -> Self {
++        Self(code)
++    }
++}
++
++pub struct CommandArgs<'a> {
++    iter: crate::slice::Iter<'a, OsString>,
++}
++
++impl<'a> Iterator for CommandArgs<'a> {
++    type Item = &'a OsStr;
++    fn next(&mut self) -> Option<&'a OsStr> {
++        self.iter.next().map(|os| &**os)
++    }
++    fn size_hint(&self) -> (usize, Option<usize>) {
++        self.iter.size_hint()
++    }
++}
++
++impl<'a> ExactSizeIterator for CommandArgs<'a> {
++    fn len(&self) -> usize {
++        self.iter.len()
++    }
++    fn is_empty(&self) -> bool {
++        self.iter.is_empty()
++    }
++}
++
++impl<'a> fmt::Debug for CommandArgs<'a> {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_list().entries(self.iter.clone()).finish()
++    }
++}
+diff --git a/library/std/src/sys/process/mod.rs b/library/std/src/sys/process/mod.rs
+index 91c7005a..ea9868bc 100644
+--- a/library/std/src/sys/process/mod.rs
++++ b/library/std/src/sys/process/mod.rs
+@@ -8,6 +8,9 @@
+     } else if #[cfg(target_os = "uefi")] {
+         mod uefi;
+         use uefi as imp;
++    } else if #[cfg(target_os = "fullrust")] {
++        mod fullrust;
++        use fullrust as imp;
+     } else {
+         mod unsupported;
+         use unsupported as imp;
 diff --git a/library/std/src/sys/random/fullrust.rs b/library/std/src/sys/random/fullrust.rs
 new file mode 100644
 index 00000000..8a52e503
