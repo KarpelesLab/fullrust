@@ -380,10 +380,10 @@ index d81ff875..4b96582c 100644
          pub use windows::*;
 diff --git a/library/std/src/sys/fs/fullrust.rs b/library/std/src/sys/fs/fullrust.rs
 new file mode 100644
-index 00000000..1729ae56
+index 00000000..62a39b15
 --- /dev/null
 +++ b/library/std/src/sys/fs/fullrust.rs
-@@ -0,0 +1,777 @@
+@@ -0,0 +1,782 @@
 +//! Filesystem for the fullrust target, on raw Linux syscalls (no libc).
 +//!
 +//! `File` is a thin owner of a raw kernel fd. Metadata comes from `statx(2)`
@@ -458,6 +458,9 @@ index 00000000..1729ae56
 +
 +// utimensat(2) sentinel nanoseconds.
 +const UTIME_OMIT: i64 = (1 << 30) - 2;
++
++// Maximum iovec count the kernel accepts in one readv/writev (UIO_MAXIOV).
++const IOV_MAX: usize = 1024;
 +
 +#[inline]
 +fn cvt(r: usize) -> io::Result<usize> {
@@ -547,15 +550,17 @@ index 00000000..1729ae56
 +    }
 +
 +    pub fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
-+        match bufs.iter_mut().find(|b| !b.is_empty()) {
-+            Some(b) => self.read(b),
-+            None => Ok(0),
-+        }
++        // `IoSliceMut` is `repr(transparent)` over `iovec`, so the slice is a
++        // ready-made iovec array; cap at IOV_MAX to avoid EINVAL.
++        let n = bufs.len().min(IOV_MAX);
++        cvt(unsafe {
++            sysc::syscall3(sysc::READV, self.fd as usize, bufs.as_mut_ptr() as usize, n)
++        })
 +    }
 +
 +    #[inline]
 +    pub fn is_read_vectored(&self) -> bool {
-+        false
++        true
 +    }
 +
 +    pub fn read_buf(&self, mut cursor: BorrowedCursor<'_>) -> io::Result<()> {
@@ -576,15 +581,15 @@ index 00000000..1729ae56
 +    }
 +
 +    pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-+        match bufs.iter().find(|b| !b.is_empty()) {
-+            Some(b) => self.write(b),
-+            None => Ok(0),
-+        }
++        let n = bufs.len().min(IOV_MAX);
++        cvt(unsafe {
++            sysc::syscall3(sysc::WRITEV, self.fd as usize, bufs.as_ptr() as usize, n)
++        })
 +    }
 +
 +    #[inline]
 +    pub fn is_write_vectored(&self) -> bool {
-+        false
++        true
 +    }
 +
 +    #[inline]
@@ -1175,12 +1180,115 @@ index d55e2807..6430cb12 100644
      } else {
          mod unsupported;
          use unsupported as imp;
+diff --git a/library/std/src/sys/io/io_slice/iovec.rs b/library/std/src/sys/io/io_slice/iovec.rs
+index df563589..b094f9ef 100644
+--- a/library/std/src/sys/io/io_slice/iovec.rs
++++ b/library/std/src/sys/io/io_slice/iovec.rs
+@@ -3,6 +3,16 @@
+ #[cfg(any(target_family = "unix", target_os = "trusty"))]
+ use libc::iovec;
+ 
++// The fullrust target has no libc; define the kernel `struct iovec` directly.
++#[cfg(target_os = "fullrust")]
++#[repr(C)]
++#[derive(Copy, Clone)]
++#[allow(non_camel_case_types)]
++struct iovec {
++    iov_base: *mut crate::ffi::c_void,
++    iov_len: usize,
++}
++
+ use crate::ffi::c_void;
+ use crate::marker::PhantomData;
+ use crate::slice;
+diff --git a/library/std/src/sys/io/is_terminal/fullrust.rs b/library/std/src/sys/io/is_terminal/fullrust.rs
+new file mode 100644
+index 00000000..c5643d3f
+--- /dev/null
++++ b/library/std/src/sys/io/is_terminal/fullrust.rs
+@@ -0,0 +1,53 @@
++//! `is_terminal` for the fullrust target.
++//!
++//! There is no libc `isatty`, so we ask the kernel directly: `ioctl(fd, TCGETS)`
++//! succeeds only on a tty (otherwise `ENOTTY`). The std types that implement
++//! `IsTerminal` are a fixed set, and on this target they aren't reachable through
++//! the unix `AsFd` machinery, so a small sealed trait maps each to its fd.
++
++use crate::fs::File;
++use crate::io::{Stderr, StderrLock, Stdin, StdinLock, Stdout, StdoutLock};
++use crate::sys::pal::sysc;
++use crate::sys_common::AsInner;
++
++// `ioctl` request that fetches terminal attributes; fails with ENOTTY otherwise.
++const TCGETS: usize = 0x5401;
++
++fn isatty(fd: i32) -> bool {
++    // `struct termios` (kernel `ktermios`) is well under 64 bytes; the ioctl only
++    // writes into the buffer on success, and we only care whether it succeeds.
++    let mut termios = [0u8; 64];
++    sysc::ret(unsafe {
++        sysc::syscall3(sysc::IOCTL, fd as usize, TCGETS, termios.as_mut_ptr() as usize)
++    })
++    .is_ok()
++}
++
++/// The fd backing each `IsTerminal` type on this target.
++pub trait TerminalFd {
++    fn terminal_fd(&self) -> i32;
++}
++
++macro_rules! std_stream_fd {
++    ($($t:ty => $fd:expr),* $(,)?) => {$(
++        impl TerminalFd for $t {
++            fn terminal_fd(&self) -> i32 { $fd }
++        }
++    )*};
++}
++
++std_stream_fd! {
++    Stdin => 0, StdinLock<'_> => 0,
++    Stdout => 1, StdoutLock<'_> => 1,
++    Stderr => 2, StderrLock<'_> => 2,
++}
++
++impl TerminalFd for File {
++    fn terminal_fd(&self) -> i32 {
++        self.as_inner().as_raw_fd()
++    }
++}
++
++pub fn is_terminal<T: TerminalFd>(t: &T) -> bool {
++    isatty(t.terminal_fd())
++}
+diff --git a/library/std/src/sys/io/mod.rs b/library/std/src/sys/io/mod.rs
+index 4d0365d4..23e41308 100644
+--- a/library/std/src/sys/io/mod.rs
++++ b/library/std/src/sys/io/mod.rs
+@@ -2,7 +2,7 @@
+ 
+ mod io_slice {
+     cfg_if::cfg_if! {
+-        if #[cfg(any(target_family = "unix", target_os = "hermit", target_os = "solid_asp3", target_os = "trusty"))] {
++        if #[cfg(any(target_family = "unix", target_os = "hermit", target_os = "solid_asp3", target_os = "trusty", target_os = "fullrust"))] {
+             mod iovec;
+             pub use iovec::*;
+         } else if #[cfg(target_os = "windows")] {
+@@ -29,6 +29,9 @@ mod is_terminal {
+         } else if #[cfg(target_os = "hermit")] {
+             mod hermit;
+             pub use hermit::*;
++        } else if #[cfg(target_os = "fullrust")] {
++            mod fullrust;
++            pub use fullrust::*;
+         } else {
+             mod unsupported;
+             pub use unsupported::*;
 diff --git a/library/std/src/sys/net/connection/fullrust.rs b/library/std/src/sys/net/connection/fullrust.rs
 new file mode 100644
-index 00000000..81cc1ac3
+index 00000000..847fe7b5
 --- /dev/null
 +++ b/library/std/src/sys/net/connection/fullrust.rs
-@@ -0,0 +1,937 @@
+@@ -0,0 +1,941 @@
 +//! TCP/UDP sockets and DNS for the fullrust target, on raw Linux syscalls.
 +//!
 +//! A single `Socket` (an owned fd) backs `TcpStream`, `TcpListener`, and
@@ -1236,6 +1344,8 @@ index 00000000..81cc1ac3
 +const F_DUPFD_CLOEXEC: usize = 1030;
 +const POLLOUT: i16 = 0x4;
 +const EINPROGRESS: i32 = 115;
++// Maximum iovec count the kernel accepts in one readv/writev (UIO_MAXIOV).
++const IOV_MAX: usize = 1024;
 +
 +#[inline]
 +fn cvt(r: usize) -> io::Result<usize> {
@@ -1447,6 +1557,22 @@ index 00000000..81cc1ac3
 +        self.recv_with_flags(buf, 0)
 +    }
 +
++    fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
++        // `IoSliceMut` is `repr(transparent)` over `iovec`; cap at IOV_MAX.
++        let n = bufs.len().min(IOV_MAX);
++        cvt(unsafe {
++            sysc::syscall3(sysc::READV, self.fd as usize, bufs.as_mut_ptr() as usize, n)
++        })
++    }
++
++    fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
++        // Safe without MSG_NOSIGNAL because SIGPIPE is ignored process-wide.
++        let n = bufs.len().min(IOV_MAX);
++        cvt(unsafe {
++            sysc::syscall3(sysc::WRITEV, self.fd as usize, bufs.as_ptr() as usize, n)
++        })
++    }
++
 +    fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
 +        self.recv_with_flags(buf, MSG_PEEK)
 +    }
@@ -1589,14 +1715,6 @@ index 00000000..81cc1ac3
 +    }
 +}
 +
-+// `read_vectored`/`write_vectored` fall back to a single non-empty buffer.
-+fn first_mut<'a>(bufs: &'a mut [IoSliceMut<'_>]) -> Option<&'a mut [u8]> {
-+    bufs.iter_mut().find(|b| !b.is_empty()).map(|b| &mut **b)
-+}
-+fn first_ref<'a>(bufs: &'a [IoSlice<'_>]) -> Option<&'a [u8]> {
-+    bufs.iter().find(|b| !b.is_empty()).map(|b| &**b)
-+}
-+
 +// ---------------------------------------------------------------------------
 +// TcpStream
 +// ---------------------------------------------------------------------------
@@ -1641,25 +1759,19 @@ index 00000000..81cc1ac3
 +        self.inner.read_buf(cursor)
 +    }
 +    pub fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
-+        match first_mut(bufs) {
-+            Some(b) => self.inner.read(b),
-+            None => Ok(0),
-+        }
++        self.inner.read_vectored(bufs)
 +    }
 +    pub fn is_read_vectored(&self) -> bool {
-+        false
++        true
 +    }
 +    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
 +        self.inner.write(buf)
 +    }
 +    pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-+        match first_ref(bufs) {
-+            Some(b) => self.inner.write(b),
-+            None => Ok(0),
-+        }
++        self.inner.write_vectored(bufs)
 +    }
 +    pub fn is_write_vectored(&self) -> bool {
-+        false
++        true
 +    }
 +    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
 +        self.inner.sockname(sysc::GETPEERNAME)
@@ -2136,10 +2248,10 @@ index 646679a1..411f126d 100644
              mod unsupported;
 diff --git a/library/std/src/sys/pal/fullrust/common.rs b/library/std/src/sys/pal/fullrust/common.rs
 new file mode 100644
-index 00000000..5f04b788
+index 00000000..d7370991
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/common.rs
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,78 @@
 +use crate::io as std_io;
 +
 +// Called once by `rt::init` via `sys::init`, with the real argc/argv that the
@@ -2155,6 +2267,23 @@ index 00000000..5f04b788
 +    if !argv.is_null() && argc >= 0 {
 +        let envp = unsafe { argv.add(argc as usize + 1) } as *const *const core::ffi::c_char;
 +        unsafe { crate::sys::env::init(envp) };
++    }
++    // Ignore SIGPIPE, as std does on unix: a write to a closed pipe/socket must
++    // surface as `EPIPE`, never terminate the process. Without this (and with no
++    // signal handler installed) the kernel's default action would kill us.
++    unsafe { ignore_sigpipe() };
++}
++
++/// `rt_sigaction(SIGPIPE, SIG_IGN)` via the raw kernel ABI.
++unsafe fn ignore_sigpipe() {
++    use super::sysc;
++    const SIGPIPE: usize = 13;
++    const SIG_IGN: usize = 1;
++    // struct kernel_sigaction { sa_handler; sa_flags; sa_restorer; sa_mask[1]; }
++    let act: [usize; 4] = [SIG_IGN, 0, 0, 0];
++    unsafe {
++        // Final arg is the sigset size in bytes (8 for the 64-bit kernel mask).
++        sysc::syscall4(sysc::RT_SIGACTION, SIGPIPE, act.as_ptr() as usize, 0, 8);
 +    }
 +}
 +
@@ -3092,10 +3221,10 @@ index 00000000..887454d8
 +}
 diff --git a/library/std/src/sys/pal/fullrust/mod.rs b/library/std/src/sys/pal/fullrust/mod.rs
 new file mode 100644
-index 00000000..07744bd9
+index 00000000..171f524e
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/mod.rs
-@@ -0,0 +1,219 @@
+@@ -0,0 +1,224 @@
 +//! The `fullrust` platform abstraction layer: libc-free Linux on raw syscalls.
 +//!
 +//! This pal provides what a hosted std gets from libc + crt0: the process entry
@@ -3189,6 +3318,11 @@ index 00000000..07744bd9
 +    pub const CLOSE: usize = 3;
 +    pub const POLL: usize = 7;
 +    pub const LSEEK: usize = 8;
++    pub const IOCTL: usize = 16;
++    pub const READV: usize = 19;
++    pub const WRITEV: usize = 20;
++    pub const RT_SIGACTION: usize = 13;
++    pub const PRCTL: usize = 157;
 +    pub const DUP2: usize = 33;
 +    pub const FORK: usize = 57;
 +    pub const EXECVE: usize = 59;
@@ -3317,14 +3451,13 @@ index 00000000..07744bd9
 +}
 diff --git a/library/std/src/sys/pal/fullrust/os.rs b/library/std/src/sys/pal/fullrust/os.rs
 new file mode 100644
-index 00000000..f210c9c3
+index 00000000..5ecc9e6b
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/os.rs
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,220 @@
 +use super::sysc;
 +use crate::error::Error as StdError;
 +use crate::ffi::{CString, OsStr, OsString};
-+use crate::marker::PhantomData;
 +use crate::path::{self, PathBuf};
 +use crate::{fmt, io};
 +
@@ -3332,8 +3465,72 @@ index 00000000..f210c9c3
 +    0
 +}
 +
++/// A human-readable message for a Linux errno. Without libc there is no
++/// `strerror`, so we carry a table of the common values; anything else falls
++/// back to the numeric form (matching `strerror`'s "Unknown error" spirit).
 +pub fn error_string(errno: i32) -> String {
-+    format!("os error {errno}")
++    let msg = match errno {
++        1 => "Operation not permitted",
++        2 => "No such file or directory",
++        3 => "No such process",
++        4 => "Interrupted system call",
++        5 => "Input/output error",
++        6 => "No such device or address",
++        7 => "Argument list too long",
++        8 => "Exec format error",
++        9 => "Bad file descriptor",
++        10 => "No child processes",
++        11 => "Resource temporarily unavailable",
++        12 => "Cannot allocate memory",
++        13 => "Permission denied",
++        14 => "Bad address",
++        16 => "Device or resource busy",
++        17 => "File exists",
++        18 => "Invalid cross-device link",
++        19 => "No such device",
++        20 => "Not a directory",
++        21 => "Is a directory",
++        22 => "Invalid argument",
++        23 => "Too many open files in system",
++        24 => "Too many open files",
++        25 => "Inappropriate ioctl for device",
++        27 => "File too large",
++        28 => "No space left on device",
++        29 => "Illegal seek",
++        30 => "Read-only file system",
++        31 => "Too many links",
++        32 => "Broken pipe",
++        34 => "Numerical result out of range",
++        36 => "File name too long",
++        38 => "Function not implemented",
++        39 => "Directory not empty",
++        40 => "Too many levels of symbolic links",
++        61 => "No data available",
++        62 => "Timer expired",
++        88 => "Socket operation on non-socket",
++        90 => "Message too long",
++        91 => "Protocol wrong type for socket",
++        92 => "Protocol not available",
++        93 => "Protocol not supported",
++        95 => "Operation not supported",
++        97 => "Address family not supported by protocol",
++        98 => "Address already in use",
++        99 => "Cannot assign requested address",
++        100 => "Network is down",
++        101 => "Network is unreachable",
++        103 => "Software caused connection abort",
++        104 => "Connection reset by peer",
++        105 => "No buffer space available",
++        106 => "Transport endpoint is already connected",
++        107 => "Transport endpoint is not connected",
++        110 => "Connection timed out",
++        111 => "Connection refused",
++        113 => "No route to host",
++        114 => "Operation already in progress",
++        115 => "Operation now in progress",
++        _ => return format!("Unknown error {errno}"),
++    };
++    msg.to_string()
 +}
 +
 +/// Build a NUL-terminated C string from a path's raw bytes. On the fullrust
@@ -3370,40 +3567,73 @@ index 00000000..f210c9c3
 +    sysc::ret(r).map(|_| ()).map_err(io::Error::from_raw_os_error)
 +}
 +
-+pub struct SplitPaths<'a>(!, PhantomData<&'a ()>);
++/// The `PATH`-style separator on this (Unix-semantics) target.
++const PATH_SEPARATOR: u8 = b':';
 +
-+pub fn split_paths(_unparsed: &OsStr) -> SplitPaths<'_> {
-+    panic!("unsupported")
++pub struct SplitPaths<'a> {
++    iter: crate::iter::Map<
++        crate::slice::Split<'a, u8, fn(&u8) -> bool>,
++        fn(&[u8]) -> PathBuf,
++    >,
++}
++
++pub fn split_paths(unparsed: &OsStr) -> SplitPaths<'_> {
++    fn bytes_to_path(b: &[u8]) -> PathBuf {
++        PathBuf::from(os_string_from_bytes(b))
++    }
++    fn is_separator(b: &u8) -> bool {
++        *b == PATH_SEPARATOR
++    }
++    SplitPaths {
++        iter: unparsed
++            .as_encoded_bytes()
++            .split(is_separator as fn(&u8) -> bool)
++            .map(bytes_to_path as fn(&[u8]) -> PathBuf),
++    }
 +}
 +
 +impl<'a> Iterator for SplitPaths<'a> {
 +    type Item = PathBuf;
 +    fn next(&mut self) -> Option<PathBuf> {
-+        self.0
++        self.iter.next()
++    }
++    fn size_hint(&self) -> (usize, Option<usize>) {
++        self.iter.size_hint()
 +    }
 +}
 +
 +#[derive(Debug)]
 +pub struct JoinPathsError;
 +
-+pub fn join_paths<I, T>(_paths: I) -> Result<OsString, JoinPathsError>
++pub fn join_paths<I, T>(paths: I) -> Result<OsString, JoinPathsError>
 +where
 +    I: Iterator<Item = T>,
 +    T: AsRef<OsStr>,
 +{
-+    Err(JoinPathsError)
++    let mut joined = Vec::new();
++    for (i, path) in paths.enumerate() {
++        let path = path.as_ref().as_encoded_bytes();
++        if i > 0 {
++            joined.push(PATH_SEPARATOR);
++        }
++        if path.contains(&PATH_SEPARATOR) {
++            return Err(JoinPathsError);
++        }
++        joined.extend_from_slice(path);
++    }
++    Ok(os_string_from_bytes(&joined))
 +}
 +
 +impl fmt::Display for JoinPathsError {
 +    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-+        "not supported on this platform yet".fmt(f)
++        "path segment contains separator `:`".fmt(f)
 +    }
 +}
 +
 +impl StdError for JoinPathsError {
 +    #[allow(deprecated)]
 +    fn description(&self) -> &str {
-+        "not supported on this platform yet"
++        "failed to join paths"
 +    }
 +}
 +
@@ -3430,7 +3660,8 @@ index 00000000..f210c9c3
 +}
 +
 +pub fn home_dir() -> Option<PathBuf> {
-+    None
++    // No libc/NSS to fall back on, so `$HOME` is authoritative here.
++    crate::env::var_os("HOME").filter(|s| !s.is_empty()).map(PathBuf::from)
 +}
 +
 +pub fn exit(code: i32) -> ! {
@@ -3446,10 +3677,10 @@ index 00000000..f210c9c3
 +}
 diff --git a/library/std/src/sys/pal/fullrust/pipe.rs b/library/std/src/sys/pal/fullrust/pipe.rs
 new file mode 100644
-index 00000000..919386c6
+index 00000000..818bcb39
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/pipe.rs
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,186 @@
 +//! Anonymous pipes for the fullrust target, on raw Linux syscalls.
 +//!
 +//! `AnonPipe` owns one end of a kernel pipe (an fd) and closes it on drop. Pipes
@@ -3470,6 +3701,8 @@ index 00000000..919386c6
 +const F_DUPFD_CLOEXEC: usize = 1030;
 +// poll(2) events.
 +const POLLIN: i16 = 0x1;
++// Maximum iovec count the kernel accepts in one readv/writev (UIO_MAXIOV).
++const IOV_MAX: usize = 1024;
 +
 +#[inline]
 +fn cvt(r: usize) -> io::Result<usize> {
@@ -3512,14 +3745,15 @@ index 00000000..919386c6
 +    }
 +
 +    pub fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
-+        match bufs.iter_mut().find(|b| !b.is_empty()) {
-+            Some(b) => self.read(b),
-+            None => Ok(0),
-+        }
++        // `IoSliceMut` is `repr(transparent)` over `iovec`; cap at IOV_MAX.
++        let n = bufs.len().min(IOV_MAX);
++        cvt(unsafe {
++            sysc::syscall3(sysc::READV, self.fd as usize, bufs.as_mut_ptr() as usize, n)
++        })
 +    }
 +
 +    pub fn is_read_vectored(&self) -> bool {
-+        false
++        true
 +    }
 +
 +    pub fn read_to_end(&self, buf: &mut Vec<u8>) -> io::Result<usize> {
@@ -3546,14 +3780,14 @@ index 00000000..919386c6
 +    }
 +
 +    pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-+        match bufs.iter().find(|b| !b.is_empty()) {
-+            Some(b) => self.write(b),
-+            None => Ok(0),
-+        }
++        let n = bufs.len().min(IOV_MAX);
++        cvt(unsafe {
++            sysc::syscall3(sysc::WRITEV, self.fd as usize, bufs.as_ptr() as usize, n)
++        })
 +    }
 +
 +    pub fn is_write_vectored(&self) -> bool {
-+        false
++        true
 +    }
 +}
 +
@@ -3635,10 +3869,10 @@ index 00000000..919386c6
 +}
 diff --git a/library/std/src/sys/pal/fullrust/thread.rs b/library/std/src/sys/pal/fullrust/thread.rs
 new file mode 100644
-index 00000000..bb57a358
+index 00000000..4dd468b6
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/thread.rs
-@@ -0,0 +1,255 @@
+@@ -0,0 +1,260 @@
 +use super::sysc;
 +use crate::ffi::CStr;
 +use crate::io;
@@ -3841,8 +4075,13 @@ index 00000000..bb57a358
 +        }
 +    }
 +
-+    pub fn set_name(_name: &CStr) {
-+        // prctl(PR_SET_NAME) — not wired up yet.
++    pub fn set_name(name: &CStr) {
++        // prctl(PR_SET_NAME, name): the kernel copies up to 16 bytes (incl. NUL)
++        // into the thread's `comm`, so an over-long name is simply truncated.
++        const PR_SET_NAME: usize = 15;
++        unsafe {
++            sysc::syscall2(sysc::PRCTL, PR_SET_NAME, name.as_ptr() as usize);
++        }
 +    }
 +
 +    pub fn sleep(dur: Duration) {

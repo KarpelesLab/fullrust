@@ -143,10 +143,18 @@ concurrent stdout/stderr capture, `wait4` exit status, signals), and `std::net`
 (TCP/UDP on the socket syscalls + a self-contained DNS resolver: `/etc/hosts` +
 `/etc/resolv.conf` + UDP A/AAAA queries). Each has a dedicated `test-*` crate.
 
+**Polish closing the remaining gaps:** `strerror`-quality `io::Error` messages
+(errno→text table, since there's no libc `strerror`), `is_terminal` via
+`ioctl(TCGETS)`, `env::split_paths`/`join_paths`/`home_dir` (`$HOME`),
+`thread::set_name` via `prctl(PR_SET_NAME)`, **real vectored I/O** (`readv`/
+`writev` for `File`/`TcpStream`/pipes — `IoSlice` now lowers to a kernel `iovec`),
+and **process-wide `SIGPIPE` ignore** at startup so a write to a closed peer
+returns `EPIPE` instead of killing the process. Covered by `test-osextra`.
+
 Extra changes beyond the target spec / pal: `build.rs` (check-cfg + restricted_std
 allowlist), `cc_detect.rs` (probe via the gnu triple), `compile.rs`
 (`compiler-builtins-mem`), the `sys/{stdio,args,random,alloc,thread_local}`
-dispatchers, `fullrust` branches in the `sys/{fs,net,process,env,path}` +
+dispatchers, `fullrust` branches in the `sys/{fs,net,process,env,path,io}` +
 `sys/sync/*` + `thread_local` guards, and a real fd-backed `pal::pipe`.
 
 ### Known limitations (next steps)
@@ -154,6 +162,9 @@ dispatchers, `fullrust` branches in the `sys/{fs,net,process,env,path}` +
   `mmap` each (correct, but not cached); a medium/large segment tier and finer
   decommit hysteresis are future work. Abandoned segments are reclaimed on
   demand; never-reclaimed ones stay mapped (bounded, mimalloc-style).
+- **Diagnostics**: `panic = abort` with no unwinder, so panic backtraces are
+  unavailable, and there is no `SIGSEGV` guard-page handler — a thread stack
+  overflow is a bare segfault rather than the "stack overflow" message.
 
 ## Version matrix
 
