@@ -19,6 +19,15 @@ fn check(name: &str, cond: bool) {
     }
 }
 
+/// Parse the `SigIgn:` hex bitmask from the contents of a `/proc/<pid>/status`.
+fn sigign_mask(status: &str) -> u64 {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("SigIgn:"))
+        .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+        .unwrap_or(0)
+}
+
 fn main() {
     // --- error_string: io::Error Display now carries strerror-quality text ---
     let err = std::fs::File::open("/no/such/path/at/all-xyz").unwrap_err();
@@ -118,6 +127,21 @@ fn main() {
     // The point is we are still alive to make this assertion at all.
     check("write to dead peer didn't kill process", true);
     check("write to dead peer reported error", reported_error);
+
+    // --- SIGPIPE disposition is honored properly, not blanket-ignored ---
+    // SIGPIPE is signal 13 -> bit 12 (mask 0x1000) in the /proc SigIgn field.
+    const SIGPIPE_BIT: u64 = 1 << 12;
+    // We (the parent) ignore SIGPIPE by default, so our own SigIgn has the bit.
+    let self_status = std::fs::read_to_string("/proc/self/status").unwrap();
+    check("parent ignores SIGPIPE (default)", sigign_mask(&self_status) & SIGPIPE_BIT != 0);
+    // A spawned child must get SIG_DFL restored (bit clear), so ordinary Unix
+    // tools terminate on a broken pipe instead of inheriting our SIG_IGN.
+    let child = std::process::Command::new("cat")
+        .arg("/proc/self/status")
+        .output()
+        .expect("spawn cat");
+    let child_status = String::from_utf8_lossy(&child.stdout);
+    check("spawned child restores SIGPIPE default", sigign_mask(&child_status) & SIGPIPE_BIT == 0);
 
     let fails = unsafe { FAILS };
     if fails == 0 {

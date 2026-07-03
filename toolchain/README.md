@@ -148,8 +148,11 @@ concurrent stdout/stderr capture, `wait4` exit status, signals), and `std::net`
 `ioctl(TCGETS)`, `env::split_paths`/`join_paths`/`home_dir` (`$HOME`),
 `thread::set_name` via `prctl(PR_SET_NAME)`, **real vectored I/O** (`readv`/
 `writev` for `File`/`TcpStream`/pipes — `IoSlice` now lowers to a kernel `iovec`),
-and **process-wide `SIGPIPE` ignore** at startup so a write to a closed peer
-returns `EPIPE` instead of killing the process. Covered by `test-osextra`.
+and **proper `SIGPIPE` handling**: startup honors the compiler's
+`-Zon-broken-pipe` directive (default `SIG_IGN` so a write to a closed peer
+returns `EPIPE`; `kill`→`SIG_DFL`, `inherit`, `error` all respected), and the
+`fork`+`execve` child restores `SIG_DFL` before exec so spawned Unix tools
+terminate on a broken pipe as expected. Covered by `test-osextra`.
 
 Extra changes beyond the target spec / pal: `build.rs` (check-cfg + restricted_std
 allowlist), `cc_detect.rs` (probe via the gnu triple), `compile.rs`

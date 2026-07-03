@@ -2248,11 +2248,12 @@ index 646679a1..411f126d 100644
              mod unsupported;
 diff --git a/library/std/src/sys/pal/fullrust/common.rs b/library/std/src/sys/pal/fullrust/common.rs
 new file mode 100644
-index 00000000..d7370991
+index 00000000..8a72a7d1
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/common.rs
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,120 @@
 +use crate::io as std_io;
++use crate::sync::atomic::{AtomicBool, Ordering};
 +
 +// Called once by `rt::init` via `sys::init`, with the real argc/argv that the
 +// compiler-emitted `main` passed to `lang_start`. We hand them to the args
@@ -2260,7 +2261,7 @@ index 00000000..d7370991
 +// NULL-terminated `argv` on the stack) for `std::env::var()`.
 +//
 +// SAFETY: must be called only once during runtime initialization.
-+pub unsafe fn init(argc: isize, argv: *const *const u8, _sigpipe: u8) {
++pub unsafe fn init(argc: isize, argv: *const *const u8, sigpipe: u8) {
 +    unsafe { crate::sys::args::init(argc, argv) };
 +    // Stack layout: [argv0..argv(argc-1)][NULL][envp0..][NULL]. So `envp` begins
 +    // one past the argv NULL terminator, i.e. at `argv[argc + 1]`.
@@ -2268,19 +2269,60 @@ index 00000000..d7370991
 +        let envp = unsafe { argv.add(argc as usize + 1) } as *const *const core::ffi::c_char;
 +        unsafe { crate::sys::env::init(envp) };
 +    }
-+    // Ignore SIGPIPE, as std does on unix: a write to a closed pipe/socket must
-+    // surface as `EPIPE`, never terminate the process. Without this (and with no
-+    // signal handler installed) the kernel's default action would kill us.
-+    unsafe { ignore_sigpipe() };
++    unsafe { reset_sigpipe(sigpipe) };
 +}
 +
-+/// `rt_sigaction(SIGPIPE, SIG_IGN)` via the raw kernel ABI.
-+unsafe fn ignore_sigpipe() {
++// SIGPIPE handling. The `sigpipe` byte is the disposition the compiler derived
++// from `-Zon-broken-pipe` / `#[unix_sigpipe = "…"]`; these constants mirror
++// `compiler/rustc_session/src/config/sigpipe.rs` (keep them in sync).
++mod sigpipe {
++    pub const DEFAULT: u8 = 0;
++    pub const INHERIT: u8 = 1;
++    pub const SIG_IGN: u8 = 2;
++    pub const SIG_DFL: u8 = 3;
++}
++
++const SIGPIPE: usize = 13;
++const SIG_DFL: usize = 0;
++const SIG_IGN: usize = 1;
++
++/// Set true when the program explicitly chose a SIGPIPE disposition via the
++/// `-Zon-broken-pipe` flag / attribute. The process spawner reads this to decide
++/// whether to restore `SIG_DFL` in children (see [`on_broken_pipe_flag_used`]).
++static ON_BROKEN_PIPE_FLAG_USED: AtomicBool = AtomicBool::new(false);
++
++pub(crate) fn on_broken_pipe_flag_used() -> bool {
++    ON_BROKEN_PIPE_FLAG_USED.load(Ordering::Relaxed)
++}
++
++/// Honor the compiler's SIGPIPE directive, exactly as the unix pal does. The
++/// Rust default (`DEFAULT`) is `SIG_IGN` so a write to a closed peer yields
++/// `EPIPE` rather than killing us; an explicit `sig_dfl`/`inherit`/`sig_ign`
++/// overrides that and marks the "flag used" state.
++unsafe fn reset_sigpipe(sigpipe: u8) {
++    let (attr_specified, disposition) = match sigpipe {
++        sigpipe::DEFAULT => (false, Some(SIG_IGN)),
++        sigpipe::INHERIT => (true, None),
++        sigpipe::SIG_IGN => (true, Some(SIG_IGN)),
++        sigpipe::SIG_DFL => (true, Some(SIG_DFL)),
++        // Be lenient about unknown encodings: keep the safe default.
++        _ => (false, Some(SIG_IGN)),
++    };
++    if attr_specified {
++        ON_BROKEN_PIPE_FLAG_USED.store(true, Ordering::Relaxed);
++    }
++    if let Some(disposition) = disposition {
++        unsafe { set_sigpipe(disposition) };
++    }
++}
++
++/// `rt_sigaction(SIGPIPE, disposition)` via the raw kernel ABI, where
++/// `disposition` is `SIG_DFL` or `SIG_IGN` (never a real handler, so no
++/// `sa_restorer` is required).
++unsafe fn set_sigpipe(disposition: usize) {
 +    use super::sysc;
-+    const SIGPIPE: usize = 13;
-+    const SIG_IGN: usize = 1;
 +    // struct kernel_sigaction { sa_handler; sa_flags; sa_restorer; sa_mask[1]; }
-+    let act: [usize; 4] = [SIG_IGN, 0, 0, 0];
++    let act: [usize; 4] = [disposition, 0, 0, 0];
 +    unsafe {
 +        // Final arg is the sigset size in bytes (8 for the 64-bit kernel mask).
 +        sysc::syscall4(sysc::RT_SIGACTION, SIGPIPE, act.as_ptr() as usize, 0, 8);
@@ -4504,10 +4546,10 @@ index faa2616a..3a89024a 100644
          path.has_root() && path.prefix().is_some()
 diff --git a/library/std/src/sys/process/fullrust.rs b/library/std/src/sys/process/fullrust.rs
 new file mode 100644
-index 00000000..9f33ede5
+index 00000000..bca124a4
 --- /dev/null
 +++ b/library/std/src/sys/process/fullrust.rs
-@@ -0,0 +1,615 @@
+@@ -0,0 +1,629 @@
 +//! Process spawning for the fullrust target, on raw Linux syscalls (no libc).
 +//!
 +//! `spawn` is the classic `fork` + `execve`. All allocation-bearing work — the
@@ -4676,6 +4718,11 @@ index 00000000..9f33ede5
 +        let candidates = resolve_candidates(&self.program, &env_map)?;
 +        let cwd = self.cwd.as_ref().map(|c| to_cstring(c)).transpose()?;
 +
++        // Unless the program opted into a specific SIGPIPE disposition via
++        // `-Zon-broken-pipe`, restore `SIG_DFL` in the child (we start life with
++        // `SIG_IGN`) so spawned Unix tools terminate on a broken pipe as expected.
++        let reset_sigpipe = !crate::sys::pal::on_broken_pipe_flag_used();
++
 +        // SAFETY: fork(2). In the child we only call async-signal-safe syscalls.
 +        let pid = sysc::ret(unsafe { sysc::syscall1(sysc::FORK, 0) })
 +            .map_err(io::Error::from_raw_os_error)?;
@@ -4690,6 +4737,7 @@ index 00000000..9f33ede5
 +                    &candidates,
 +                    argv_ptrs.as_ptr(),
 +                    envp_ptrs.as_ptr(),
++                    reset_sigpipe,
 +                )
 +            }
 +        }
@@ -4783,11 +4831,19 @@ index 00000000..9f33ede5
 +    candidates: &[CString],
 +    argv: *const *const i8,
 +    envp: *const *const i8,
++    reset_sigpipe: bool,
 +) -> ! {
 +    unsafe {
 +        install(stdin, 0);
 +        install(stdout, 1);
 +        install(stderr, 2);
++        if reset_sigpipe {
++            // Restore the default SIGPIPE disposition (terminate) that we masked
++            // at our own startup, so the exec'd program sees normal Unix behavior.
++            // `rt_sigaction(SIGPIPE, SIG_DFL, NULL, sigsetsize=8)`.
++            let act: [usize; 4] = [0 /* SIG_DFL */, 0, 0, 0];
++            sysc::syscall4(sysc::RT_SIGACTION, 13 /* SIGPIPE */, act.as_ptr() as usize, 0, 8);
++        }
 +        if let Some(cwd) = cwd {
 +            sysc::syscall1(sysc::CHDIR, cwd.as_ptr() as usize);
 +        }
