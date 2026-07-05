@@ -177,9 +177,19 @@ multi-agent design panel + adversarial correctness review.
   Abandoned segments are reclaimed on demand or at any thread exit; a segment of a
   kind that is never re-allocated *and* with no further thread exits can linger
   (bounded, mimalloc-style).
-- **Diagnostics**: `panic = abort` with no unwinder, so panic backtraces are
-  unavailable, and there is no `SIGSEGV` guard-page handler — a thread stack
-  overflow is a bare segfault rather than the "stack overflow" message.
+**Diagnostics.** Despite `panic = abort` and no unwinder, panic **backtraces**
+work: a frame-pointer stack walker (`backtrace/src/backtrace/frameptr.rs`, the
+target forces `frame_pointer: Always`; `_start` and the thread trampoline zero
+`%rbp` to terminate the chain) feeds gimli/DWARF symbolization that reads
+`/proc/self/exe` (a `native_libraries` loader returns the static non-PIE image at
+bias 0; the `std::fs`-based `mmap_fake` is used since there is no libc `mmap`), so
+`RUST_BACKTRACE=1` and `std::backtrace::Backtrace` yield names + file:line. A
+**stack-overflow handler** (`sys::pal::fullrust::stack_overflow`) installs a
+`SIGSEGV`/`SIGBUS` handler on a per-thread alternate signal stack (raw
+`rt_sigaction` with a restorer trampoline + `sigaltstack`); spawned-thread stacks
+get an `mprotect(PROT_NONE)` guard page and the main thread's guard is derived
+from `RLIMIT_STACK`, so an overflow prints `thread '…' has overflowed its stack`
+and aborts while a genuine segfault passes through unchanged.
 
 ## Version matrix
 

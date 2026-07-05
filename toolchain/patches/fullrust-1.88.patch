@@ -1,10 +1,10 @@
 diff --git a/compiler/rustc_target/src/spec/base/fullrust.rs b/compiler/rustc_target/src/spec/base/fullrust.rs
 new file mode 100644
-index 00000000..e5776ab0
+index 00000000..860893ea
 --- /dev/null
 +++ b/compiler/rustc_target/src/spec/base/fullrust.rs
-@@ -0,0 +1,49 @@
-+use crate::spec::{Cc, LinkerFlavor, Lld, PanicStrategy, RelocModel, TargetOptions};
+@@ -0,0 +1,55 @@
++use crate::spec::{Cc, FramePointer, LinkerFlavor, Lld, PanicStrategy, RelocModel, TargetOptions};
 +
 +/// Base options for the `fullrust` platform: a libc-free, fully-static Linux
 +/// ABI target. The kernel interface is plain Linux syscalls (so `llvm_target`
@@ -35,6 +35,12 @@ index 00000000..e5776ab0
 +        // No unwinder; panics abort. This removes the landing pads that would
 +        // otherwise reference the personality routine.
 +        panic_strategy: PanicStrategy::Abort,
++
++        // Keep frame pointers everywhere so the pal's frame-pointer stack walker
++        // can produce panic backtraces without an unwinder / DWARF `.eh_frame`.
++        // Both `_start` and the thread trampoline zero `%rbp`, terminating the
++        // chain cleanly.
++        frame_pointer: FramePointer::Always,
 +
 +        // Native ELF `#[thread_local]` TLS: the pal sets up a `%fs`-based TCB in
 +        // `_start` (main thread) and via CLONE_SETTLS (spawned threads), so std
@@ -2248,10 +2254,10 @@ index 646679a1..411f126d 100644
              mod unsupported;
 diff --git a/library/std/src/sys/pal/fullrust/common.rs b/library/std/src/sys/pal/fullrust/common.rs
 new file mode 100644
-index 00000000..8a72a7d1
+index 00000000..b3c920de
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/common.rs
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,124 @@
 +use crate::io as std_io;
 +use crate::sync::atomic::{AtomicBool, Ordering};
 +
@@ -2270,6 +2276,10 @@ index 00000000..8a72a7d1
 +        unsafe { crate::sys::env::init(envp) };
 +    }
 +    unsafe { reset_sigpipe(sigpipe) };
++    // Install the stack-overflow guard/handler for the main thread (prints a
++    // clear message instead of a bare SIGSEGV on overflow). Spawned threads set
++    // up their own guard + alt-stack in `thread.rs`.
++    unsafe { super::stack_overflow::init() };
 +}
 +
 +// SIGPIPE handling. The `sigpipe` byte is the disposition the compiler derived
@@ -3591,10 +3601,10 @@ index 00000000..7e3728ca
 +}
 diff --git a/library/std/src/sys/pal/fullrust/mod.rs b/library/std/src/sys/pal/fullrust/mod.rs
 new file mode 100644
-index 00000000..171f524e
+index 00000000..76dac302
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/mod.rs
-@@ -0,0 +1,224 @@
+@@ -0,0 +1,228 @@
 +//! The `fullrust` platform abstraction layer: libc-free Linux on raw syscalls.
 +//!
 +//! This pal provides what a hosted std gets from libc + crt0: the process entry
@@ -3609,6 +3619,7 @@ index 00000000..171f524e
 +pub mod heap;
 +pub mod os;
 +pub mod pipe;
++pub mod stack_overflow;
 +pub mod thread;
 +pub mod time;
 +pub mod tls;
@@ -3692,6 +3703,9 @@ index 00000000..171f524e
 +    pub const READV: usize = 19;
 +    pub const WRITEV: usize = 20;
 +    pub const RT_SIGACTION: usize = 13;
++    pub const MPROTECT: usize = 10;
++    pub const SIGALTSTACK: usize = 131;
++    pub const PRLIMIT64: usize = 302;
 +    pub const PRCTL: usize = 157;
 +    pub const DUP2: usize = 33;
 +    pub const FORK: usize = 57;
@@ -4237,12 +4251,201 @@ index 00000000..818bcb39
 +    }
 +    Ok(())
 +}
+diff --git a/library/std/src/sys/pal/fullrust/stack_overflow.rs b/library/std/src/sys/pal/fullrust/stack_overflow.rs
+new file mode 100644
+index 00000000..f744e454
+--- /dev/null
++++ b/library/std/src/sys/pal/fullrust/stack_overflow.rs
+@@ -0,0 +1,183 @@
++//! Stack-overflow detection for the fullrust target, on raw Linux syscalls.
++//!
++//! A process-wide `SIGSEGV`/`SIGBUS` handler runs on a per-thread *alternate*
++//! signal stack (so it can execute even when the normal stack is exhausted).
++//! When the faulting address lies in a thread's recorded guard region, it prints
++//! `thread '<name>' has overflowed its stack` and aborts — instead of leaving a
++//! bare, misleading segfault. Any other fault is passed through: the handler
++//! reverts that signal to its default action and returns so it re-raises.
++//!
++//! Guard regions: a spawned thread's stack (mapped by `thread.rs`) gets an
++//! `mprotect(PROT_NONE)` guard page at its low end; the main thread has no
++//! self-mapped stack, so its guard is derived from `RLIMIT_STACK` and the
++//! `[stack]` mapping in `/proc/self/maps` (the kernel enforces the real guard).
++
++use super::sysc;
++use crate::cell::Cell;
++
++const PAGE: usize = 4096;
++const ALTSTACK_SIZE: usize = 1 << 15; // 32 KiB
++
++const SIGSEGV: usize = 11;
++const SIGBUS: usize = 7;
++const SA_SIGINFO: usize = 0x0000_0004;
++const SA_ONSTACK: usize = 0x0800_0000;
++const SA_RESTORER: usize = 0x0400_0000;
++const SIG_DFL: usize = 0;
++const SS_DISABLE: usize = 2;
++const PROT_NONE: usize = 0;
++const RLIMIT_STACK: usize = 3;
++
++// Per-thread guard region `[start, end)`; a fault here is a stack overflow. We
++// write it before the handler could ever fire, so reading it in signal context
++// (native `%fs` TLS, valid in a handler) is safe in practice — same rationale as
++// the unix pal.
++thread_local! {
++    static GUARD: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
++}
++
++#[inline]
++fn os_mmap(len: usize) -> *mut u8 {
++    let r = unsafe {
++        sysc::syscall6(
++            sysc::MMAP,
++            0,
++            len,
++            sysc::PROT_READ | sysc::PROT_WRITE,
++            sysc::MAP_PRIVATE | sysc::MAP_ANONYMOUS,
++            usize::MAX,
++            0,
++        )
++    };
++    match sysc::ret(r) {
++        Ok(p) => crate::ptr::with_exposed_provenance_mut(p),
++        Err(_) => crate::ptr::null_mut(),
++    }
++}
++
++/// Signal restorer. On x86-64 the kernel has no default sigreturn trampoline, so
++/// a real handler MUST supply `sa_restorer` (with `SA_RESTORER`); it invokes
++/// `rt_sigreturn` (15) to resume the interrupted context.
++#[unsafe(naked)]
++unsafe extern "C" fn restorer() {
++    core::arch::naked_asm!("mov rax, 15", "syscall");
++}
++
++/// `SIGSEGV`/`SIGBUS` handler in `SA_SIGINFO` form. Rust never calls this; the
++/// kernel does, with `(signum, *siginfo, *ucontext)`.
++extern "C" fn handler(signum: i32, info: *mut u8, _ctx: *mut u8) {
++    // `siginfo_t` on x86-64: `si_addr` (the fault address, for SIGSEGV/SIGBUS)
++    // is at byte offset 16, past `si_signo`/`si_errno`/`si_code`.
++    let addr = unsafe { *(info.add(16) as *const usize) };
++    let (start, end) = GUARD.with(|g| g.get());
++    if start != 0 && start <= addr && addr < end {
++        crate::thread::with_current_name(|name| {
++            let name = name.unwrap_or("<unknown>");
++            rtprintpanic!("\nthread '{name}' has overflowed its stack\n");
++        });
++        rtabort!("stack overflow");
++    }
++    // Not an overflow: revert this signal to its default action and return, so
++    // the faulting instruction re-raises it (normal crash for a genuine bug).
++    unsafe { set_handler(signum as usize, SIG_DFL, 0) };
++}
++
++/// `rt_sigaction(sig, {handler, flags, restorer, mask=0}, null, sigsetsize=8)`.
++unsafe fn set_handler(sig: usize, handler_addr: usize, flags: usize) {
++    // struct kernel_sigaction { sa_handler; sa_flags; sa_restorer; sa_mask[1]; }
++    let act: [usize; 4] = if handler_addr == SIG_DFL {
++        [SIG_DFL, 0, 0, 0]
++    } else {
++        [handler_addr, flags | SA_RESTORER, restorer as usize, 0]
++    };
++    unsafe {
++        sysc::syscall4(sysc::RT_SIGACTION, sig, act.as_ptr() as usize, 0, 8);
++    }
++}
++
++/// Install this thread's alternate signal stack. Returns its base (to free at
++/// thread exit), or null if the mapping failed.
++unsafe fn install_altstack() -> *mut u8 {
++    let base = os_mmap(ALTSTACK_SIZE);
++    if base.is_null() {
++        return base;
++    }
++    // struct sigaltstack { void* ss_sp; int ss_flags; size_t ss_size; }
++    let ss: [usize; 3] = [base as usize, 0, ALTSTACK_SIZE];
++    unsafe {
++        sysc::syscall2(sysc::SIGALTSTACK, ss.as_ptr() as usize, 0);
++    }
++    base
++}
++
++/// `mprotect(PROT_NONE)` the low page of a spawned thread's stack as a guard, and
++/// return its `[start, end)` range. Called by `thread.rs` in the parent.
++pub unsafe fn protect_stack(base: *mut u8) -> (usize, usize) {
++    unsafe {
++        sysc::syscall3(sysc::MPROTECT, base as usize, PAGE, PROT_NONE);
++    }
++    (base as usize, base as usize + PAGE)
++}
++
++/// Record a spawned thread's guard region and install its alternate signal
++/// stack. Returns the altstack base for later teardown. Called at thread start.
++pub unsafe fn setup_thread(guard: (usize, usize)) -> *mut u8 {
++    GUARD.with(|g| g.set(guard));
++    unsafe { install_altstack() }
++}
++
++/// Tear down a spawned thread's alternate signal stack at thread exit.
++pub unsafe fn teardown_thread(altstack: *mut u8) {
++    if altstack.is_null() {
++        return;
++    }
++    let ss: [usize; 3] = [0, SS_DISABLE, 0];
++    unsafe {
++        sysc::syscall2(sysc::SIGALTSTACK, ss.as_ptr() as usize, 0);
++        sysc::syscall2(sysc::MUNMAP, altstack as usize, ALTSTACK_SIZE);
++    }
++}
++
++/// Read the top (high address) of the main thread's `[stack]` mapping.
++fn main_stack_top() -> Option<usize> {
++    let maps = crate::fs::read_to_string("/proc/self/maps").ok()?;
++    for line in maps.lines() {
++        if line.ends_with("[stack]") {
++            // "LOW-HIGH perms offset dev inode   pathname"
++            let hi = line.split_whitespace().next()?.split('-').nth(1)?;
++            return usize::from_str_radix(hi, 16).ok();
++        }
++    }
++    None
++}
++
++/// Guard region for the main thread: the kernel grows the stack down to
++/// `top - RLIMIT_STACK` and faults there, so classify a fault around that
++/// boundary as overflow.
++fn main_guard() -> (usize, usize) {
++    let mut rl = [0u64; 2]; // { rlim_cur, rlim_max }
++    let r =
++        unsafe { sysc::syscall4(sysc::PRLIMIT64, 0, RLIMIT_STACK, 0, rl.as_mut_ptr() as usize) };
++    let limit = match sysc::ret(r) {
++        Ok(_) => rl[0] as usize,
++        Err(_) => 8 << 20, // 8 MiB default
++    };
++    let top = main_stack_top().unwrap_or(0);
++    if top == 0 || limit == 0 || limit == usize::MAX || limit >= top {
++        return (0, 0);
++    }
++    let low = (top - limit) & !(PAGE - 1);
++    (low.saturating_sub(PAGE), low + PAGE)
++}
++
++/// Install the main thread's guard, alternate signal stack, and the process-wide
++/// `SIGSEGV`/`SIGBUS` handler. Called once from `common::init`.
++pub unsafe fn init() {
++    GUARD.with(|g| g.set(main_guard()));
++    // The main thread's altstack lives for the whole process; intentionally leak.
++    let _ = unsafe { install_altstack() };
++    unsafe {
++        set_handler(SIGSEGV, handler as usize, SA_SIGINFO | SA_ONSTACK);
++        set_handler(SIGBUS, handler as usize, SA_SIGINFO | SA_ONSTACK);
++    }
++}
 diff --git a/library/std/src/sys/pal/fullrust/thread.rs b/library/std/src/sys/pal/fullrust/thread.rs
 new file mode 100644
-index 00000000..4dd468b6
+index 00000000..2196ed4e
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/thread.rs
-@@ -0,0 +1,260 @@
+@@ -0,0 +1,267 @@
 +use super::sysc;
 +use crate::ffi::CStr;
 +use crate::io;
@@ -4332,13 +4535,17 @@ index 00000000..4dd468b6
 +unsafe impl Send for Thread {}
 +unsafe impl Sync for Thread {}
 +
-+type Payload = (Box<dyn FnOnce()>, Arc<Inner>);
++type Payload = (Box<dyn FnOnce()>, Arc<Inner>, (usize, usize));
 +
 +extern "C" fn thread_start(arg: *mut u8) -> ! {
 +    // SAFETY: `arg` is the `Payload` box leaked in `Thread::new`.
 +    let payload = unsafe { Box::from_raw(arg as *mut Payload) };
-+    let (f, inner) = *payload;
++    let (f, inner, guard) = *payload;
++    // Record this thread's stack guard and install its alternate signal stack so
++    // a stack overflow reports "thread '...' has overflowed its stack".
++    let altstack = unsafe { super::stack_overflow::setup_thread(guard) };
 +    f();
++    unsafe { super::stack_overflow::teardown_thread(altstack) };
 +    // Run this thread's `#[thread_local]` destructors and the runtime's
 +    // per-thread cleanup before we leave — `%fs` is still valid here, so native
 +    // TLS access works. (`guard::enable` is a no-op for fullrust; std relies on
@@ -4392,15 +4599,18 @@ index 00000000..4dd468b6
 +    pub unsafe fn new(stack: usize, p: Box<dyn FnOnce()>) -> io::Result<Thread> {
 +        // ctid starts nonzero; the kernel clears it on thread exit.
 +        let inner = Arc::new(Inner { ctid: AtomicU32::new(1) });
-+        let payload: Box<Payload> = Box::new((p, inner.clone()));
-+        let arg = Box::into_raw(payload) as *mut u8;
 +
 +        let size = stack.max(DEFAULT_MIN_STACK_SIZE);
 +        let base = mmap_stack(size);
 +        if base.is_null() {
-+            drop(unsafe { Box::from_raw(arg as *mut Payload) });
 +            return Err(io::Error::from_raw_os_error(12)); // ENOMEM
 +        }
++        // Guard the low page of the stack so an overflow faults into the
++        // stack-overflow handler (which reports it) instead of corrupting memory.
++        let guard = unsafe { super::stack_overflow::protect_stack(base) };
++
++        let payload: Box<Payload> = Box::new((p, inner.clone(), guard));
++        let arg = Box::into_raw(payload) as *mut u8;
 +
 +        // Build the child's native-TLS block (`%fs` data + TCB) here in the
 +        // parent and hand its thread pointer to clone via CLONE_SETTLS, so the

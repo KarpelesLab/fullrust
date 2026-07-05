@@ -1,0 +1,15 @@
+[package]
+name = "backtrace-fullrust"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "backtrace-fullrust"
+path = "src/main.rs"
+
+# Keep DWARF so gimli can resolve addresses to names + file:line; don't strip.
+[profile.release]
+panic = "abort"
+opt-level = 1
+debug = true
+strip = false
