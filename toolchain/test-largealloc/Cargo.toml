@@ -1,0 +1,13 @@
+[package]
+name = "largealloc-fullrust"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "largealloc-fullrust"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+lto = true

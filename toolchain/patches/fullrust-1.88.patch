@@ -2442,10 +2442,10 @@ index 00000000..47cf7101
 +}
 diff --git a/library/std/src/sys/pal/fullrust/heap.rs b/library/std/src/sys/pal/fullrust/heap.rs
 new file mode 100644
-index 00000000..887454d8
+index 00000000..7e3728ca
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/heap.rs
-@@ -0,0 +1,815 @@
+@@ -0,0 +1,1143 @@
 +//! A mimalloc-class global allocator for the fullrust target.
 +//!
 +//! The design follows mimalloc's "free-list sharding" model, adapted to a
@@ -2455,28 +2455,48 @@ index 00000000..887454d8
 +//!     the `%fs` TCB (see [`super::tls`]). The hot alloc/free path touches only
 +//!     the owning thread's data — no lock, no atomics, no syscall.
 +//!
-+//!   * **Segments and pages.** Memory comes from 4 MiB, 4 MiB-aligned segments
-+//!     (`mmap`). A segment is sliced into 64 KiB *pages*; each page serves a
-+//!     single size class. Because segments are aligned, the segment header (and
-+//!     thus a block's page) is found from any block pointer by masking — so
-+//!     there is **no per-allocation header** and free is routed entirely by the
-+//!     caller's `Layout`.
++//!   * **Segments, pages, and tiers.** Memory comes from 4 MiB, 4 MiB-aligned
++//!     segments (`mmap`). A segment belongs to one *kind* and is sliced into
++//!     equal *pages*, each serving one size class:
++//!       - **Small** — 64 KiB pages (page 0 is the header; 63 data pages),
++//!         objects `<= 8 KiB`.
++//!       - **Medium** — 512 KiB pages (8 per segment; page 0 also carries the
++//!         header), objects `8 KiB .. 128 KiB`.
++//!       - **Large** — the whole 4 MiB is one page (also header-bearing),
++//!         objects `128 KiB .. 512 KiB` (several blocks per page).
++//!     Because segments are 4 MiB-aligned, a block's segment (and its `kind`,
++//!     stored in the header) is recovered from any block pointer by masking — so
++//!     there is **no per-allocation header** and free routes with no size lookup.
++//!     Objects above 512 KiB, or over-aligned requests that don't fit a tier,
++//!     take a dedicated page-rounded `mmap`.
 +//!
 +//!   * **Sharded free lists.** A page has a `free` list owned exclusively by the
 +//!     allocating thread (popped/pushed with no atomics) and an atomic
 +//!     `thread_free` list onto which *other* threads push when they free a block
 +//!     they don't own. The owner folds `thread_free` into `free` only when its
 +//!     local list runs dry — so cross-thread frees never contend the fast path.
++//!     Medium and large blocks live on the exact same sharded lists as small
++//!     ones; the tier machinery is a single code path parameterized by `kind`.
 +//!
-+//!   * **Size classes.** ~36 classes with bounded internal waste: 8 B, then
-+//!     16 B-spaced, then four geometric steps per octave up to 8 KiB. Every
-+//!     class above the 8 B one is a multiple of 16, so any allocation with
-+//!     `align <= 16` is satisfied by class selection alone. Anything larger than
-+//!     8 KiB, or with `align > 16`, takes a dedicated page-rounded `mmap`,
-+//!     released to the OS on free.
++//!   * **Size classes.** 36 small classes (8 B, then 16 B-spaced, then geometric
++//!     to 8 KiB), 16 medium (2 KiB-spaced to 128 KiB), 8 large (32 KiB-spaced to
++//!     512 KiB). Every class above 8 B is a multiple of 16, so an allocation with
++//!     `align <= 16` is served by class selection alone. An **over-aligned**
++//!     request (`align > 16`) is routed to the smallest power-of-two class `>=`
++//!     its rounded need: a power-of-two class is a multiple of the (power-of-two)
++//!     alignment, and page bases are `>= 512 KiB`-aligned, so every block is
++//!     correctly aligned with no per-object fixup.
 +//!
-+//! Memory is returned to the OS when a page empties (`madvise(MADV_FREE)`) and a
-+//! fully-empty segment is `munmap`ped, so resident size tracks live bytes.
++//! Memory is returned to the OS when a page empties (`madvise(MADV_FREE)`, taking
++//! care never to advise the segment header) and a fully-empty *owned* segment is
++//! `munmap`ped, so for a single thread resident size tracks live bytes. A segment
++//! *abandoned* by an exited thread whose blocks are later freed cross-thread is
++//! reclaimed either on demand (the next thread to reclaim that kind, via
++//! `reclaim_segment`) or when any thread exits (`scavenge_abandoned` folds and
++//! unmaps emptied abandoned segments). Only in the absence of any further thread
++//! exits *and* any further allocation of that kind can such a segment linger
++//! (bounded by the peak number abandoned) — matching mimalloc's demand-driven
++//! abandoned-segment reclamation.
 +
 +use super::sysc;
 +use super::tls;
@@ -2489,26 +2509,94 @@ index 00000000..887454d8
 +const SEGMENT_SIZE: usize = 1 << SEGMENT_SHIFT; // 4 MiB
 +const SEGMENT_MASK: usize = SEGMENT_SIZE - 1;
 +
-+const PAGE_SHIFT: usize = 16;
-+const PAGE_SIZE: usize = 1 << PAGE_SHIFT; // 64 KiB
-+const PAGES_PER_SEGMENT: usize = SEGMENT_SIZE / PAGE_SIZE; // 64; page 0 is the header
++const SMALL_SHIFT: usize = 16; // 64 KiB pages
++const MED_SHIFT: usize = 19; //   512 KiB pages
++const LARGE_SHIFT: usize = 22; // 4 MiB page (whole segment)
++
++/// Max pages in a segment (small kind: 64; page 0 is the header slot).
++const MAX_PAGES: usize = SEGMENT_SIZE / (1 << SMALL_SHIFT); // 64
 +
 +const OS_PAGE: usize = 4096;
-+const MAX_SMALL: usize = 8192; // largest size served from pages
 +
-+/// Size classes (bytes). All but the first are multiples of 16, so an
-+/// allocation with `align <= 16` is satisfied by picking a class `>= max(size,
-+/// align)` rounded to `align`.
-+const CLASS_SIZES: [u32; 36] = [
++// Tier size boundaries (all recomputable from a `Layout`, so free stays
++// header-free). `need = round_up(max(size,1), max(align,1))`.
++const MAX_SMALL: usize = 8192; //   <= this  -> small
++const MED_MAX: usize = 131072; //   <= this  -> medium (128 KiB)
++const LARGE_MAX: usize = 524288; //  <= this -> large  (512 KiB); above -> huge
++
++/// The three segment kinds. `Kind as usize` indexes the per-kind arrays.
++#[derive(Copy, Clone, PartialEq, Eq)]
++enum Kind {
++    Small = 0,
++    Medium = 1,
++    Large = 2,
++}
++const NUM_KINDS: usize = 3;
++
++impl Kind {
++    #[inline]
++    fn shift(self) -> usize {
++        match self {
++            Kind::Small => SMALL_SHIFT,
++            Kind::Medium => MED_SHIFT,
++            Kind::Large => LARGE_SHIFT,
++        }
++    }
++    /// First usable page slot: small keeps page 0 as a pure header, medium/large
++    /// use page 0 too (skipping the header region within it).
++    #[inline]
++    fn first_page(self) -> usize {
++        match self {
++            Kind::Small => 1,
++            _ => 0,
++        }
++    }
++    /// Number of page slots in a segment of this kind (64 / 8 / 1).
++    #[inline]
++    fn pages(self) -> usize {
++        SEGMENT_SIZE >> self.shift()
++    }
++    #[inline]
++    fn idx(self) -> usize {
++        self as usize
++    }
++    #[inline]
++    fn from_u8(v: u8) -> Kind {
++        match v {
++            0 => Kind::Small,
++            1 => Kind::Medium,
++            _ => Kind::Large,
++        }
++    }
++}
++
++// --- size classes ---------------------------------------------------------
++
++/// Small classes (bytes). All but the first are multiples of 16.
++const SMALL_CLASSES: [u32; 36] = [
 +    8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512, 640,
 +    768, 896, 1024, 1280, 1536, 1792, 2048, 2560, 3072, 3584, 4096, 5120, 6144, 7168, 8192,
 +];
-+const NUM_CLASSES: usize = CLASS_SIZES.len();
++/// Medium classes (bytes): multiples of 2 KiB up to 128 KiB. Includes the
++/// powers of two 16/32/64/128 KiB used to satisfy over-aligned requests.
++const MED_CLASSES: [u32; 16] = [
++    10240, 12288, 14336, 16384, 20480, 24576, 28672, 32768, 40960, 49152, 57344, 65536, 81920,
++    98304, 114688, 131072,
++];
++/// Large classes (bytes): multiples of 32 KiB up to 512 KiB. Includes 256/512
++/// KiB for over-aligned requests.
++const LARGE_CLASSES: [u32; 8] =
++    [163840, 196608, 229376, 262144, 327680, 393216, 458752, 524288];
++
++const N_SMALL: usize = SMALL_CLASSES.len(); // 36
++const N_MED: usize = MED_CLASSES.len(); // 16
++const N_LARGE: usize = LARGE_CLASSES.len(); // 8
++/// Unified class index space: `0..36` small, `36..52` medium, `52..60` large.
++const NUM_CLASSES: usize = N_SMALL + N_MED + N_LARGE; // 60
++
 +const IDX_LEN: usize = MAX_SMALL / 8; // 1024
 +
-+/// `IDX[(need - 1) >> 3]` is the index of the smallest class `>= need`, for
-+/// `1 <= need <= MAX_SMALL`. Built so the whole `[need-7 ..= need]` bucket maps
-+/// to a class large enough for the bucket's top.
++/// `IDX[(need - 1) >> 3]` is the small class index for `1 <= need <= MAX_SMALL`.
 +const IDX: [u8; IDX_LEN] = build_idx();
 +
 +const fn build_idx() -> [u8; IDX_LEN] {
@@ -2517,8 +2605,8 @@ index 00000000..887454d8
 +    while b < IDX_LEN {
 +        let target = (b + 1) * 8;
 +        let mut i = 0;
-+        while i < NUM_CLASSES {
-+            if CLASS_SIZES[i] as usize >= target {
++        while i < N_SMALL {
++            if SMALL_CLASSES[i] as usize >= target {
 +                break;
 +            }
 +            i += 1;
@@ -2530,14 +2618,87 @@ index 00000000..887454d8
 +}
 +
 +#[inline]
++fn class_size(class: usize) -> u32 {
++    if class < N_SMALL {
++        SMALL_CLASSES[class]
++    } else if class < N_SMALL + N_MED {
++        MED_CLASSES[class - N_SMALL]
++    } else {
++        LARGE_CLASSES[class - N_SMALL - N_MED]
++    }
++}
++
++#[inline]
++fn small_class_of(need: usize) -> usize {
++    IDX[(need - 1) >> 3] as usize
++}
++
++/// Smallest medium class `>= v` (unified index). `v` is in `(MAX_SMALL, MED_MAX]`.
++#[inline]
++fn med_class_of(v: usize) -> usize {
++    let mut i = 0;
++    while i < N_MED {
++        if MED_CLASSES[i] as usize >= v {
++            break;
++        }
++        i += 1;
++    }
++    N_SMALL + i
++}
++
++/// Smallest large class `>= v` (unified index). `v` is in `(MED_MAX, LARGE_MAX]`.
++#[inline]
++fn large_class_of(v: usize) -> usize {
++    let mut i = 0;
++    while i < N_LARGE {
++        if LARGE_CLASSES[i] as usize >= v {
++            break;
++        }
++        i += 1;
++    }
++    N_SMALL + N_MED + i
++}
++
++#[inline]
 +fn round_up(v: usize, to: usize) -> usize {
 +    (v + to - 1) & !(to - 1)
 +}
 +
-+/// Class index for an already-`need`-rounded request, `need <= MAX_SMALL`.
++/// The single routing oracle: map a `Layout` to a paged tier+class or the huge
++/// path. `alloc`, `alloc_zeroed`, `dealloc`, and `realloc` all call this, so
++/// alloc and free never disagree about where a pointer lives.
++enum Route {
++    Paged(Kind, usize),
++    Huge,
++}
++
 +#[inline]
-+fn class_of(need: usize) -> usize {
-+    IDX[(need - 1) >> 3] as usize
++fn route(size: usize, align: usize) -> Route {
++    let need = round_up(size.max(1), align.max(1));
++    if align <= 16 {
++        if need <= MAX_SMALL {
++            Route::Paged(Kind::Small, small_class_of(need))
++        } else if need <= MED_MAX {
++            Route::Paged(Kind::Medium, med_class_of(need))
++        } else if need <= LARGE_MAX {
++            Route::Paged(Kind::Large, large_class_of(need))
++        } else {
++            Route::Huge
++        }
++    } else {
++        // Over-aligned: a power-of-two class is a multiple of the power-of-two
++        // alignment, and page bases are >= 512 KiB-aligned, so the block is
++        // aligned with no fixup. Tiny (<= 8 KiB) and giant (> 512 KiB)
++        // over-aligned requests fall to the huge path.
++        let c = need.next_power_of_two();
++        if c > MAX_SMALL && c <= MED_MAX {
++            Route::Paged(Kind::Medium, med_class_of(c))
++        } else if c > MED_MAX && c <= LARGE_MAX {
++            Route::Paged(Kind::Large, large_class_of(c))
++        } else {
++            Route::Huge
++        }
++    }
 +}
 +
 +// --- raw OS memory --------------------------------------------------------
@@ -2585,7 +2746,6 @@ index 00000000..887454d8
 +    }
 +    let raw_addr = raw.addr();
 +    let base_addr = round_up(raw_addr, SEGMENT_SIZE);
-+    // Trim the unaligned head and the leftover tail back to the OS.
 +    if base_addr > raw_addr {
 +        unsafe { os_munmap(raw_addr, base_addr - raw_addr) };
 +    }
@@ -2621,37 +2781,62 @@ index 00000000..887454d8
 +    used: u32,
 +    /// Size class in bytes, or `0` for an unused page slot.
 +    block_size: u32,
++    /// Unified class index (avoids re-deriving from `block_size`).
++    class: u16,
 +    /// Links within the owning heap's per-class page list.
 +    next: *mut Page,
 +    prev: *mut Page,
 +}
 +
 +/// A 4 MiB segment header (at the segment base). `pages[0]`'s data area holds
-+/// this header; usable pages are `1..PAGES_PER_SEGMENT`.
++/// this header; which page slots are usable depends on `kind`.
 +#[repr(C)]
 +struct Segment {
 +    /// Owning heap, or null while abandoned. Atomic so a cross-thread freer can
 +    /// read it while the owner publishes/abandons.
 +    owner: AtomicPtr<Heap>,
++    /// This segment's kind (`Kind as u8`), so any code holding a segment pointer
++    /// — including a cross-thread freer that masked a block pointer — recovers
++    /// the page geometry without consulting the caller's `Layout`.
++    kind: u8,
 +    /// Pages with `used > 0`. When this hits 0 the segment is fully free.
 +    used_pages: u32,
-+    /// Link in the owning heap's segment list.
++    /// Link in the owning heap's per-kind segment list.
 +    next: *mut Segment,
 +    prev: *mut Segment,
-+    /// Link in the global abandoned-segment stack.
++    /// Link in the global per-kind abandoned-segment stack.
 +    abandoned_next: *mut Segment,
-+    pages: [Page; PAGES_PER_SEGMENT],
++    pages: [Page; MAX_PAGES],
 +}
 +
-+/// A per-thread heap: the head of a per-class page list, plus the owned
-+/// segments. Created lazily on first allocation and reached via `%fs`.
++/// Bytes at the front of a segment reserved for its header. No block is ever
++/// placed here; computed once at compile time and rounded to an OS page so the
++/// `MADV_FREE` on page 0 can start cleanly past it.
++const HEADER_SIZE: usize = round_up_const(core::mem::size_of::<Segment>(), OS_PAGE);
++
++const fn round_up_const(v: usize, to: usize) -> usize {
++    (v + to - 1) & !(to - 1)
++}
++
++/// A per-thread heap: per-class active page lists, plus the owned segments split
++/// by kind. Created lazily on first allocation and reached via `%fs`.
 +#[repr(C)]
 +struct Heap {
-+    /// Head page per size class (allocation tries this first).
++    /// Head page per unified size class (allocation tries this first).
 +    active: [*mut Page; NUM_CLASSES],
-+    /// Owned segments (doubly linked for O(1) unlink on free-to-OS).
-+    segments: *mut Segment,
++    /// Owned segments, one doubly linked list per kind.
++    segments: [*mut Segment; NUM_KINDS],
++    /// A small cache of fully-empty, still-committed segments per kind, kept for
++    /// immediate reuse so a single-object alloc/free churn doesn't `munmap` and
++    /// re-`mmap` its segment every cycle. Singly linked via `Segment::next`.
++    free_segs: [*mut Segment; NUM_KINDS],
++    free_count: [u32; NUM_KINDS],
 +}
++
++/// Empty-segment cache depth per kind. Small keeps its historical immediate-
++/// `munmap` behavior (0); medium/large retain a couple for churn. The bound is
++/// `cap * 4 MiB * kinds` of committed VA per thread (worst case 16 MiB here).
++const FREE_SEG_CAP: [u32; NUM_KINDS] = [0, 2, 2];
 +
 +// --- segment / page helpers ----------------------------------------------
 +
@@ -2660,23 +2845,31 @@ index 00000000..887454d8
 +    ptr::with_exposed_provenance_mut(block.addr() & !SEGMENT_MASK)
 +}
 +
++/// Data-area base and block count of page `i` in a `kind` segment, accounting
++/// for the header that lives at the front of page 0.
 +#[inline]
-+fn page_index(seg: *mut Segment, block: *mut u8) -> usize {
-+    (block.addr() - (seg as *mut u8).addr()) >> PAGE_SHIFT
-+}
-+
-+/// Data area base of page `i` within `seg`.
-+#[inline]
-+fn page_data(seg: *mut Segment, i: usize) -> *mut u8 {
-+    ptr::with_exposed_provenance_mut((seg as *mut u8).addr() + i * PAGE_SIZE)
++fn page_layout(seg: *mut Segment, i: usize, kind: Kind, bsize: usize) -> (usize, usize) {
++    let page_size = 1usize << kind.shift();
++    let base = (seg as *mut u8).addr() + i * page_size;
++    if i == 0 {
++        // Page 0 carries the Segment header: place the first block on the
++        // size-class grid just past it, so no block ever aliases the header.
++        let k0 = (HEADER_SIZE + bsize - 1) / bsize;
++        (base + k0 * bsize, page_size / bsize - k0)
++    } else {
++        (base, page_size / bsize)
++    }
 +}
 +
 +// --- the global allocator -------------------------------------------------
 +
-+/// Spinlock guarding the global abandoned-segment stack (touched only on thread
++/// Spinlock guarding the global abandoned-segment stacks (touched only on thread
 +/// exit and segment reclaim, both rare).
 +static ABANDON_LOCK: AtomicBool = AtomicBool::new(false);
-+static ABANDONED: AtomicPtr<Segment> = AtomicPtr::new(ptr::null_mut());
++/// One abandoned-segment stack per kind, so a thread reclaiming e.g. a medium
++/// segment never adopts a large one (their page geometry differs).
++static ABANDONED: [AtomicPtr<Segment>; NUM_KINDS] =
++    [const { AtomicPtr::new(ptr::null_mut()) }; NUM_KINDS];
 +
 +#[inline]
 +fn lock_abandon() {
@@ -2702,8 +2895,8 @@ index 00000000..887454d8
 +
 +#[cold]
 +fn heap_init() -> *mut Heap {
-+    // One OS page holds the Heap struct; it is zero from a fresh mapping, so all
-+    // `active` heads and `segments` start null.
++    // One or more OS pages hold the Heap struct; it is zero from a fresh mapping,
++    // so all `active` heads and `segments` start null.
 +    let mem = os_mmap(round_up(core::mem::size_of::<Heap>(), OS_PAGE));
 +    if mem.is_null() {
 +        return ptr::null_mut();
@@ -2752,36 +2945,56 @@ index 00000000..887454d8
 +    ptr::null_mut()
 +}
 +
-+/// Find a usable page slot in `h`'s segments (or a reclaimed/new segment) and
-+/// initialize it for `class`, linking it as the head of the class list.
++/// Find a usable page slot in `h`'s `kind` segments (or a reclaimed/new segment)
++/// and initialize it for `class`, linking it as the head of the class list.
 +#[cold]
-+unsafe fn heap_alloc_page(h: *mut Heap, class: usize) -> *mut Page {
++unsafe fn heap_alloc_page(h: *mut Heap, kind: Kind, class: usize) -> *mut Page {
 +    let heap = unsafe { &mut *h };
-+    let bsize = CLASS_SIZES[class];
++    let bsize = class_size(class);
++    let first = kind.first_page();
++    let per = kind.pages();
 +
 +    loop {
 +        // Look for a free page slot (block_size == 0) in an owned segment. A
 +        // reclaimed segment may have *live* pages re-queued at any slot, so we
-+        // must take a genuinely free slot rather than assuming slot 1.
-+        let mut seg = heap.segments;
++        // must take a genuinely free slot rather than assuming a fixed one.
++        let mut seg = heap.segments[kind.idx()];
 +        while !seg.is_null() {
 +            let s = unsafe { &mut *seg };
-+            let mut i = 1;
-+            while i < PAGES_PER_SEGMENT {
++            let mut i = first;
++            while i < per {
 +                if s.pages[i].block_size == 0 {
-+                    return unsafe { init_page(seg, i, class, bsize, h) };
++                    return unsafe { init_page(seg, i, kind, class, bsize, h) };
 +                }
 +                i += 1;
 +            }
 +            seg = s.next;
 +        }
 +
-+        // No free slot anywhere: adopt an abandoned segment, else map a new one.
-+        // Both link the segment into `heap.segments`; loop back to claim a slot
-+        // in it (a reclaimed segment can be full, in which case we try again).
-+        let seg = unsafe { reclaim_segment(h) };
++        // No free slot in a live segment: reuse a cached empty segment (still
++        // committed — no syscall) before touching the OS.
++        let ki = kind.idx();
++        let cached = heap.free_segs[ki];
++        if !cached.is_null() {
++            let s = unsafe { &mut *cached };
++            heap.free_segs[ki] = s.next;
++            heap.free_count[ki] -= 1;
++            // Relink into the active segment list; all its pages are free.
++            s.prev = ptr::null_mut();
++            s.next = heap.segments[ki];
++            if !s.next.is_null() {
++                unsafe { (*s.next).prev = cached };
++            }
++            heap.segments[ki] = cached;
++            continue; // rescan will find its free slots
++        }
++
++        // Otherwise adopt an abandoned segment, else map a new one. Both link the
++        // segment into `heap.segments[kind]`; loop back to claim a slot (a
++        // reclaimed segment can be full, in which case we try again).
++        let seg = unsafe { reclaim_segment(h, kind) };
 +        if seg.is_null() {
-+            let seg = unsafe { new_segment(h) };
++            let seg = unsafe { new_segment(h, kind) };
 +            if seg.is_null() {
 +                return ptr::null_mut();
 +            }
@@ -2795,22 +3008,22 @@ index 00000000..887454d8
 +unsafe fn init_page(
 +    seg: *mut Segment,
 +    i: usize,
++    kind: Kind,
 +    class: usize,
 +    bsize: u32,
 +    h: *mut Heap,
 +) -> *mut Page {
 +    let s = unsafe { &mut *seg };
-+    let data = page_data(seg, i);
++    let (data_addr, blocks) = page_layout(seg, i, kind, bsize as usize);
 +    let pg = &mut s.pages[i] as *mut Page;
 +    let page = unsafe { &mut *pg };
 +    page.free = ptr::null_mut();
 +    page.thread_free = AtomicPtr::new(ptr::null_mut());
-+    page.bump = data;
-+    // Whole-number block count for this page.
-+    let blocks = PAGE_SIZE / bsize as usize;
-+    page.bump_end = unsafe { data.add(blocks * bsize as usize) };
++    page.bump = ptr::with_exposed_provenance_mut(data_addr);
++    page.bump_end = ptr::with_exposed_provenance_mut(data_addr + blocks * bsize as usize);
 +    page.used = 0;
 +    page.block_size = bsize;
++    page.class = class as u16;
 +    s.used_pages += 1;
 +
 +    // Push to the head of the class list.
@@ -2824,9 +3037,9 @@ index 00000000..887454d8
 +    pg
 +}
 +
-+/// Map and register a new segment owned by `h`.
++/// Map and register a new `kind` segment owned by `h`.
 +#[cold]
-+unsafe fn new_segment(h: *mut Heap) -> *mut Segment {
++unsafe fn new_segment(h: *mut Heap, kind: Kind) -> *mut Segment {
 +    let base = os_alloc_segment();
 +    if base.is_null() {
 +        return ptr::null_mut();
@@ -2835,31 +3048,34 @@ index 00000000..887454d8
 +    let seg = base as *mut Segment;
 +    let s = unsafe { &mut *seg };
 +    s.owner = AtomicPtr::new(h);
++    s.kind = kind as u8;
 +    s.used_pages = 0;
 +    s.abandoned_next = ptr::null_mut();
-+    // Link into the heap's segment list.
++    // Link into the heap's per-kind segment list.
 +    let heap = unsafe { &mut *h };
++    let ki = kind.idx();
 +    s.prev = ptr::null_mut();
-+    s.next = heap.segments;
++    s.next = heap.segments[ki];
 +    if !s.next.is_null() {
 +        unsafe { (*s.next).prev = seg };
 +    }
-+    heap.segments = seg;
++    heap.segments[ki] = seg;
 +    seg
 +}
 +
-+/// Try to take an abandoned segment off the global stack and adopt it into `h`:
-+/// re-own it, re-queue its live pages, and fold in any cross-thread frees.
++/// Try to take an abandoned `kind` segment off the global stack and adopt it
++/// into `h`: re-own it, re-queue its live pages, and fold in cross-thread frees.
 +#[cold]
-+unsafe fn reclaim_segment(h: *mut Heap) -> *mut Segment {
++unsafe fn reclaim_segment(h: *mut Heap, kind: Kind) -> *mut Segment {
++    let ki = kind.idx();
 +    lock_abandon();
-+    let seg = ABANDONED.load(Ordering::Acquire);
++    let seg = ABANDONED[ki].load(Ordering::Acquire);
 +    if seg.is_null() {
 +        unlock_abandon();
 +        return ptr::null_mut();
 +    }
 +    let s = unsafe { &mut *seg };
-+    ABANDONED.store(s.abandoned_next, Ordering::Release);
++    ABANDONED[ki].store(s.abandoned_next, Ordering::Release);
 +    unlock_abandon();
 +
 +    s.abandoned_next = ptr::null_mut();
@@ -2868,8 +3084,10 @@ index 00000000..887454d8
 +    // Re-queue every live page into this heap's class lists and recount.
 +    let heap = unsafe { &mut *h };
 +    s.used_pages = 0;
-+    let mut i = 1;
-+    while i < PAGES_PER_SEGMENT {
++    let first = kind.first_page();
++    let per = kind.pages();
++    let mut i = first;
++    while i < per {
 +        let pg = &mut s.pages[i] as *mut Page;
 +        let page = unsafe { &mut *pg };
 +        if page.block_size != 0 {
@@ -2894,7 +3112,7 @@ index 00000000..887454d8
 +                page.free = ptr::null_mut();
 +            } else {
 +                s.used_pages += 1;
-+                let class = class_of(page.block_size as usize);
++                let class = page.class as usize;
 +                page.prev = ptr::null_mut();
 +                page.next = heap.active[class];
 +                if !page.next.is_null() {
@@ -2908,17 +3126,88 @@ index 00000000..887454d8
 +
 +    // Link the segment into the heap.
 +    s.prev = ptr::null_mut();
-+    s.next = heap.segments;
++    s.next = heap.segments[ki];
 +    if !s.next.is_null() {
 +        unsafe { (*s.next).prev = seg };
 +    }
-+    heap.segments = seg;
++    heap.segments[ki] = seg;
 +    seg
 +}
 +
-+/// Small (page-served) allocation for `class`.
++/// Walk the abandoned stack for `kind`, folding each segment's pending
++/// cross-thread frees, and `munmap` any segment that has become fully empty
++/// (splicing it out of the stack). Called at thread exit so that segments
++/// abandoned by earlier-exited threads, whose blocks have since been freed
++/// cross-thread, are returned to the OS instead of waiting for a future
++/// same-kind allocation to reclaim them.
++///
++/// # Safety
++/// All mutation of abandoned segments happens under `ABANDON_LOCK`, serialized
++/// with `reclaim_segment`. A segment is only unmapped once its recomputed
++/// `used_pages` is 0 — which, by the `used` accounting, means every outstanding
++/// block has been folded, so no concurrent cross-thread freer is still touching
++/// it (an in-flight free keeps its page's `used > 0` until its block is folded).
++#[cold]
++unsafe fn scavenge_abandoned(kind: Kind) {
++    let ki = kind.idx();
++    let first = kind.first_page();
++    let per = kind.pages();
++    lock_abandon();
++    let mut prev: *mut Segment = ptr::null_mut();
++    let mut cur = ABANDONED[ki].load(Ordering::Acquire);
++    while !cur.is_null() {
++        let s = unsafe { &mut *cur };
++        let next = s.abandoned_next;
++
++        // Fold every live page's cross-thread frees and recount.
++        let mut live = 0u32;
++        let mut i = first;
++        while i < per {
++            let pg = &mut s.pages[i];
++            if pg.block_size != 0 {
++                let tf = pg.thread_free.swap(ptr::null_mut(), Ordering::Acquire);
++                if !tf.is_null() {
++                    let mut n: u32 = 0;
++                    let mut node = tf;
++                    let mut last = tf;
++                    while !node.is_null() {
++                        n += 1;
++                        last = node;
++                        node = unsafe { (*node).next };
++                    }
++                    pg.used -= n;
++                    unsafe { (*last).next = pg.free };
++                    pg.free = tf;
++                }
++                if pg.used == 0 {
++                    pg.block_size = 0;
++                } else {
++                    live += 1;
++                }
++            }
++            i += 1;
++        }
++        s.used_pages = live;
++
++        if live == 0 {
++            // Splice out of the abandoned stack and return to the OS.
++            if prev.is_null() {
++                ABANDONED[ki].store(next, Ordering::Release);
++            } else {
++                unsafe { (*prev).abandoned_next = next };
++            }
++            unsafe { os_munmap((cur as *mut u8).addr(), SEGMENT_SIZE) };
++        } else {
++            prev = cur;
++        }
++        cur = next;
++    }
++    unlock_abandon();
++}
++
++/// Paged allocation for `kind`/`class`.
 +#[inline]
-+unsafe fn alloc_small(class: usize) -> *mut u8 {
++unsafe fn alloc_paged(kind: Kind, class: usize) -> *mut u8 {
 +    let h = heap();
 +    if h.is_null() {
 +        return ptr::null_mut();
@@ -2946,7 +3235,7 @@ index 00000000..887454d8
 +    }
 +
 +    // No page with space: get a fresh one.
-+    let pg = unsafe { heap_alloc_page(h, class) };
++    let pg = unsafe { heap_alloc_page(h, kind, class) };
 +    if pg.is_null() {
 +        return ptr::null_mut();
 +    }
@@ -2960,14 +3249,12 @@ index 00000000..887454d8
 +        return;
 +    }
 +    let page = unsafe { &mut *p };
-+    // Unlink.
 +    if !page.prev.is_null() {
 +        unsafe { (*page.prev).next = page.next };
 +    }
 +    if !page.next.is_null() {
 +        unsafe { (*page.next).prev = page.prev };
 +    }
-+    // Push front.
 +    page.prev = ptr::null_mut();
 +    page.next = heap.active[class];
 +    if !page.next.is_null() {
@@ -2976,26 +3263,29 @@ index 00000000..887454d8
 +    heap.active[class] = p;
 +}
 +
-+/// Free a small (page-served) block back to its page.
++/// Free a paged block back to its page. The block's segment (and thus its kind
++/// and page geometry) is recovered by masking — no `Layout` needed here.
 +#[inline]
-+unsafe fn free_small(block: *mut u8) {
++unsafe fn free_paged(block: *mut u8) {
 +    let seg = segment_of(block);
-+    let i = page_index(seg, block);
 +    let s = unsafe { &mut *seg };
++    let kind = Kind::from_u8(s.kind);
++    let shift = kind.shift();
++    let i = (block.addr() - (seg as *mut u8).addr()) >> shift;
 +    let pg = &mut s.pages[i] as *mut Page;
 +
 +    // Integrity check (debug only, zero release cost): the freed pointer must
 +    // land on its page's current size-class grid. A miss means a double free, a
 +    // free of a foreign/stale pointer, or a use-after-free — fail loudly here
-+    // rather than corrupt the heap. (Caught the segment-reuse bug during bring-up.)
++    // rather than corrupt the heap.
 +    #[cfg(debug_assertions)]
 +    {
 +        let page = unsafe { &*pg };
-+        let data = page_data(seg, i);
-+        let off = block.addr().wrapping_sub(data.addr());
++        let page_base = (seg as *mut u8).addr() + i * (1usize << shift);
++        let off = block.addr().wrapping_sub(page_base);
 +        debug_assert!(
 +            page.block_size != 0
-+                && off < PAGE_SIZE
++                && off < (1usize << shift)
 +                && off % page.block_size as usize == 0,
 +            "invalid free: pointer not on its page's size-class grid",
 +        );
@@ -3038,9 +3328,10 @@ index 00000000..887454d8
 +#[cold]
 +unsafe fn retire_page(seg: *mut Segment, i: usize) {
 +    let s = unsafe { &mut *seg };
++    let kind = Kind::from_u8(s.kind);
 +    let pg = &mut s.pages[i];
-+    // Reset to an empty, reusable slot.
-+    let class = class_of(pg.block_size as usize);
++    let class = pg.class as usize;
++
 +    // Unlink from the class list.
 +    let me = s.owner.load(Ordering::Relaxed);
 +    if !me.is_null() {
@@ -3059,31 +3350,54 @@ index 00000000..887454d8
 +    pg.prev = ptr::null_mut();
 +    pg.free = ptr::null_mut();
 +    pg.block_size = 0;
-+    // Drop the page's physical memory; the virtual range stays mapped for reuse.
-+    let data = page_data(seg, i);
-+    unsafe { os_madvise(data.addr(), PAGE_SIZE, sysc::MADV_FREE) };
 +
 +    s.used_pages -= 1;
-+    if s.used_pages == 0 {
-+        unsafe { free_segment(seg) };
++    if s.used_pages > 0 {
++        // Segment still alive: drop just this page's physical memory; the virtual
++        // range stays mapped for reuse. For the header-bearing page (0) start
++        // past the header, never advising it.
++        let seg_addr = (seg as *mut u8).addr();
++        let page_size = 1usize << kind.shift();
++        let (madv_addr, madv_len) = if i == 0 {
++            let start = round_up(seg_addr + HEADER_SIZE, OS_PAGE);
++            (start, (seg_addr + page_size) - start)
++        } else {
++            (seg_addr + i * page_size, page_size)
++        };
++        unsafe { os_madvise(madv_addr, madv_len, sysc::MADV_FREE) };
++    } else {
++        // Whole segment empty: cache it (kept committed for fast reuse) or, past
++        // the cache cap, return it to the OS.
++        unsafe { release_segment(seg) };
 +    }
 +}
 +
-+/// Unlink a fully-empty segment from its heap and return it to the OS.
++/// Unlink a fully-empty segment from its heap; keep it in the per-kind empty
++/// cache (committed, for immediate reuse) up to the cap, else `munmap` it.
 +#[cold]
-+unsafe fn free_segment(seg: *mut Segment) {
++unsafe fn release_segment(seg: *mut Segment) {
 +    let s = unsafe { &mut *seg };
 +    let owner = s.owner.load(Ordering::Relaxed);
 +    if !owner.is_null() {
 +        let heap = unsafe { &mut *owner };
-+        if heap.segments == seg {
-+            heap.segments = s.next;
++        let ki = Kind::from_u8(s.kind).idx();
++        if heap.segments[ki] == seg {
++            heap.segments[ki] = s.next;
 +        }
 +        if !s.prev.is_null() {
 +            unsafe { (*s.prev).next = s.next };
 +        }
 +        if !s.next.is_null() {
 +            unsafe { (*s.next).prev = s.prev };
++        }
++        if heap.free_count[ki] < FREE_SEG_CAP[ki] {
++            // Cache for reuse. Owner stays set; no other thread can reference a
++            // fully-empty segment, so this is safe until thread exit / reuse.
++            s.prev = ptr::null_mut();
++            s.next = heap.free_segs[ki];
++            heap.free_segs[ki] = seg;
++            heap.free_count[ki] += 1;
++            return;
 +        }
 +    }
 +    unsafe { os_munmap((seg as *mut u8).addr(), SEGMENT_SIZE) };
@@ -3092,7 +3406,7 @@ index 00000000..887454d8
 +// --- huge (dedicated mmap) path ------------------------------------------
 +
 +/// Length of the dedicated mapping backing a huge/over-aligned allocation of
-+/// `layout`. Recomputable from the `Layout` alone, so free needs no header.
++/// `size`. Recomputable from the `Layout` alone, so free needs no header.
 +#[inline]
 +fn huge_len(size: usize) -> usize {
 +    round_up(size.max(1), OS_PAGE)
@@ -3102,7 +3416,6 @@ index 00000000..887454d8
 +unsafe fn alloc_huge(size: usize, align: usize) -> *mut u8 {
 +    let len = huge_len(size);
 +    if align <= OS_PAGE {
-+        // mmap is already page-aligned, which covers any align up to a page.
 +        os_mmap(len)
 +    } else {
 +        // Over-map and trim to an `align`-aligned region of exactly `len`.
@@ -3132,37 +3445,28 @@ index 00000000..887454d8
 +
 +// --- public entry points (called by the GlobalAlloc impl) -----------------
 +
-+/// Route by `Layout`: small page-served, or huge/over-aligned dedicated mmap.
-+#[inline]
-+fn need_of(size: usize, align: usize) -> usize {
-+    round_up(size.max(1), align.max(1))
-+}
-+
 +#[inline]
 +pub unsafe fn alloc(size: usize, align: usize) -> *mut u8 {
-+    if align <= 16 {
-+        let need = need_of(size, align);
-+        if need <= MAX_SMALL {
-+            return unsafe { alloc_small(class_of(need)) };
-+        }
++    match route(size, align) {
++        Route::Paged(kind, class) => unsafe { alloc_paged(kind, class) },
++        Route::Huge => unsafe { alloc_huge(size, align) },
 +    }
-+    unsafe { alloc_huge(size, align) }
 +}
 +
 +#[inline]
 +pub unsafe fn alloc_zeroed(size: usize, align: usize) -> *mut u8 {
-+    if align <= 16 {
-+        let need = need_of(size, align);
-+        if need <= MAX_SMALL {
-+            let p = unsafe { alloc_small(class_of(need)) };
++    match route(size, align) {
++        Route::Paged(kind, class) => {
++            // Paged memory may be reused/`MADV_FREE`d and is not guaranteed zero.
++            let p = unsafe { alloc_paged(kind, class) };
 +            if !p.is_null() {
 +                unsafe { ptr::write_bytes(p, 0, size) };
 +            }
-+            return p;
++            p
 +        }
++        // The huge path is a fresh mmap, already zero.
++        Route::Huge => unsafe { alloc_huge(size, align) },
 +    }
-+    // Huge path is a fresh mmap, already zero.
-+    unsafe { alloc_huge(size, align) }
 +}
 +
 +#[inline]
@@ -3170,20 +3474,19 @@ index 00000000..887454d8
 +    if ptr.is_null() {
 +        return;
 +    }
-+    if align <= 16 && need_of(size, align) <= MAX_SMALL {
-+        unsafe { free_small(ptr) };
-+    } else {
-+        unsafe { free_huge(ptr, size) };
++    match route(size, align) {
++        Route::Paged(..) => unsafe { free_paged(ptr) },
++        Route::Huge => unsafe { free_huge(ptr, size) },
 +    }
 +}
 +
 +#[inline]
 +pub unsafe fn realloc(ptr: *mut u8, old_size: usize, align: usize, new_size: usize) -> *mut u8 {
-+    // In-place when old and new map to the same small size class.
-+    if align <= 16 {
-+        let on = need_of(old_size, align);
-+        let nn = need_of(new_size, align);
-+        if on <= MAX_SMALL && nn <= MAX_SMALL && class_of(on) == class_of(nn) {
++    // In-place when old and new map to the same paged class.
++    if let (Route::Paged(_, co), Route::Paged(_, cn)) =
++        (route(old_size, align), route(new_size, align))
++    {
++        if co == cn {
 +            return ptr;
 +        }
 +    }
@@ -3201,60 +3504,85 @@ index 00000000..887454d8
 +/// frees, return fully-empty segments to the OS, and abandon the rest for other
 +/// threads to reclaim. The `Heap` struct itself is then unmapped.
 +pub unsafe fn thread_exit() {
++    // Reclaim segments abandoned by earlier-exited threads that have since been
++    // emptied by cross-thread frees. Done unconditionally (even for a thread that
++    // never allocated but freed others' blocks) so abandoned retention is bounded
++    // by any thread exit, not only exits of threads that allocated.
++    for ki in 0..NUM_KINDS {
++        unsafe { scavenge_abandoned(Kind::from_u8(ki as u8)) };
++    }
++
 +    let h = tls::heap() as *mut Heap;
 +    if h.is_null() {
 +        return;
 +    }
 +    let heap = unsafe { &mut *h };
 +
-+    let mut seg = heap.segments;
-+    while !seg.is_null() {
-+        let s = unsafe { &mut *seg };
-+        let next = s.next;
++    for ki in 0..NUM_KINDS {
++        let kind = Kind::from_u8(ki as u8);
++        let first = kind.first_page();
++        let per = kind.pages();
++        let mut seg = heap.segments[ki];
++        while !seg.is_null() {
++            let s = unsafe { &mut *seg };
++            let next = s.next;
 +
-+        // Recount live pages after folding in cross-thread frees.
-+        let mut live = 0u32;
-+        let mut i = 1;
-+        while i < PAGES_PER_SEGMENT {
-+            let pg = &mut s.pages[i];
-+            if pg.block_size != 0 {
-+                let tf = pg.thread_free.swap(ptr::null_mut(), Ordering::Acquire);
-+                if !tf.is_null() {
-+                    let mut n: u32 = 0;
-+                    let mut node = tf;
-+                    let mut last = tf;
-+                    while !node.is_null() {
-+                        n += 1;
-+                        last = node;
-+                        node = unsafe { (*node).next };
++            // Recount live pages after folding in cross-thread frees.
++            let mut live = 0u32;
++            let mut i = first;
++            while i < per {
++                let pg = &mut s.pages[i];
++                if pg.block_size != 0 {
++                    let tf = pg.thread_free.swap(ptr::null_mut(), Ordering::Acquire);
++                    if !tf.is_null() {
++                        let mut n: u32 = 0;
++                        let mut node = tf;
++                        let mut last = tf;
++                        while !node.is_null() {
++                            n += 1;
++                            last = node;
++                            node = unsafe { (*node).next };
++                        }
++                        pg.used -= n;
++                        unsafe { (*last).next = pg.free };
++                        pg.free = tf;
 +                    }
-+                    pg.used -= n;
-+                    unsafe { (*last).next = pg.free };
-+                    pg.free = tf;
++                    if pg.used == 0 {
++                        pg.block_size = 0;
++                    } else {
++                        live += 1;
++                    }
 +                }
-+                if pg.used == 0 {
-+                    pg.block_size = 0;
-+                } else {
-+                    live += 1;
-+                }
++                i += 1;
 +            }
-+            i += 1;
-+        }
-+        s.used_pages = live;
++            s.used_pages = live;
 +
-+        if live == 0 {
-+            unsafe { os_munmap((seg as *mut u8).addr(), SEGMENT_SIZE) };
-+        } else {
-+            // Abandon: clear owner, push onto the global stack.
-+            s.owner.store(ptr::null_mut(), Ordering::Release);
-+            s.next = ptr::null_mut();
-+            s.prev = ptr::null_mut();
-+            lock_abandon();
-+            s.abandoned_next = ABANDONED.load(Ordering::Acquire);
-+            ABANDONED.store(seg, Ordering::Release);
-+            unlock_abandon();
++            if live == 0 {
++                unsafe { os_munmap((seg as *mut u8).addr(), SEGMENT_SIZE) };
++            } else {
++                // Abandon: clear owner, push onto the global per-kind stack.
++                s.owner.store(ptr::null_mut(), Ordering::Release);
++                s.next = ptr::null_mut();
++                s.prev = ptr::null_mut();
++                lock_abandon();
++                s.abandoned_next = ABANDONED[ki].load(Ordering::Acquire);
++                ABANDONED[ki].store(seg, Ordering::Release);
++                unlock_abandon();
++            }
++            seg = next;
 +        }
-+        seg = next;
++        heap.segments[ki] = ptr::null_mut();
++
++        // Return the empty-segment cache to the OS (thread-private, so no other
++        // thread can hold a pointer into these).
++        let mut c = heap.free_segs[ki];
++        while !c.is_null() {
++            let next = unsafe { (*c).next };
++            unsafe { os_munmap((c as *mut u8).addr(), SEGMENT_SIZE) };
++            c = next;
++        }
++        heap.free_segs[ki] = ptr::null_mut();
++        heap.free_count[ki] = 0;
 +    }
 +
 +    // Free the Heap struct and clear the TLS slot.

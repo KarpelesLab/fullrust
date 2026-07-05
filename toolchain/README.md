@@ -160,11 +160,23 @@ allowlist), `cc_detect.rs` (probe via the gnu triple), `compile.rs`
 dispatchers, `fullrust` branches in the `sys/{fs,net,process,env,path,io}` +
 `sys/sync/*` + `thread_local` guards, and a real fd-backed `pal::pipe`.
 
+The allocator now has **three paged tiers** plus a huge fallback: small (≤8 KiB,
+64 KiB pages), **medium** (8–128 KiB, 512 KiB pages) and **large** (128–512 KiB,
+whole-4 MiB page), all reusing the same sharded free-list / cross-thread / reclaim
+machinery parameterized by segment *kind*, with a committed empty-segment cache
+(≈14–24 ns/op alloc+free churn vs ~5 µs for the old per-op `mmap`). **Over-aligned**
+requests (`align > 16`) route to power-of-two classes; only `>512 KiB` or
+un-fittable over-alignment take a dedicated `mmap`. Free stays header-free (masks
+to the segment and reads its stored kind). A thread-exit scavenge folds and unmaps
+abandoned segments emptied by cross-thread frees. Design chosen and reviewed via
+multi-agent design panel + adversarial correctness review.
+
 ### Known limitations (next steps)
-- **Allocator**: large (>8 KiB) and over-aligned allocations take a dedicated
-  `mmap` each (correct, but not cached); a medium/large segment tier and finer
-  decommit hysteresis are future work. Abandoned segments are reclaimed on
-  demand; never-reclaimed ones stay mapped (bounded, mimalloc-style).
+- **Allocator**: `>512 KiB` and un-fittable over-aligned allocations still take a
+  dedicated `mmap` each (a cached-mmap magazine for that band is future work).
+  Abandoned segments are reclaimed on demand or at any thread exit; a segment of a
+  kind that is never re-allocated *and* with no further thread exits can linger
+  (bounded, mimalloc-style).
 - **Diagnostics**: `panic = abort` with no unwinder, so panic backtraces are
   unavailable, and there is no `SIGSEGV` guard-page handler — a thread stack
   overflow is a bare segfault rather than the "stack overflow" message.
