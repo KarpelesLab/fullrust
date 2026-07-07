@@ -165,18 +165,23 @@ The allocator now has **three paged tiers** plus a huge fallback: small (≤8 Ki
 whole-4 MiB page), all reusing the same sharded free-list / cross-thread / reclaim
 machinery parameterized by segment *kind*, with a committed empty-segment cache
 (≈14–24 ns/op alloc+free churn vs ~5 µs for the old per-op `mmap`). **Over-aligned**
-requests (`align > 16`) route to power-of-two classes; only `>512 KiB` or
-un-fittable over-alignment take a dedicated `mmap`. Free stays header-free (masks
-to the segment and reads its stored kind). A thread-exit scavenge folds and unmaps
-abandoned segments emptied by cross-thread frees. Design chosen and reviewed via
-multi-agent design panel + adversarial correctness review.
+requests (`align > 16`) route to power-of-two classes. Free stays header-free
+(masks to the segment and reads its stored kind). A thread-exit scavenge folds and
+unmaps abandoned segments emptied by cross-thread frees. **Huge** allocations
+(`>512 KiB`, page-aligned) go through a per-thread reuse cache: on free the mapping
+is `MADV_DONTNEED`'d (so it holds no RSS yet re-faults as zero, keeping
+`alloc_zeroed` correct) and parked by page-length for reuse, so repeated
+large-buffer churn avoids the `mmap`/`munmap` pair (and its `mmap_lock` /
+TLB-shootdown cost) — only over-aligned or un-cacheable huge requests hit the OS
+each time. Design chosen and reviewed via multi-agent design panel + adversarial
+correctness review.
 
 ### Known limitations (next steps)
-- **Allocator**: `>512 KiB` and un-fittable over-aligned allocations still take a
-  dedicated `mmap` each (a cached-mmap magazine for that band is future work).
-  Abandoned segments are reclaimed on demand or at any thread exit; a segment of a
-  kind that is never re-allocated *and* with no further thread exits can linger
-  (bounded, mimalloc-style).
+- **Allocator**: the per-thread huge cache is not shared across threads, so a
+  producer/consumer huge pattern (alloc on A, free on B) reuses less than
+  same-thread churn. Abandoned segments are reclaimed on demand or at any thread
+  exit; a segment of a kind that is never re-allocated *and* with no further thread
+  exits can linger (bounded, mimalloc-style).
 **Diagnostics.** Despite `panic = abort` and no unwinder, panic **backtraces**
 work: a frame-pointer stack walker (`backtrace/src/backtrace/frameptr.rs`, the
 target forces `frame_pointer: Always`; `_start` and the thread trampoline zero

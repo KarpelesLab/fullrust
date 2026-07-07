@@ -2452,10 +2452,10 @@ index 00000000..47cf7101
 +}
 diff --git a/library/std/src/sys/pal/fullrust/heap.rs b/library/std/src/sys/pal/fullrust/heap.rs
 new file mode 100644
-index 00000000..7e3728ca
+index 00000000..a3d33c2c
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/heap.rs
-@@ -0,0 +1,1143 @@
+@@ -0,0 +1,1230 @@
 +//! A mimalloc-class global allocator for the fullrust target.
 +//!
 +//! The design follows mimalloc's "free-list sharding" model, adapted to a
@@ -2478,7 +2478,9 @@ index 00000000..7e3728ca
 +//!     stored in the header) is recovered from any block pointer by masking — so
 +//!     there is **no per-allocation header** and free routes with no size lookup.
 +//!     Objects above 512 KiB, or over-aligned requests that don't fit a tier,
-+//!     take a dedicated page-rounded `mmap`.
++//!     take a dedicated page-rounded `mmap`; page-aligned huge mappings are kept
++//!     in a small per-thread reuse cache (`MADV_DONTNEED`'d, so they hold no RSS
++//!     yet re-fault as zero) so repeated large-buffer churn avoids syscalls.
 +//!
 +//!   * **Sharded free lists.** A page has a `free` list owned exclusively by the
 +//!     allocating thread (popped/pushed with no atomics) and an atomic
@@ -2841,7 +2843,20 @@ index 00000000..7e3728ca
 +    /// re-`mmap` its segment every cycle. Singly linked via `Segment::next`.
 +    free_segs: [*mut Segment; NUM_KINDS],
 +    free_count: [u32; NUM_KINDS],
++    /// A small cache of freed huge (`> LARGE_MAX`, page-aligned) mappings, kept
++    /// for reuse so repeated large-buffer churn avoids an `mmap`/`munmap` pair
++    /// each cycle. Each entry is `(base_addr, len)`; `len == 0` marks a free
++    /// slot. Cached mappings are `MADV_DONTNEED`'d, so they hold no RSS and
++    /// re-fault as zero (keeping `alloc_zeroed` correct).
++    huge_cache: [(usize, usize); HUGE_CACHE_N],
++    /// Total bytes currently parked in `huge_cache` (bounds retention).
++    huge_bytes: usize,
 +}
++
++/// Number of cached huge mappings retained per thread.
++const HUGE_CACHE_N: usize = 16;
++/// Cap on total virtual bytes parked in a thread's huge cache.
++const HUGE_VA_MAX: usize = 32 << 20; // 32 MiB
 +
 +/// Empty-segment cache depth per kind. Small keeps its historical immediate-
 +/// `munmap` behavior (0); medium/large retain a couple for churn. The bound is
@@ -3413,7 +3428,7 @@ index 00000000..7e3728ca
 +    unsafe { os_munmap((seg as *mut u8).addr(), SEGMENT_SIZE) };
 +}
 +
-+// --- huge (dedicated mmap) path ------------------------------------------
++// --- huge (dedicated mmap, with a per-thread reuse cache) -----------------
 +
 +/// Length of the dedicated mapping backing a huge/over-aligned allocation of
 +/// `size`. Recomputable from the `Layout` alone, so free needs no header.
@@ -3422,10 +3437,64 @@ index 00000000..7e3728ca
 +    round_up(size.max(1), OS_PAGE)
 +}
 +
++/// Take a cached huge mapping of exactly `len` bytes, or null. Cached mappings
++/// are page-aligned (from `mmap`) and `MADV_DONTNEED`'d, so they satisfy any
++/// `align <= OS_PAGE` and re-fault as zero.
++#[inline]
++unsafe fn huge_cache_pop(h: *mut Heap, len: usize) -> *mut u8 {
++    let heap = unsafe { &mut *h };
++    let mut i = 0;
++    while i < HUGE_CACHE_N {
++        if heap.huge_cache[i].1 == len {
++            let addr = heap.huge_cache[i].0;
++            heap.huge_cache[i] = (0, 0);
++            heap.huge_bytes -= len;
++            return ptr::with_exposed_provenance_mut(addr);
++        }
++        i += 1;
++    }
++    ptr::null_mut()
++}
++
++/// Park a page-aligned huge mapping for reuse. Returns `true` if cached (the
++/// caller must not `munmap` it); `false` if the cache is full or over budget.
++#[inline]
++unsafe fn huge_cache_push(h: *mut Heap, ptr: *mut u8, len: usize) -> bool {
++    let heap = unsafe { &mut *h };
++    if heap.huge_bytes + len > HUGE_VA_MAX {
++        return false;
++    }
++    let mut i = 0;
++    while i < HUGE_CACHE_N {
++        if heap.huge_cache[i].1 == 0 {
++            // Drop the physical pages (RSS) but keep the VA; the mapping will
++            // re-fault as zero on reuse. If the advice fails, don't cache.
++            if sysc::ret(unsafe { sysc::syscall3(sysc::MADVISE, ptr.addr(), len, sysc::MADV_DONTNEED) })
++                .is_err()
++            {
++                return false;
++            }
++            heap.huge_cache[i] = (ptr.addr(), len);
++            heap.huge_bytes += len;
++            return true;
++        }
++        i += 1;
++    }
++    false
++}
++
 +#[inline]
 +unsafe fn alloc_huge(size: usize, align: usize) -> *mut u8 {
 +    let len = huge_len(size);
 +    if align <= OS_PAGE {
++        // Reuse a cached mapping of this exact length before touching the OS.
++        let h = heap();
++        if !h.is_null() {
++            let p = unsafe { huge_cache_pop(h, len) };
++            if !p.is_null() {
++                return p;
++            }
++        }
 +        os_mmap(len)
 +    } else {
 +        // Over-map and trim to an `align`-aligned region of exactly `len`.
@@ -3449,8 +3518,17 @@ index 00000000..7e3728ca
 +}
 +
 +#[inline]
-+unsafe fn free_huge(ptr: *mut u8, size: usize) {
-+    unsafe { os_munmap(ptr.addr(), huge_len(size)) };
++unsafe fn free_huge(ptr: *mut u8, size: usize, align: usize) {
++    let len = huge_len(size);
++    // Only page-aligned mappings are fungible enough to cache; over-aligned ones
++    // (trimmed to a specific base) go straight back to the OS.
++    if align <= OS_PAGE {
++        let h = heap();
++        if !h.is_null() && unsafe { huge_cache_push(h, ptr, len) } {
++            return;
++        }
++    }
++    unsafe { os_munmap(ptr.addr(), len) };
 +}
 +
 +// --- public entry points (called by the GlobalAlloc impl) -----------------
@@ -3486,19 +3564,18 @@ index 00000000..7e3728ca
 +    }
 +    match route(size, align) {
 +        Route::Paged(..) => unsafe { free_paged(ptr) },
-+        Route::Huge => unsafe { free_huge(ptr, size) },
++        Route::Huge => unsafe { free_huge(ptr, size, align) },
 +    }
 +}
 +
 +#[inline]
 +pub unsafe fn realloc(ptr: *mut u8, old_size: usize, align: usize, new_size: usize) -> *mut u8 {
-+    // In-place when old and new map to the same paged class.
-+    if let (Route::Paged(_, co), Route::Paged(_, cn)) =
-+        (route(old_size, align), route(new_size, align))
-+    {
-+        if co == cn {
-+            return ptr;
-+        }
++    // In-place when old and new map to the same paged class, or to a huge
++    // mapping of the same page-rounded length.
++    match (route(old_size, align), route(new_size, align)) {
++        (Route::Paged(_, co), Route::Paged(_, cn)) if co == cn => return ptr,
++        (Route::Huge, Route::Huge) if huge_len(old_size) == huge_len(new_size) => return ptr,
++        _ => {}
 +    }
 +    let new = unsafe { alloc(new_size, align) };
 +    if new.is_null() {
@@ -3594,6 +3671,16 @@ index 00000000..7e3728ca
 +        heap.free_segs[ki] = ptr::null_mut();
 +        heap.free_count[ki] = 0;
 +    }
++
++    // Return the cached huge mappings to the OS (thread-private).
++    for i in 0..HUGE_CACHE_N {
++        let (addr, len) = heap.huge_cache[i];
++        if len != 0 {
++            unsafe { os_munmap(addr, len) };
++            heap.huge_cache[i] = (0, 0);
++        }
++    }
++    heap.huge_bytes = 0;
 +
 +    // Free the Heap struct and clear the TLS slot.
 +    unsafe { os_munmap(h.addr(), round_up(core::mem::size_of::<Heap>(), OS_PAGE)) };

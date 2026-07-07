@@ -55,7 +55,9 @@ fn main() {
     // --- throughput first (clean heap): repeated alloc+free at medium/large
     //     sizes. Previously each iteration was an mmap+munmap syscall pair
     //     (~5 us); the committed empty-segment cache recycles in-segment. ---
-    for &(sz, label) in &[(65536usize, "64KiB (medium)"), (262144, "256KiB (large)")] {
+    for &(sz, label) in
+        &[(65536usize, "64KiB (medium)"), (262144, "256KiB (large)"), (1_048_576, "1MiB (huge)")]
+    {
         let layout = Layout::from_size_align(sz, 16).unwrap();
         let iters = 500_000u64;
         use std::hint::black_box;
@@ -249,6 +251,81 @@ fn main() {
         println!("     RSS before={before}KiB peak={peak}KiB after={after}KiB");
         check("large burst grows RSS", grew);
         check("freeing large burst releases RSS", released);
+    }
+
+    // --- huge tier (>512 KiB): per-thread reuse cache ---
+    // alloc_zeroed from a reused (MADV_DONTNEED'd) huge mapping must be zero.
+    unsafe {
+        let l = Layout::from_size_align(1_500_000, 16).unwrap(); // huge
+        let d = alloc(l);
+        for i in (0..1_500_000).step_by(4096) {
+            *d.add(i) = 0xFF;
+        }
+        dealloc(d, l); // cached
+        let z = alloc_zeroed(l); // likely the same mapping, must read back zero
+        let mut zeroed = true;
+        for i in (0..1_500_000).step_by(4096) {
+            if *z.add(i) != 0 {
+                zeroed = false;
+                break;
+            }
+        }
+        dealloc(z, l);
+        check("alloc_zeroed clears reused huge memory", zeroed);
+    }
+
+    // cross-thread huge free: allocate huge on producers, free on a collector.
+    {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let collector = thread::spawn(move || {
+            let mut n = 0u64;
+            while let Ok(v) = rx.recv() {
+                n += v[0] as u64 % 1 + 1; // touch
+                drop(v);
+            }
+            n
+        });
+        let mut hs = Vec::new();
+        for t in 0..3 {
+            let tx = tx.clone();
+            hs.push(thread::spawn(move || {
+                for k in 0..500 {
+                    let mut v = vec![0u8; 700_000 + (k % 3) * 4096]; // huge
+                    v[0] = t as u8;
+                    tx.send(v).unwrap();
+                }
+            }));
+        }
+        drop(tx);
+        for h in hs {
+            h.join().unwrap();
+        }
+        let n = collector.join().unwrap();
+        check("cross-thread huge free", n == 1500);
+    }
+
+    // RSS: MADV_DONTNEED on cache-in means freed huge mappings hold no RSS.
+    {
+        let before = rss_kib();
+        let layout = Layout::from_size_align(2_097_152, 16).unwrap(); // 2 MiB
+        let mut ps = Vec::new();
+        for _ in 0..40 {
+            let p = unsafe { alloc(layout) };
+            let mut off = 0;
+            while off < 2_097_152 {
+                unsafe { *p.add(off) = 1 };
+                off += 4096;
+            }
+            ps.push(p);
+        }
+        let peak = rss_kib();
+        for p in ps {
+            unsafe { dealloc(p, layout) };
+        }
+        let after = rss_kib();
+        println!("     huge RSS before={before}KiB peak={peak}KiB after={after}KiB");
+        check("huge burst grows RSS", peak > before + 40_000);
+        check("freeing huge cache releases RSS (MADV_DONTNEED)", after < before + 20_000);
     }
 
     let fails = unsafe { FAILS };
