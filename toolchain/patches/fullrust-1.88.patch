@@ -175,6 +175,239 @@ index ef695601..f4f4971b 100644
  
          // See src/bootstrap/src/core/build_steps/synthetic_targets.rs
          || env::var("RUSTC_BOOTSTRAP_SYNTHETIC_TARGET").is_ok()
+diff --git a/library/std/src/os/fd/owned.rs b/library/std/src/os/fd/owned.rs
+index 10e1e73a..f7a5b72d 100644
+--- a/library/std/src/os/fd/owned.rs
++++ b/library/std/src/os/fd/owned.rs
+@@ -12,7 +12,8 @@
+     target_arch = "wasm32",
+     target_env = "sgx",
+     target_os = "hermit",
+-    target_os = "trusty"
++    target_os = "trusty",
++    target_os = "fullrust"
+ )))]
+ use crate::sys::cvt;
+ #[cfg(not(target_os = "trusty"))]
+@@ -95,7 +96,12 @@ pub fn try_clone(&self) -> crate::io::Result<Self> {
+ impl BorrowedFd<'_> {
+     /// Creates a new `OwnedFd` instance that shares the same underlying file
+     /// description as the existing `BorrowedFd` instance.
+-    #[cfg(not(any(target_arch = "wasm32", target_os = "hermit", target_os = "trusty")))]
++    #[cfg(not(any(
++        target_arch = "wasm32",
++        target_os = "hermit",
++        target_os = "trusty",
++        target_os = "fullrust"
++    )))]
+     #[stable(feature = "io_safety", since = "1.63.0")]
+     pub fn try_clone_to_owned(&self) -> crate::io::Result<OwnedFd> {
+         // We want to atomically duplicate this file descriptor and set the
+@@ -116,6 +122,18 @@ pub fn try_clone_to_owned(&self) -> crate::io::Result<OwnedFd> {
+         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+     }
+ 
++    /// Creates a new `OwnedFd` instance that shares the same underlying file
++    /// description as the existing `BorrowedFd` instance.
++    ///
++    /// `fullrust` has no libc, so this issues the `F_DUPFD_CLOEXEC` `fcntl`
++    /// directly (avoiding fds 0-2, as the generic path does).
++    #[cfg(target_os = "fullrust")]
++    #[stable(feature = "io_safety", since = "1.63.0")]
++    pub fn try_clone_to_owned(&self) -> crate::io::Result<OwnedFd> {
++        let fd = crate::sys::fcntl_dupfd_cloexec(self.as_raw_fd(), 3)?;
++        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
++    }
++
+     /// Creates a new `OwnedFd` instance that shares the same underlying file
+     /// description as the existing `BorrowedFd` instance.
+     #[cfg(any(target_arch = "wasm32", target_os = "hermit", target_os = "trusty"))]
+@@ -182,7 +200,7 @@ fn drop(&mut self) {
+             // not-POSIX-compliant implementation, the consequences could be really bad since we may
+             // close the wrong FD. Helpful link to an epic discussion by POSIX workgroup that led to
+             // the latest POSIX wording: http://austingroupbugs.net/view.php?id=529
+-            #[cfg(not(target_os = "hermit"))]
++            #[cfg(not(any(target_os = "hermit", target_os = "fullrust")))]
+             {
+                 #[cfg(unix)]
+                 crate::sys::fs::debug_assert_fd_is_open(self.fd.as_inner());
+@@ -191,6 +209,10 @@ fn drop(&mut self) {
+             }
+             #[cfg(target_os = "hermit")]
+             let _ = hermit_abi::close(self.fd.as_inner());
++            #[cfg(target_os = "fullrust")]
++            // fullrust has no libc; close via the raw syscall. Errors are
++            // ignored here for the same reasons as every other platform.
++            crate::sys::close_raw(self.as_raw_fd());
+         }
+     }
+ }
+diff --git a/library/std/src/os/fd/raw.rs b/library/std/src/os/fd/raw.rs
+index 34a6cf1a..3f76f68a 100644
+--- a/library/std/src/os/fd/raw.rs
++++ b/library/std/src/os/fd/raw.rs
+@@ -5,6 +5,17 @@
+ #[cfg(target_os = "hermit")]
+ use hermit_abi as libc;
+ 
++// `fullrust` has no libc; the stdio `AsRawFd` impls below reach for
++// `libc::{STDIN,STDOUT,STDERR}_FILENO`, so provide those three constants under
++// the same name. (Everything else fullrust needs comes from `os::fullrust::io`.)
++#[cfg(target_os = "fullrust")]
++mod libc {
++    use super::RawFd;
++    pub const STDIN_FILENO: RawFd = 0;
++    pub const STDOUT_FILENO: RawFd = 1;
++    pub const STDERR_FILENO: RawFd = 2;
++}
++
+ #[cfg(not(target_os = "trusty"))]
+ use crate::fs;
+ use crate::io;
+@@ -18,6 +29,8 @@
+ use crate::os::unix::io::OwnedFd;
+ #[cfg(target_os = "wasi")]
+ use crate::os::wasi::io::OwnedFd;
++#[cfg(target_os = "fullrust")]
++use crate::os::fullrust::io::OwnedFd;
+ #[cfg(not(target_os = "trusty"))]
+ use crate::sys_common::{AsInner, FromInner, IntoInner};
+ 
+diff --git a/library/std/src/os/fullrust/ffi.rs b/library/std/src/os/fullrust/ffi.rs
+new file mode 100644
+index 00000000..50f715c8
+--- /dev/null
++++ b/library/std/src/os/fullrust/ffi.rs
+@@ -0,0 +1,46 @@
++//! `fullrust`-specific extensions to primitives in the [`std::ffi`] module.
++//!
++//! `fullrust` uses the same byte-oriented `OsStr`/`OsString` representation as
++//! Unix, so these extension traits are the Unix ones.
++//!
++//! # Examples
++//!
++//! ```
++//! use std::ffi::OsString;
++//! use std::os::fullrust::ffi::OsStringExt;
++//!
++//! let bytes = b"foo".to_vec();
++//!
++//! // OsStringExt::from_vec
++//! let os_string = OsString::from_vec(bytes);
++//! assert_eq!(os_string.to_str(), Some("foo"));
++//!
++//! // OsStringExt::into_vec
++//! let bytes = os_string.into_vec();
++//! assert_eq!(bytes, b"foo");
++//! ```
++//!
++//! ```
++//! use std::ffi::OsStr;
++//! use std::os::fullrust::ffi::OsStrExt;
++//!
++//! let bytes = b"foo";
++//!
++//! // OsStrExt::from_bytes
++//! let os_str = OsStr::from_bytes(bytes);
++//! assert_eq!(os_str.to_str(), Some("foo"));
++//!
++//! // OsStrExt::as_bytes
++//! let bytes = os_str.as_bytes();
++//! assert_eq!(bytes, b"foo");
++//! ```
++//!
++//! [`std::ffi`]: crate::ffi
++
++#![stable(feature = "rust1", since = "1.0.0")]
++
++#[path = "../unix/ffi/os_str.rs"]
++mod os_str;
++
++#[stable(feature = "rust1", since = "1.0.0")]
++pub use self::os_str::{OsStrExt, OsStringExt};
+diff --git a/library/std/src/os/fullrust/io/mod.rs b/library/std/src/os/fullrust/io/mod.rs
+new file mode 100644
+index 00000000..206a907a
+--- /dev/null
++++ b/library/std/src/os/fullrust/io/mod.rs
+@@ -0,0 +1,14 @@
++//! `fullrust`-specific extensions to general I/O primitives.
++//!
++//! This is just a re-export of the shared, OS-agnostic [`std::os::fd`] surface
++//! (`RawFd`, `AsRawFd`, `OwnedFd`, `BorrowedFd`, `AsFd`, …). `fullrust` backs
++//! every fd-owning std type (`File`, `TcpStream`, `PipeReader`, …) with an
++//! [`OwnedFd`], so all of these traits work exactly as they do on `unix`.
++//!
++//! [`std::os::fd`]: crate::os::fd
++//! [`OwnedFd`]: crate::os::fd::OwnedFd
++
++#![stable(feature = "rust1", since = "1.0.0")]
++
++#[stable(feature = "rust1", since = "1.0.0")]
++pub use crate::os::fd::*;
+diff --git a/library/std/src/os/fullrust/mod.rs b/library/std/src/os/fullrust/mod.rs
+new file mode 100644
+index 00000000..a9e0247d
+--- /dev/null
++++ b/library/std/src/os/fullrust/mod.rs
+@@ -0,0 +1,28 @@
++//! Platform-specific extensions to `std` for the `fullrust` target.
++//!
++//! `fullrust` is a libc-free, fully static Linux-ABI target that is
++//! deliberately *not* a member of the `unix` target family (so `cfg(unix)` is
++//! false and std selects its own raw-syscall platform layer). It nonetheless
++//! speaks the ordinary Unix file-descriptor ABI, so — exactly like the other
++//! non-unix fd targets (`hermit`, `wasi`) — it re-exports [`std::os::fd`] here
++//! under `std::os::fullrust::io`, giving crates the usual
++//! `AsFd`/`AsRawFd`/`OwnedFd` interop without pulling in the `unix` module.
++//!
++//! [`std::os::fd`]: crate::os::fd
++
++#![stable(feature = "rust1", since = "1.0.0")]
++#![deny(unsafe_op_in_unsafe_fn)]
++
++pub mod ffi;
++pub mod io;
++
++/// A prelude for conveniently writing platform-specific code.
++#[stable(feature = "rust1", since = "1.0.0")]
++pub mod prelude {
++    #[doc(no_inline)]
++    #[stable(feature = "rust1", since = "1.0.0")]
++    pub use super::ffi::{OsStrExt, OsStringExt};
++    #[doc(no_inline)]
++    #[stable(feature = "rust1", since = "1.0.0")]
++    pub use super::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
++}
+diff --git a/library/std/src/os/mod.rs b/library/std/src/os/mod.rs
+index ab7734a7..22c9140b 100644
+--- a/library/std/src/os/mod.rs
++++ b/library/std/src/os/mod.rs
+@@ -139,6 +139,8 @@ pub mod windows {}
+ pub mod freebsd;
+ #[cfg(target_os = "fuchsia")]
+ pub mod fuchsia;
++#[cfg(target_os = "fullrust")]
++pub mod fullrust;
+ #[cfg(target_os = "haiku")]
+ pub mod haiku;
+ #[cfg(target_os = "hermit")]
+@@ -182,7 +184,14 @@ pub mod windows {}
+ #[cfg(target_os = "xous")]
+ pub mod xous;
+ 
+-#[cfg(any(unix, target_os = "hermit", target_os = "trusty", target_os = "wasi", doc))]
++#[cfg(any(
++    unix,
++    target_os = "hermit",
++    target_os = "trusty",
++    target_os = "wasi",
++    target_os = "fullrust",
++    doc
++))]
+ pub mod fd;
+ 
+ #[cfg(any(target_os = "linux", target_os = "android", doc))]
 diff --git a/library/std/src/sys/alloc/fullrust.rs b/library/std/src/sys/alloc/fullrust.rs
 new file mode 100644
 index 00000000..758984ca
@@ -229,6 +462,41 @@ index 8489e17c..e9e1fe23 100644
          target_family = "unix",
          target_os = "wasi",
          target_os = "teeos",
+diff --git a/library/std/src/sys/anonymous_pipe/fullrust.rs b/library/std/src/sys/anonymous_pipe/fullrust.rs
+new file mode 100644
+index 00000000..2ae982e4
+--- /dev/null
++++ b/library/std/src/sys/anonymous_pipe/fullrust.rs
+@@ -0,0 +1,15 @@
++use crate::io;
++use crate::sys::pal::fd::FileDesc;
++use crate::sys::pipe::pipe as pal_pipe;
++use crate::sys_common::IntoInner;
++
++// A `std::io::pipe` end is just an owned fd. Backing it with `FileDesc` (which
++// wraps `OwnedFd`) gives `PipeReader`/`PipeWriter` the full `os::fd` interop —
++// `as_fd()`, `as_raw_fd()`, `From<OwnedFd>` — exactly as on unix.
++pub type AnonPipe = FileDesc;
++
++#[inline]
++pub fn pipe() -> io::Result<(AnonPipe, AnonPipe)> {
++    // Reuse the pal's `pipe2(O_CLOEXEC)` and unwrap each end to its `FileDesc`.
++    pal_pipe().map(|(rx, wx)| (rx.into_inner(), wx.into_inner()))
++}
+diff --git a/library/std/src/sys/anonymous_pipe/mod.rs b/library/std/src/sys/anonymous_pipe/mod.rs
+index aa14c8b6..8f0b46f3 100644
+--- a/library/std/src/sys/anonymous_pipe/mod.rs
++++ b/library/std/src/sys/anonymous_pipe/mod.rs
+@@ -4,6 +4,9 @@
+     if #[cfg(unix)] {
+         mod unix;
+         pub use unix::{AnonPipe, pipe};
++    } else if #[cfg(target_os = "fullrust")] {
++        mod fullrust;
++        pub use fullrust::{AnonPipe, pipe};
+     } else if #[cfg(windows)] {
+         mod windows;
+         pub use windows::{AnonPipe, pipe};
 diff --git a/library/std/src/sys/args/fullrust.rs b/library/std/src/sys/args/fullrust.rs
 new file mode 100644
 index 00000000..9cd28fb5
@@ -415,10 +683,10 @@ index d81ff875..4b96582c 100644
          pub use windows::*;
 diff --git a/library/std/src/sys/fs/fullrust.rs b/library/std/src/sys/fs/fullrust.rs
 new file mode 100644
-index 00000000..486108cc
+index 00000000..cac05209
 --- /dev/null
 +++ b/library/std/src/sys/fs/fullrust.rs
-@@ -0,0 +1,746 @@
+@@ -0,0 +1,800 @@
 +//! Filesystem for the fullrust target, on raw Linux syscalls (no libc).
 +//!
 +//! `File` is a thin owner of a raw kernel fd. Metadata comes from `statx(2)`
@@ -434,12 +702,14 @@ index 00000000..486108cc
 +use crate::fmt;
 +use crate::fs::TryLockError;
 +use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut, SeekFrom};
++use crate::os::fullrust::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd};
 +use crate::path::{Path, PathBuf};
 +use crate::sync::Arc;
 +use crate::sys::pal::fd::{cvt, FileDesc};
 +use crate::sys::pal::os;
 +use crate::sys::pal::sysc;
 +use crate::sys::time::SystemTime;
++use crate::sys_common::{AsInner, FromInner, IntoInner};
 +
 +// `AT_FDCWD` as the raw kernel value (-100), passed in a register as `usize`.
 +const AT_FDCWD: usize = (-100isize) as usize;
@@ -655,6 +925,58 @@ index 00000000..486108cc
 +impl fmt::Debug for File {
 +    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 +        f.debug_struct("File").field("fd", &self.0.raw()).finish()
++    }
++}
++
++// `std::os::fd` interop: chain `File` → `FileDesc` → `OwnedFd` so `File`
++// exposes `as_fd()`/`as_raw_fd()` and round-trips through `OwnedFd`.
++impl AsInner<FileDesc> for File {
++    #[inline]
++    fn as_inner(&self) -> &FileDesc {
++        &self.0
++    }
++}
++
++impl IntoInner<FileDesc> for File {
++    #[inline]
++    fn into_inner(self) -> FileDesc {
++        self.0
++    }
++}
++
++impl FromInner<FileDesc> for File {
++    #[inline]
++    fn from_inner(file_desc: FileDesc) -> File {
++        File(file_desc)
++    }
++}
++
++impl AsFd for File {
++    #[inline]
++    fn as_fd(&self) -> BorrowedFd<'_> {
++        self.0.as_fd()
++    }
++}
++
++impl AsRawFd for File {
++    #[inline]
++    fn as_raw_fd(&self) -> RawFd {
++        self.0.as_raw_fd()
++    }
++}
++
++impl IntoRawFd for File {
++    #[inline]
++    fn into_raw_fd(self) -> RawFd {
++        self.0.into_raw_fd()
++    }
++}
++
++impl FromRawFd for File {
++    #[inline]
++    unsafe fn from_raw_fd(fd: RawFd) -> File {
++        // SAFETY: guaranteed by the caller of the (unsafe) `FromRawFd` trait.
++        File(unsafe { FromRawFd::from_raw_fd(fd) })
 +    }
 +}
 +
@@ -1202,10 +1524,10 @@ index df563589..b094f9ef 100644
  use crate::slice;
 diff --git a/library/std/src/sys/io/is_terminal/fullrust.rs b/library/std/src/sys/io/is_terminal/fullrust.rs
 new file mode 100644
-index 00000000..c5643d3f
+index 00000000..24e2e284
 --- /dev/null
 +++ b/library/std/src/sys/io/is_terminal/fullrust.rs
-@@ -0,0 +1,53 @@
+@@ -0,0 +1,68 @@
 +//! `is_terminal` for the fullrust target.
 +//!
 +//! There is no libc `isatty`, so we ask the kernel directly: `ioctl(fd, TCGETS)`
@@ -1215,6 +1537,7 @@ index 00000000..c5643d3f
 +
 +use crate::fs::File;
 +use crate::io::{Stderr, StderrLock, Stdin, StdinLock, Stdout, StdoutLock};
++use crate::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 +use crate::sys::pal::sysc;
 +use crate::sys_common::AsInner;
 +
@@ -1256,6 +1579,20 @@ index 00000000..c5643d3f
 +    }
 +}
 +
++// `os::fd` is enabled on this target, so its `IsTerminal for BorrowedFd/OwnedFd`
++// impls route here too.
++impl TerminalFd for BorrowedFd<'_> {
++    fn terminal_fd(&self) -> i32 {
++        self.as_raw_fd()
++    }
++}
++
++impl TerminalFd for OwnedFd {
++    fn terminal_fd(&self) -> i32 {
++        self.as_raw_fd()
++    }
++}
++
 +pub fn is_terminal<T: TerminalFd>(t: &T) -> bool {
 +    isatty(t.terminal_fd())
 +}
@@ -1284,10 +1621,10 @@ index 4d0365d4..23e41308 100644
              pub use unsupported::*;
 diff --git a/library/std/src/sys/net/connection/fullrust.rs b/library/std/src/sys/net/connection/fullrust.rs
 new file mode 100644
-index 00000000..ef638608
+index 00000000..10a646c7
 --- /dev/null
 +++ b/library/std/src/sys/net/connection/fullrust.rs
-@@ -0,0 +1,915 @@
+@@ -0,0 +1,1049 @@
 +//! TCP/UDP sockets and DNS for the fullrust target, on raw Linux syscalls.
 +//!
 +//! A single `Socket` (an owned [`FileDesc`]) backs `TcpStream`, `TcpListener`,
@@ -1300,8 +1637,10 @@ index 00000000..ef638608
 +
 +use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
 +use crate::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6};
++use crate::os::fullrust::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd};
 +use crate::sys::pal::fd::{cvt, FileDesc};
 +use crate::sys::pal::sysc;
++use crate::sys_common::{AsInner, FromInner, IntoInner};
 +use crate::time::Duration;
 +use crate::{fmt, mem};
 +
@@ -1688,6 +2027,60 @@ index 00000000..ef638608
 +    }
 +}
 +
++// `std::os::fd` interop: chain `Socket` → `FileDesc` → `OwnedFd`, matching the
++// unix `Socket`. The `net::{TcpStream,TcpListener,UdpSocket}` fd impls in
++// `os::fd::net` reach the fd through `sys::net::$t::socket().as_raw_fd()` and
++// these `FromInner`/`IntoInner` links.
++impl AsInner<FileDesc> for Socket {
++    #[inline]
++    fn as_inner(&self) -> &FileDesc {
++        &self.0
++    }
++}
++
++impl IntoInner<FileDesc> for Socket {
++    #[inline]
++    fn into_inner(self) -> FileDesc {
++        self.0
++    }
++}
++
++impl FromInner<FileDesc> for Socket {
++    #[inline]
++    fn from_inner(file_desc: FileDesc) -> Socket {
++        Socket(file_desc)
++    }
++}
++
++impl AsFd for Socket {
++    #[inline]
++    fn as_fd(&self) -> BorrowedFd<'_> {
++        self.0.as_fd()
++    }
++}
++
++impl AsRawFd for Socket {
++    #[inline]
++    fn as_raw_fd(&self) -> RawFd {
++        self.0.as_raw_fd()
++    }
++}
++
++impl IntoRawFd for Socket {
++    #[inline]
++    fn into_raw_fd(self) -> RawFd {
++        self.0.into_raw_fd()
++    }
++}
++
++impl FromRawFd for Socket {
++    #[inline]
++    unsafe fn from_raw_fd(fd: RawFd) -> Socket {
++        // SAFETY: guaranteed by the caller of the (unsafe) `FromRawFd` trait.
++        Socket(unsafe { FromRawFd::from_raw_fd(fd) })
++    }
++}
++
 +// ---------------------------------------------------------------------------
 +// TcpStream
 +// ---------------------------------------------------------------------------
@@ -1792,6 +2185,32 @@ index 00000000..ef638608
 +    }
 +}
 +
++impl TcpStream {
++    #[inline]
++    pub fn socket(&self) -> &Socket {
++        &self.inner
++    }
++
++    #[inline]
++    pub fn into_socket(self) -> Socket {
++        self.inner
++    }
++}
++
++impl AsInner<Socket> for TcpStream {
++    #[inline]
++    fn as_inner(&self) -> &Socket {
++        &self.inner
++    }
++}
++
++impl FromInner<Socket> for TcpStream {
++    #[inline]
++    fn from_inner(socket: Socket) -> TcpStream {
++        TcpStream { inner: socket }
++    }
++}
++
 +impl fmt::Debug for TcpStream {
 +    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 +        f.debug_struct("TcpStream").field("fd", &self.inner.0.raw()).finish()
@@ -1850,6 +2269,32 @@ index 00000000..ef638608
 +    }
 +    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
 +        self.inner.set_nonblocking(nonblocking)
++    }
++}
++
++impl TcpListener {
++    #[inline]
++    pub fn socket(&self) -> &Socket {
++        &self.inner
++    }
++
++    #[inline]
++    pub fn into_socket(self) -> Socket {
++        self.inner
++    }
++}
++
++impl AsInner<Socket> for TcpListener {
++    #[inline]
++    fn as_inner(&self) -> &Socket {
++        &self.inner
++    }
++}
++
++impl FromInner<Socket> for TcpListener {
++    #[inline]
++    fn from_inner(socket: Socket) -> TcpListener {
++        TcpListener { inner: socket }
 +    }
 +}
 +
@@ -1987,6 +2432,32 @@ index 00000000..ef638608
 +    }
 +    pub fn connect(&self, addr: io::Result<&SocketAddr>) -> io::Result<()> {
 +        self.inner.connect(addr?)
++    }
++}
++
++impl UdpSocket {
++    #[inline]
++    pub fn socket(&self) -> &Socket {
++        &self.inner
++    }
++
++    #[inline]
++    pub fn into_socket(self) -> Socket {
++        self.inner
++    }
++}
++
++impl AsInner<Socket> for UdpSocket {
++    #[inline]
++    fn as_inner(&self) -> &Socket {
++        &self.inner
++    }
++}
++
++impl FromInner<Socket> for UdpSocket {
++    #[inline]
++    fn from_inner(socket: Socket) -> UdpSocket {
++        UdpSocket { inner: socket }
 +    }
 +}
 +
@@ -2437,19 +2908,27 @@ index 00000000..0f4de215
 +}
 diff --git a/library/std/src/sys/pal/fullrust/fd.rs b/library/std/src/sys/pal/fullrust/fd.rs
 new file mode 100644
-index 00000000..b78ce1cc
+index 00000000..f13f7736
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/fd.rs
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,224 @@
 +//! An owned file descriptor and the operations common to everything backed by
 +//! one — `File`, `AnonPipe`, and the socket layer. Each of those wraps a
 +//! `FileDesc` instead of re-implementing read/write/vectored I/O, `dup`, and
 +//! close, so the raw-syscall plumbing lives in exactly one place.
++//!
++//! `FileDesc` is a thin wrapper over [`OwnedFd`]: ownership, the close-on-drop,
++//! and the fd-safety guarantees all come from `OwnedFd`, and the whole
++//! `std::os::fd` interop surface (`AsFd`, `AsRawFd`, `OwnedFd` round-tripping)
++//! is wired up here by implementing the same trait web the `unix`/`hermit`
++//! `FileDesc`s do. That is what lets `File`/`TcpStream`/`PipeReader`/… expose
++//! `as_fd()`/`as_raw_fd()` on the fullrust target.
 +
 +use super::sysc;
 +use crate::fmt;
 +use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
-+use crate::mem;
++use crate::os::fullrust::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
++use crate::sys_common::{AsInner, FromInner, IntoInner};
 +
 +// fcntl(2) commands / flags used here.
 +const F_GETFL: usize = 3;
@@ -2466,38 +2945,62 @@ index 00000000..b78ce1cc
 +    sysc::ret(r).map_err(io::Error::from_raw_os_error)
 +}
 +
-+/// A file descriptor that closes itself on drop.
-+pub struct FileDesc(i32);
++/// `fcntl(fd, F_DUPFD_CLOEXEC, min)`: duplicate `fd` onto the lowest free
++/// descriptor `>= min`, close-on-exec, returning the new raw fd. Shared by
++/// [`FileDesc::duplicate`] and `BorrowedFd::try_clone_to_owned`.
++pub(crate) fn fcntl_dupfd_cloexec(fd: i32, min: i32) -> io::Result<i32> {
++    let new =
++        cvt(unsafe { sysc::syscall3(sysc::FCNTL, fd as usize, F_DUPFD_CLOEXEC, min as usize) })?;
++    Ok(new as i32)
++}
++
++/// `close(fd)`, ignoring the result. This is where an [`OwnedFd`] is actually
++/// released (see its `Drop`), so it lives here next to the other fd syscalls.
++///
++/// # Safety
++///
++/// `fd` must be an owned descriptor that nothing else will use afterwards
++/// (exactly the `OwnedFd`-drop contract).
++pub(crate) unsafe fn close_raw(fd: i32) {
++    unsafe {
++        sysc::syscall1(sysc::CLOSE, fd as usize);
++    }
++}
++
++/// An owned file descriptor: a newtype over [`OwnedFd`] that adds the raw
++/// read/write/dup syscalls shared by every fd-backed std type.
++pub struct FileDesc(OwnedFd);
 +
 +impl FileDesc {
++    /// Take ownership of a raw descriptor. The fd must be open and owned by the
++    /// caller (it will be closed when the `FileDesc` is dropped).
 +    #[inline]
 +    pub fn from_raw(fd: i32) -> FileDesc {
-+        FileDesc(fd)
++        // SAFETY: every caller passes a freshly-obtained, owned descriptor.
++        unsafe { FileDesc(OwnedFd::from_raw_fd(fd)) }
 +    }
 +
 +    #[inline]
 +    pub fn raw(&self) -> i32 {
-+        self.0
++        self.0.as_raw_fd()
 +    }
 +
 +    /// Consume without closing, returning the raw descriptor.
 +    #[inline]
 +    pub fn into_raw(self) -> i32 {
-+        let fd = self.0;
-+        mem::forget(self);
-+        fd
++        self.0.into_raw_fd()
 +    }
 +
 +    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
 +        cvt(unsafe {
-+            sysc::syscall3(sysc::READ, self.0 as usize, buf.as_mut_ptr() as usize, buf.len())
++            sysc::syscall3(sysc::READ, self.raw() as usize, buf.as_mut_ptr() as usize, buf.len())
 +        })
 +    }
 +
 +    pub fn read_buf(&self, mut cursor: BorrowedCursor<'_>) -> io::Result<()> {
 +        let n = cvt(unsafe {
 +            let dst = cursor.as_mut().as_mut_ptr() as usize;
-+            sysc::syscall3(sysc::READ, self.0 as usize, dst, cursor.capacity())
++            sysc::syscall3(sysc::READ, self.raw() as usize, dst, cursor.capacity())
 +        })?;
 +        // SAFETY: the kernel initialized the first `n` bytes of the cursor.
 +        unsafe { cursor.advance_unchecked(n) };
@@ -2508,45 +3011,129 @@ index 00000000..b78ce1cc
 +        // `IoSliceMut` is `repr(transparent)` over `iovec`, so the slice is a
 +        // ready-made iovec array; cap the count at IOV_MAX.
 +        let n = bufs.len().min(IOV_MAX);
-+        cvt(unsafe { sysc::syscall3(sysc::READV, self.0 as usize, bufs.as_mut_ptr() as usize, n) })
++        cvt(unsafe {
++            sysc::syscall3(sysc::READV, self.raw() as usize, bufs.as_mut_ptr() as usize, n)
++        })
 +    }
 +
 +    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
 +        cvt(unsafe {
-+            sysc::syscall3(sysc::WRITE, self.0 as usize, buf.as_ptr() as usize, buf.len())
++            sysc::syscall3(sysc::WRITE, self.raw() as usize, buf.as_ptr() as usize, buf.len())
 +        })
 +    }
 +
 +    pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
 +        let n = bufs.len().min(IOV_MAX);
-+        cvt(unsafe { sysc::syscall3(sysc::WRITEV, self.0 as usize, bufs.as_ptr() as usize, n) })
++        cvt(unsafe { sysc::syscall3(sysc::WRITEV, self.raw() as usize, bufs.as_ptr() as usize, n) })
 +    }
 +
 +    /// Duplicate the descriptor, close-on-exec (`F_DUPFD_CLOEXEC`).
 +    pub fn duplicate(&self) -> io::Result<FileDesc> {
-+        let fd = cvt(unsafe { sysc::syscall3(sysc::FCNTL, self.0 as usize, F_DUPFD_CLOEXEC, 0) })?;
-+        Ok(FileDesc(fd as i32))
++        Ok(FileDesc::from_raw(fcntl_dupfd_cloexec(self.raw(), 0)?))
++    }
++
++    /// Alias of [`duplicate`](Self::duplicate); the name `io::Pipe*` expects.
++    #[inline]
++    pub fn try_clone(&self) -> io::Result<FileDesc> {
++        self.duplicate()
++    }
++
++    #[inline]
++    pub fn is_read_vectored(&self) -> bool {
++        true
++    }
++
++    #[inline]
++    pub fn is_write_vectored(&self) -> bool {
++        true
++    }
++
++    /// Read to EOF, appending into `buf`. Retries on `EINTR`.
++    pub fn read_to_end(&self, buf: &mut Vec<u8>) -> io::Result<usize> {
++        let mut total = 0;
++        let mut tmp = [0u8; 8192];
++        loop {
++            match self.read(&mut tmp) {
++                Ok(0) => break,
++                Ok(n) => {
++                    buf.extend_from_slice(&tmp[..n]);
++                    total += n;
++                }
++                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
++                Err(e) => return Err(e),
++            }
++        }
++        Ok(total)
 +    }
 +
 +    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
-+        let flags = cvt(unsafe { sysc::syscall3(sysc::FCNTL, self.0 as usize, F_GETFL, 0) })?;
++        let flags = cvt(unsafe { sysc::syscall3(sysc::FCNTL, self.raw() as usize, F_GETFL, 0) })?;
 +        let new = if nonblocking { flags | O_NONBLOCK } else { flags & !O_NONBLOCK };
-+        cvt(unsafe { sysc::syscall3(sysc::FCNTL, self.0 as usize, F_SETFL, new) })?;
++        cvt(unsafe { sysc::syscall3(sysc::FCNTL, self.raw() as usize, F_SETFL, new) })?;
 +        Ok(())
-+    }
-+}
-+
-+impl Drop for FileDesc {
-+    fn drop(&mut self) {
-+        unsafe {
-+            sysc::syscall1(sysc::CLOSE, self.0 as usize);
-+        }
 +    }
 +}
 +
 +impl fmt::Debug for FileDesc {
 +    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-+        f.debug_struct("FileDesc").field("fd", &self.0).finish()
++        f.debug_struct("FileDesc").field("fd", &self.raw()).finish()
++    }
++}
++
++// --- `std::os::fd` interop -------------------------------------------------
++//
++// The owning fd type is `OwnedFd`; these impls chain `FileDesc` into the shared
++// `os::fd` machinery exactly as `sys/fd/unix.rs` and `sys/fd/hermit.rs` do, so
++// `File`/`Socket`/`AnonPipe` (which each wrap a `FileDesc`) get the full
++// `AsFd`/`AsRawFd`/`OwnedFd` surface for free.
++
++impl AsInner<OwnedFd> for FileDesc {
++    #[inline]
++    fn as_inner(&self) -> &OwnedFd {
++        &self.0
++    }
++}
++
++impl IntoInner<OwnedFd> for FileDesc {
++    #[inline]
++    fn into_inner(self) -> OwnedFd {
++        self.0
++    }
++}
++
++impl FromInner<OwnedFd> for FileDesc {
++    #[inline]
++    fn from_inner(owned: OwnedFd) -> Self {
++        FileDesc(owned)
++    }
++}
++
++impl AsFd for FileDesc {
++    #[inline]
++    fn as_fd(&self) -> BorrowedFd<'_> {
++        self.0.as_fd()
++    }
++}
++
++impl AsRawFd for FileDesc {
++    #[inline]
++    fn as_raw_fd(&self) -> RawFd {
++        self.0.as_raw_fd()
++    }
++}
++
++impl IntoRawFd for FileDesc {
++    #[inline]
++    fn into_raw_fd(self) -> RawFd {
++        self.0.into_raw_fd()
++    }
++}
++
++impl FromRawFd for FileDesc {
++    #[inline]
++    unsafe fn from_raw_fd(fd: RawFd) -> Self {
++        // SAFETY: guaranteed by the caller of the (unsafe) `FromRawFd` trait.
++        FileDesc(unsafe { OwnedFd::from_raw_fd(fd) })
 +    }
 +}
 diff --git a/library/std/src/sys/pal/fullrust/futex.rs b/library/std/src/sys/pal/fullrust/futex.rs
@@ -3826,10 +4413,10 @@ index 00000000..da8bd67d
 +}
 diff --git a/library/std/src/sys/pal/fullrust/mod.rs b/library/std/src/sys/pal/fullrust/mod.rs
 new file mode 100644
-index 00000000..b3c2c4e3
+index 00000000..c1e0403e
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/mod.rs
-@@ -0,0 +1,289 @@
+@@ -0,0 +1,293 @@
 +//! The `fullrust` platform abstraction layer: libc-free Linux on raw syscalls.
 +//!
 +//! This pal provides what a hosted std gets from libc + crt0: the process entry
@@ -3843,6 +4430,10 @@ index 00000000..b3c2c4e3
 +#[cfg(feature = "panic_unwind")]
 +pub mod eh_frame;
 +pub mod fd;
++// Flatten these two raw-fd helpers up to `crate::sys::*` (via `pal`) so the
++// generic `os::fd::owned` code — which lives outside `sys` and can't name the
++// private `pal` module — can close/dup an `OwnedFd` on this libc-free target.
++pub(crate) use fd::{close_raw, fcntl_dupfd_cloexec};
 +pub mod futex;
 +pub mod heap;
 +pub mod os;
@@ -4347,10 +4938,10 @@ index 00000000..5ecc9e6b
 +}
 diff --git a/library/std/src/sys/pal/fullrust/pipe.rs b/library/std/src/sys/pal/fullrust/pipe.rs
 new file mode 100644
-index 00000000..a5a42eff
+index 00000000..e942af6c
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/pipe.rs
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,137 @@
 +//! Anonymous pipes for the fullrust target, on raw Linux syscalls.
 +//!
 +//! `AnonPipe` owns one end of a kernel pipe (an fd) and closes it on drop. Pipes
@@ -4363,6 +4954,7 @@ index 00000000..a5a42eff
 +use super::sysc;
 +use crate::fmt;
 +use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
++use crate::sys_common::IntoInner;
 +
 +// pipe2(2) flag / poll(2) events.
 +const O_CLOEXEC: usize = 0o2000000;
@@ -4382,10 +4974,6 @@ index 00000000..a5a42eff
 +        self.0.raw()
 +    }
 +
-+    pub fn try_clone(&self) -> io::Result<Self> {
-+        Ok(AnonPipe(self.0.duplicate()?))
-+    }
-+
 +    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
 +        self.0.read(buf)
 +    }
@@ -4403,20 +4991,7 @@ index 00000000..a5a42eff
 +    }
 +
 +    pub fn read_to_end(&self, buf: &mut Vec<u8>) -> io::Result<usize> {
-+        let mut total = 0;
-+        let mut tmp = [0u8; 8192];
-+        loop {
-+            match self.read(&mut tmp) {
-+                Ok(0) => break,
-+                Ok(n) => {
-+                    buf.extend_from_slice(&tmp[..n]);
-+                    total += n;
-+                }
-+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-+                Err(e) => return Err(e),
-+            }
-+        }
-+        Ok(total)
++        self.0.read_to_end(buf)
 +    }
 +
 +    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
@@ -4435,6 +5010,15 @@ index 00000000..a5a42eff
 +impl fmt::Debug for AnonPipe {
 +    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 +        f.debug_struct("AnonPipe").field("fd", &self.0.raw()).finish()
++    }
++}
++
++/// Unwrap to the owning [`FileDesc`]. This is how `sys::anonymous_pipe` (the
++/// `std::io::pipe` surface) turns a pipe end into an `os::fd`-capable handle.
++impl IntoInner<FileDesc> for AnonPipe {
++    #[inline]
++    fn into_inner(self) -> FileDesc {
++        self.0
 +    }
 +}
 +
@@ -5299,10 +5883,10 @@ index 2e1d2e53..c59f65d7 100644
          all(target_vendor = "fortanix", target_env = "sgx"),
 diff --git a/library/std/src/sys/process/fullrust.rs b/library/std/src/sys/process/fullrust.rs
 new file mode 100644
-index 00000000..bca124a4
+index 00000000..8389f68b
 --- /dev/null
 +++ b/library/std/src/sys/process/fullrust.rs
-@@ -0,0 +1,629 @@
+@@ -0,0 +1,638 @@
 +//! Process spawning for the fullrust target, on raw Linux syscalls (no libc).
 +//!
 +//! `spawn` is the classic `fork` + `execve`. All allocation-bearing work — the
@@ -5319,6 +5903,7 @@ index 00000000..bca124a4
 +use crate::path::Path;
 +use crate::sys::fs::File;
 +use crate::sys::pal::sysc;
++use crate::sys::pal::fd::FileDesc;
 +use crate::sys::pipe::{self, AnonPipe};
 +use crate::{fmt, io};
 +
@@ -5651,6 +6236,14 @@ index 00000000..bca124a4
 +impl From<AnonPipe> for Stdio {
 +    fn from(pipe: AnonPipe) -> Stdio {
 +        Stdio::Fd(pipe)
++    }
++}
++
++// `std::io::pipe` ends arrive as an `OwnedFd`-backed `FileDesc` (the
++// `sys::anonymous_pipe` type); re-own the raw fd as the pal's pipe type.
++impl From<FileDesc> for Stdio {
++    fn from(fd: FileDesc) -> Stdio {
++        Stdio::Fd(AnonPipe::from_fd(fd.into_raw()))
 +    }
 +}
 +
