@@ -86,6 +86,16 @@ cargo +fullrust-1.88 build --target x86_64-unknown-linux-fullrust --release
 `BOOTSTRAP_SKIP_TARGET_SANITY=1` is needed because the downloaded stage0 compiler
 predates the new target.
 
+To build **real third-party crates** (anything with a `build.rs` or a proc-macro
+dependency — `serde`, `syn`, …), the sysroot also needs **host** std, since build
+scripts and proc-macros compile for the host. Build both targets at once so both
+live in the sysroot (building one target alone drops the other):
+
+```console
+BOOTSTRAP_SKIP_TARGET_SANITY=1 python3 x.py build library --stage 1 \
+  --target x86_64-unknown-linux-gnu,x86_64-unknown-linux-fullrust
+```
+
 To regenerate the overlay after editing the rust tree:
 
 ```console
@@ -213,6 +223,25 @@ terminate the chain) feeds gimli/DWARF symbolization that reads `/proc/self/exe`
 get an `mprotect(PROT_NONE)` guard page and the main thread's guard is derived
 from `RLIMIT_STACK`, so an overflow prints `thread '…' has overflowed its stack`
 and aborts while a genuine segfault passes through unchanged.
+
+**Real-world validation.** Beyond the hand-written `test-*` crates, real
+third-party code runs on the target as static, libc-free ELFs:
+
+- **serde + serde_json** (`test-realworld`) — typed + untyped JSON round-trips,
+  pulling `serde_derive`/`syn`/`proc-macro2` (proc-macros compile for the host).
+- **purecrypto** (a pure-Rust crypto toolkit) — its CLI builds and runs; SHA-256
+  and SHA3-256 match the NIST test vectors, and EC P-256 key generation works.
+  Needed only a fullrust `OsRng` (reads `/dev/urandom` via `std::fs`, which is
+  `O_CLOEXEC` on this target) since it isn't in the `unix` family.
+- **rsurl** (a pure-Rust `curl`) — built HTTP-only, it performs a full
+  `GET https://…`: DNS via the pal resolver, TCP connect, a purecrypto **TLS 1.3**
+  handshake with embedded-root certificate verification, and HTTP/2 — end to end
+  on the from-scratch std, no libc and no OpenSSL. rsurl itself needed no changes.
+
+The recurring friction is that `cfg(unix)` is `false` on this target, so a crate's
+unix-gated (but otherwise portable) code is invisible unless it also has a
+`not(any(unix, windows))` / `target_os = "fullrust"` path — cf. `std::os::fd` /
+`std::os::unix`, still the main ecosystem gap.
 
 ## Version matrix
 
