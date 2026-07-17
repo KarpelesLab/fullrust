@@ -182,12 +182,26 @@ correctness review.
   same-thread churn. Abandoned segments are reclaimed on demand or at any thread
   exit; a segment of a kind that is never re-allocated *and* with no further thread
   exits can linger (bounded, mimalloc-style).
-**Diagnostics.** Despite `panic = abort` and no unwinder, panic **backtraces**
-work: a frame-pointer stack walker (`backtrace/src/backtrace/frameptr.rs`, the
-target forces `frame_pointer: Always`; `_start` and the thread trampoline zero
-`%rbp` to terminate the chain) feeds gimli/DWARF symbolization that reads
-`/proc/self/exe` (a `native_libraries` loader returns the static non-PIE image at
-bias 0; the `std::fs`-based `mmap_fake` is used since there is no libc `mmap`), so
+**Unwinding.** The target defaults to `panic = unwind`, with a **pure-Rust DWARF
+unwinder** (no libgcc/libunwind, no libc): the in-tree `unwinding` crate — already
+a std dependency for xous — is routed to fullrust in `library/unwind` and
+`library/panic_unwind` (the `gcc.rs` Itanium backend + `rust_eh_personality`). Its
+one platform hook is finding `.eh_frame`: `sys::pal::fullrust::eh_frame` registers
+a custom FDE finder that locates `.eh_frame_hdr` (`PT_GNU_EH_FRAME`) and the text
+segment from the process program headers (captured from the auxv `AT_PHDR` by
+`tls::init_main`) — the libc-free equivalent of `dl_iterate_phdr`. So
+`catch_unwind` catches, RAII `Drop`s run as the stack unwinds, panic payloads
+propagate, an uncaught panic unwinds out of `main` and exits 101, a panic during
+cleanup aborts (correct Rust semantics), and unwinding works across spawned
+threads — all verified by `test-unwind`. (`-C panic=abort` is still honored per
+crate.)
+
+**Diagnostics.** Panic **backtraces** work independently of the unwinder: a
+frame-pointer stack walker (`backtrace/src/backtrace/frameptr.rs`, the target
+forces `frame_pointer: Always`; `_start` and the thread trampoline zero `%rbp` to
+terminate the chain) feeds gimli/DWARF symbolization that reads `/proc/self/exe`
+(a `native_libraries` loader returns the static non-PIE image at bias 0; the
+`std::fs`-based `mmap_fake` is used since there is no libc `mmap`), so
 `RUST_BACKTRACE=1` and `std::backtrace::Backtrace` yield names + file:line. A
 **stack-overflow handler** (`sys::pal::fullrust::stack_overflow`) installs a
 `SIGSEGV`/`SIGBUS` handler on a per-thread alternate signal stack (raw

@@ -1,9 +1,9 @@
 diff --git a/compiler/rustc_target/src/spec/base/fullrust.rs b/compiler/rustc_target/src/spec/base/fullrust.rs
 new file mode 100644
-index 00000000..860893ea
+index 00000000..0809c64d
 --- /dev/null
 +++ b/compiler/rustc_target/src/spec/base/fullrust.rs
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,59 @@
 +use crate::spec::{Cc, FramePointer, LinkerFlavor, Lld, PanicStrategy, RelocModel, TargetOptions};
 +
 +/// Base options for the `fullrust` platform: a libc-free, fully-static Linux
@@ -32,14 +32,18 @@ index 00000000..860893ea
 +        position_independent_executables: false,
 +        relocation_model: RelocModel::Static,
 +
-+        // No unwinder; panics abort. This removes the landing pads that would
-+        // otherwise reference the personality routine.
-+        panic_strategy: PanicStrategy::Abort,
++        // Panics unwind. The target ships a pure-Rust DWARF unwinder (the
++        // `unwinding` crate, via `library/unwind`); its `.eh_frame` is located
++        // at runtime through the program headers (see
++        // `sys::pal::fullrust::eh_frame`, which registers a custom FDE finder).
++        // `eh_frame_header` defaults to true, so the linker emits `.eh_frame_hdr`
++        // + `PT_GNU_EH_FRAME`, which the finder reads via the auxv `AT_PHDR`.
++        panic_strategy: PanicStrategy::Unwind,
 +
 +        // Keep frame pointers everywhere so the pal's frame-pointer stack walker
-+        // can produce panic backtraces without an unwinder / DWARF `.eh_frame`.
-+        // Both `_start` and the thread trampoline zero `%rbp`, terminating the
-+        // chain cleanly.
++        // can produce backtraces cheaply. Both `_start` and the thread trampoline
++        // zero `%rbp`, terminating the chain cleanly. (Unwinding itself uses the
++        // DWARF `.eh_frame`, not the frame-pointer chain.)
 +        frame_pointer: FramePointer::Always,
 +
 +        // Native ELF `#[thread_local]` TLS: the pal sets up a `%fs`-based TCB in
@@ -122,6 +126,31 @@ index 00000000..d20db759
 +        options: base,
 +    }
 +}
+diff --git a/library/panic_unwind/build.rs b/library/panic_unwind/build.rs
+new file mode 100644
+index 00000000..a6481350
+--- /dev/null
++++ b/library/panic_unwind/build.rs
+@@ -0,0 +1,7 @@
++fn main() {
++    println!("cargo:rerun-if-changed=build.rs");
++    // `fullrust` is a `target_os` this fork adds; teach the bootstrap compiler's
++    // check-cfg about the value (mirrors `library/std/build.rs`) so this crate's
++    // `cfg(target_os = "fullrust")` branch is not rejected.
++    println!("cargo:rustc-check-cfg=cfg(target_os, values(\"fullrust\"))");
++}
+diff --git a/library/panic_unwind/src/lib.rs b/library/panic_unwind/src/lib.rs
+index 50bd933a..e89abb9a 100644
+--- a/library/panic_unwind/src/lib.rs
++++ b/library/panic_unwind/src/lib.rs
+@@ -48,6 +48,7 @@
+         all(target_family = "windows", target_env = "gnu"),
+         target_os = "psp",
+         target_os = "xous",
++        target_os = "fullrust",
+         target_os = "solid_asp3",
+         all(target_family = "unix", not(any(target_os = "espidf", target_os = "nuttx"))),
+         all(target_vendor = "fortanix", target_env = "sgx"),
 diff --git a/library/std/build.rs b/library/std/build.rs
 index ef695601..f4f4971b 100644
 --- a/library/std/build.rs
@@ -2382,6 +2411,102 @@ index 00000000..b3c920de
 +    }
 +    core::intrinsics::abort()
 +}
+diff --git a/library/std/src/sys/pal/fullrust/eh_frame.rs b/library/std/src/sys/pal/fullrust/eh_frame.rs
+new file mode 100644
+index 00000000..4124202b
+--- /dev/null
++++ b/library/std/src/sys/pal/fullrust/eh_frame.rs
+@@ -0,0 +1,90 @@
++//! Runtime `.eh_frame` discovery for the pure-Rust `unwinding` backend.
++//!
++//! The unwinder (via `library/unwind`, `fde-custom` feature) needs to be told
++//! where the DWARF unwind tables live. On a normal glibc target this comes from
++//! `dl_iterate_phdr`; here there is no libc, so we read the process program
++//! headers (captured from the auxv by [`super::tls::init_main`]) to find the
++//! `PT_GNU_EH_FRAME` segment (`.eh_frame_hdr`) and the text `PT_LOAD` — exactly
++//! what the `unwinding` crate's `fde-phdr-aux` path does, without libc.
++
++use super::tls;
++use crate::ops::Range;
++use crate::ptr;
++
++// Elf64_Phdr field offsets.
++const PH_TYPE: usize = 0; // u32
++const PH_VADDR: usize = 16; // u64
++const PH_MEMSZ: usize = 40; // u64
++
++const PT_LOAD: u32 = 1;
++const PT_PHDR: u32 = 6;
++const PT_GNU_EH_FRAME: u32 = 0x6474_e550;
++
++#[inline]
++unsafe fn rd_u32(addr: usize) -> u32 {
++    unsafe { *ptr::with_exposed_provenance::<u32>(addr) }
++}
++#[inline]
++unsafe fn rd_u64(addr: usize) -> u64 {
++    unsafe { *ptr::with_exposed_provenance::<u64>(addr) }
++}
++
++struct PhdrFinder;
++static FINDER: PhdrFinder = PhdrFinder;
++
++// SAFETY: `find` only reads the process's own immutable program-header table and
++// returns addresses within the loaded image.
++unsafe impl unwind::EhFrameFinder for PhdrFinder {
++    fn find(&self, pc: usize) -> Option<unwind::FrameInfo> {
++        let (phdr, phent, phnum) = tls::program_headers();
++        if phdr == 0 || phnum == 0 {
++            return None;
++        }
++
++        // Recover the load bias from the known runtime address of the header
++        // table and the `PT_PHDR` stated vaddr (0 for a non-PIE static binary,
++        // but this also handles a PIE).
++        let mut base = 0usize;
++        for i in 0..phnum {
++            let ph = phdr + i * phent;
++            if unsafe { rd_u32(ph + PH_TYPE) } == PT_PHDR {
++                base = phdr.wrapping_sub(unsafe { rd_u64(ph + PH_VADDR) } as usize);
++                break;
++            }
++        }
++
++        // Locate the text segment containing `pc` and the `.eh_frame_hdr`.
++        let mut text: Option<Range<usize>> = None;
++        let mut eh_frame_hdr = 0usize;
++        for i in 0..phnum {
++            let ph = phdr + i * phent;
++            let ty = unsafe { rd_u32(ph + PH_TYPE) };
++            let start = base + unsafe { rd_u64(ph + PH_VADDR) } as usize;
++            match ty {
++                PT_LOAD => {
++                    let end = start + unsafe { rd_u64(ph + PH_MEMSZ) } as usize;
++                    if (start..end).contains(&pc) {
++                        text = Some(start..end);
++                    }
++                }
++                PT_GNU_EH_FRAME => eh_frame_hdr = start,
++                _ => {}
++            }
++        }
++
++        let text = text?;
++        if eh_frame_hdr == 0 {
++            return None;
++        }
++        Some(unwind::FrameInfo {
++            text_base: Some(text.start),
++            kind: unwind::FrameInfoKind::EhFrameHdr(eh_frame_hdr),
++        })
++    }
++}
++
++/// Register the FDE finder with the unwinder. Called once at startup, before any
++/// unwinding can occur.
++pub fn init() {
++    let _ = unwind::set_custom_eh_frame_finder(&FINDER);
++}
 diff --git a/library/std/src/sys/pal/fullrust/futex.rs b/library/std/src/sys/pal/fullrust/futex.rs
 new file mode 100644
 index 00000000..47cf7101
@@ -3688,10 +3813,10 @@ index 00000000..a3d33c2c
 +}
 diff --git a/library/std/src/sys/pal/fullrust/mod.rs b/library/std/src/sys/pal/fullrust/mod.rs
 new file mode 100644
-index 00000000..76dac302
+index 00000000..37452308
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/mod.rs
-@@ -0,0 +1,228 @@
+@@ -0,0 +1,234 @@
 +//! The `fullrust` platform abstraction layer: libc-free Linux on raw syscalls.
 +//!
 +//! This pal provides what a hosted std gets from libc + crt0: the process entry
@@ -3702,6 +3827,8 @@ index 00000000..76dac302
 +
 +#![deny(unsafe_op_in_unsafe_fn)]
 +
++#[cfg(feature = "panic_unwind")]
++pub mod eh_frame;
 +pub mod futex;
 +pub mod heap;
 +pub mod os;
@@ -3890,6 +4017,10 @@ index 00000000..76dac302
 +    // it parses the auxv that follows envp, and everything below (the allocator,
 +    // any `#[thread_local]`) depends on `%fs` already pointing at a valid TCB.
 +    unsafe { tls::init_main(stack) };
++    // Register the unwinder's FDE finder now that the program headers are known
++    // (it needs `tls::program_headers()`), before any panic can unwind.
++    #[cfg(feature = "panic_unwind")]
++    eh_frame::init();
 +    let argc = unsafe { *stack } as core::ffi::c_int;
 +    let argv = unsafe { stack.add(1) } as *const *const u8;
 +    let code = unsafe { main(argc, argv) };
@@ -4875,10 +5006,10 @@ index 00000000..8ee3776b
 +}
 diff --git a/library/std/src/sys/pal/fullrust/tls.rs b/library/std/src/sys/pal/fullrust/tls.rs
 new file mode 100644
-index 00000000..ef5ae7ca
+index 00000000..2ce50801
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/tls.rs
-@@ -0,0 +1,259 @@
+@@ -0,0 +1,280 @@
 +//! Native ELF thread-local storage (`%fs`-based, variant II) for the fullrust
 +//! target — the libc-free equivalent of glibc/musl's `__init_tls`/`__copy_tls`.
 +//!
@@ -4948,6 +5079,23 @@ index 00000000..ef5ae7ca
 +static TLS_MEMSZ: AtomicUsize = AtomicUsize::new(0);
 +static TLS_ALIGN: AtomicUsize = AtomicUsize::new(16);
 +static TLS_READY: AtomicU8 = AtomicU8::new(0);
++
++// The process program-header table, captured from the auxv (`AT_PHDR`/`AT_PHENT`/
++// `AT_PHNUM`). The unwinder's FDE finder reads these to locate `.eh_frame_hdr`
++// (`PT_GNU_EH_FRAME`) and the text segment. See `super::eh_frame`.
++static PHDR: AtomicUsize = AtomicUsize::new(0);
++static PHENT: AtomicUsize = AtomicUsize::new(0);
++static PHNUM: AtomicUsize = AtomicUsize::new(0);
++
++/// The program-header table `(addr, entry_size, count)` from the auxv, or
++/// `(0, _, 0)` if it was unavailable.
++pub fn program_headers() -> (usize, usize, usize) {
++    (
++        PHDR.load(Ordering::Relaxed),
++        PHENT.load(Ordering::Relaxed),
++        PHNUM.load(Ordering::Relaxed),
++    )
++}
 +
 +const TCB_SIZE: usize = core::mem::size_of::<Tcb>();
 +
@@ -5100,6 +5248,10 @@ index 00000000..ef5ae7ca
 +        }
 +        aux = unsafe { aux.add(2) };
 +    }
++    // Publish the program-header table for the unwinder's FDE finder.
++    PHDR.store(phdr, Ordering::Relaxed);
++    PHENT.store(phent, Ordering::Relaxed);
++    PHNUM.store(phnum, Ordering::Relaxed);
 +
 +    // Scan the program headers for PT_TLS. Non-PIE → load bias 0, so p_vaddr is
 +    // already the absolute address of the init image.
@@ -5169,6 +5321,18 @@ index faa2616a..3a89024a 100644
          path.has_root()
      } else {
          path.has_root() && path.prefix().is_some()
+diff --git a/library/std/src/sys/personality/mod.rs b/library/std/src/sys/personality/mod.rs
+index 2e1d2e53..c59f65d7 100644
+--- a/library/std/src/sys/personality/mod.rs
++++ b/library/std/src/sys/personality/mod.rs
+@@ -30,6 +30,7 @@ fn rust_eh_personality() {
+         all(target_family = "windows", target_env = "gnu"),
+         target_os = "psp",
+         target_os = "xous",
++        target_os = "fullrust",
+         target_os = "solid_asp3",
+         all(target_family = "unix", not(target_os = "espidf"), not(target_os = "l4re"), not(target_os = "nuttx")),
+         all(target_vendor = "fortanix", target_env = "sgx"),
 diff --git a/library/std/src/sys/process/fullrust.rs b/library/std/src/sys/process/fullrust.rs
 new file mode 100644
 index 00000000..bca124a4
@@ -6033,6 +6197,45 @@ index 9fafac3a..4630f37c 100644
          if #[cfg(any(
              all(
                  not(target_vendor = "apple"),
+diff --git a/library/unwind/Cargo.toml b/library/unwind/Cargo.toml
+index df43e6ae..94936c07 100644
+--- a/library/unwind/Cargo.toml
++++ b/library/unwind/Cargo.toml
+@@ -21,7 +21,7 @@ cfg-if = "1.0"
+ [target.'cfg(not(all(windows, target_env = "msvc")))'.dependencies]
+ libc = { version = "0.2.140", features = ['rustc-dep-of-std'], default-features = false }
+ 
+-[target.'cfg(target_os = "xous")'.dependencies]
++[target.'cfg(any(target_os = "xous", target_os = "fullrust"))'.dependencies]
+ unwinding = { version = "0.2.6", features = ['rustc-dep-of-std', 'unwinder', 'fde-custom'], default-features = false }
+ 
+ [features]
+diff --git a/library/unwind/build.rs b/library/unwind/build.rs
+new file mode 100644
+index 00000000..a6481350
+--- /dev/null
++++ b/library/unwind/build.rs
+@@ -0,0 +1,7 @@
++fn main() {
++    println!("cargo:rerun-if-changed=build.rs");
++    // `fullrust` is a `target_os` this fork adds; teach the bootstrap compiler's
++    // check-cfg about the value (mirrors `library/std/build.rs`) so this crate's
++    // `cfg(target_os = "fullrust")` branch is not rejected.
++    println!("cargo:rustc-check-cfg=cfg(target_os, values(\"fullrust\"))");
++}
+diff --git a/library/unwind/src/lib.rs b/library/unwind/src/lib.rs
+index 5451a38a..72f12a8e 100644
+--- a/library/unwind/src/lib.rs
++++ b/library/unwind/src/lib.rs
+@@ -34,7 +34,7 @@
+     ))] {
+         mod libunwind;
+         pub use libunwind::*;
+-    } else if #[cfg(target_os = "xous")] {
++    } else if #[cfg(any(target_os = "xous", target_os = "fullrust"))] {
+         mod unwinding;
+         pub use unwinding::*;
+     } else if #[cfg(target_family = "wasm")] {
 diff --git a/src/bootstrap/src/core/build_steps/compile.rs b/src/bootstrap/src/core/build_steps/compile.rs
 index 2e5865e5..db03deb7 100644
 --- a/src/bootstrap/src/core/build_steps/compile.rs

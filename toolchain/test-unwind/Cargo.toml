@@ -1,0 +1,13 @@
+[package]
+name = "unwind-fullrust"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "unwind-fullrust"
+path = "src/main.rs"
+
+# NOTE: no `panic = "abort"` here — the fullrust target now defaults to
+# panic=unwind, so this exercises real stack unwinding + catch_unwind.
+[profile.release]
+opt-level = 1
