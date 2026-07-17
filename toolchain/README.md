@@ -158,7 +158,11 @@ Extra changes beyond the target spec / pal: `build.rs` (check-cfg + restricted_s
 allowlist), `cc_detect.rs` (probe via the gnu triple), `compile.rs`
 (`compiler-builtins-mem`), the `sys/{stdio,args,random,alloc,thread_local}`
 dispatchers, `fullrust` branches in the `sys/{fs,net,process,env,path,io}` +
-`sys/sync/*` + `thread_local` guards, and a real fd-backed `pal::pipe`.
+`sys/sync/*` + `thread_local` guards, and a real fd-backed `pal::pipe`. `File`,
+`AnonPipe`, and the socket layer all wrap one shared `pal::fd::FileDesc` (owned fd
++ read/write/vectored/`dup`/close), and the raw `mmap`/`munmap`/`madvise` and
+program-header readers live once in the pal root — so the syscall plumbing has a
+single home rather than a copy per subsystem.
 
 The allocator now has **three paged tiers** plus a huge fallback: small (≤8 KiB,
 64 KiB pages), **medium** (8–128 KiB, 512 KiB pages) and **large** (128–512 KiB,

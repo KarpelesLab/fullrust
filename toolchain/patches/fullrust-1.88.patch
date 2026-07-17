@@ -415,10 +415,10 @@ index d81ff875..4b96582c 100644
          pub use windows::*;
 diff --git a/library/std/src/sys/fs/fullrust.rs b/library/std/src/sys/fs/fullrust.rs
 new file mode 100644
-index 00000000..62a39b15
+index 00000000..486108cc
 --- /dev/null
 +++ b/library/std/src/sys/fs/fullrust.rs
-@@ -0,0 +1,782 @@
+@@ -0,0 +1,746 @@
 +//! Filesystem for the fullrust target, on raw Linux syscalls (no libc).
 +//!
 +//! `File` is a thin owner of a raw kernel fd. Metadata comes from `statx(2)`
@@ -434,9 +434,9 @@ index 00000000..62a39b15
 +use crate::fmt;
 +use crate::fs::TryLockError;
 +use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut, SeekFrom};
-+use crate::mem;
 +use crate::path::{Path, PathBuf};
 +use crate::sync::Arc;
++use crate::sys::pal::fd::{cvt, FileDesc};
 +use crate::sys::pal::os;
 +use crate::sys::pal::sysc;
 +use crate::sys::time::SystemTime;
@@ -471,7 +471,6 @@ index 00000000..62a39b15
 +const LOCK_UN: usize = 8;
 +
 +// fcntl(2) command.
-+const F_DUPFD_CLOEXEC: usize = 1030;
 +
 +// st_mode type bits.
 +const S_IFMT: u16 = 0o170000;
@@ -494,23 +493,22 @@ index 00000000..62a39b15
 +// utimensat(2) sentinel nanoseconds.
 +const UTIME_OMIT: i64 = (1 << 30) - 2;
 +
-+// Maximum iovec count the kernel accepts in one readv/writev (UIO_MAXIOV).
-+const IOV_MAX: usize = 1024;
-+
-+#[inline]
-+fn cvt(r: usize) -> io::Result<usize> {
-+    sysc::ret(r).map_err(io::Error::from_raw_os_error)
-+}
 +
 +// ---------------------------------------------------------------------------
 +// File
 +// ---------------------------------------------------------------------------
 +
-+pub struct File {
-+    fd: i32,
-+}
++/// An open file. Read/write/vectored I/O, `dup`, and close come from the shared
++/// [`FileDesc`]; the methods here are the file-specific syscalls (`statx`,
++/// `fsync`, `flock`, `lseek`, `ftruncate`, `fchmod`, `utimensat`).
++pub struct File(FileDesc);
 +
 +impl File {
++    #[inline]
++    fn raw(&self) -> usize {
++        self.0.raw() as usize
++    }
++
 +    pub fn open(path: &Path, opts: &OpenOptions) -> io::Result<File> {
 +        let c = os::cstr(path)?;
 +        let mut flags = opts.get_access_mode()?;
@@ -526,23 +524,23 @@ index 00000000..62a39b15
 +                mode as usize,
 +            )
 +        })?;
-+        Ok(File { fd: fd as i32 })
++        Ok(File(FileDesc::from_raw(fd as i32)))
 +    }
 +
 +    pub fn file_attr(&self) -> io::Result<FileAttr> {
-+        do_statx(self.fd as usize, c"", AT_EMPTY_PATH)
++        do_statx(self.raw(), c"", AT_EMPTY_PATH)
 +    }
 +
 +    pub fn fsync(&self) -> io::Result<()> {
-+        cvt(unsafe { sysc::syscall1(sysc::FSYNC, self.fd as usize) }).map(drop)
++        cvt(unsafe { sysc::syscall1(sysc::FSYNC, self.raw()) }).map(drop)
 +    }
 +
 +    pub fn datasync(&self) -> io::Result<()> {
-+        cvt(unsafe { sysc::syscall1(sysc::FDATASYNC, self.fd as usize) }).map(drop)
++        cvt(unsafe { sysc::syscall1(sysc::FDATASYNC, self.raw()) }).map(drop)
 +    }
 +
 +    fn flock(&self, op: usize) -> io::Result<()> {
-+        cvt(unsafe { sysc::syscall2(sysc::FLOCK, self.fd as usize, op) }).map(drop)
++        cvt(unsafe { sysc::syscall2(sysc::FLOCK, self.raw(), op) }).map(drop)
 +    }
 +
 +    pub fn lock(&self) -> io::Result<()> {
@@ -554,7 +552,7 @@ index 00000000..62a39b15
 +    }
 +
 +    fn try_flock(&self, op: usize) -> Result<(), TryLockError> {
-+        match sysc::ret(unsafe { sysc::syscall2(sysc::FLOCK, self.fd as usize, op | LOCK_NB) }) {
++        match sysc::ret(unsafe { sysc::syscall2(sysc::FLOCK, self.raw(), op | LOCK_NB) }) {
 +            Ok(_) => Ok(()),
 +            // flock(LOCK_NB) reports contention as EWOULDBLOCK (== EAGAIN, 11).
 +            Err(11) => Err(TryLockError::WouldBlock),
@@ -575,22 +573,15 @@ index 00000000..62a39b15
 +    }
 +
 +    pub fn truncate(&self, size: u64) -> io::Result<()> {
-+        cvt(unsafe { sysc::syscall2(sysc::FTRUNCATE, self.fd as usize, size as usize) }).map(drop)
++        cvt(unsafe { sysc::syscall2(sysc::FTRUNCATE, self.raw(), size as usize) }).map(drop)
 +    }
 +
 +    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-+        cvt(unsafe {
-+            sysc::syscall3(sysc::READ, self.fd as usize, buf.as_mut_ptr() as usize, buf.len())
-+        })
++        self.0.read(buf)
 +    }
 +
 +    pub fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
-+        // `IoSliceMut` is `repr(transparent)` over `iovec`, so the slice is a
-+        // ready-made iovec array; cap at IOV_MAX to avoid EINVAL.
-+        let n = bufs.len().min(IOV_MAX);
-+        cvt(unsafe {
-+            sysc::syscall3(sysc::READV, self.fd as usize, bufs.as_mut_ptr() as usize, n)
-+        })
++        self.0.read_vectored(bufs)
 +    }
 +
 +    #[inline]
@@ -598,28 +589,16 @@ index 00000000..62a39b15
 +        true
 +    }
 +
-+    pub fn read_buf(&self, mut cursor: BorrowedCursor<'_>) -> io::Result<()> {
-+        // SAFETY: `read` writes initialized bytes into the buffer head; we then
-+        // advance the cursor by exactly that many, never claiming uninit bytes.
-+        let n = cvt(unsafe {
-+            let dst = cursor.as_mut().as_mut_ptr() as usize;
-+            sysc::syscall3(sysc::READ, self.fd as usize, dst, cursor.capacity())
-+        })?;
-+        unsafe { cursor.advance_unchecked(n) };
-+        Ok(())
++    pub fn read_buf(&self, cursor: BorrowedCursor<'_>) -> io::Result<()> {
++        self.0.read_buf(cursor)
 +    }
 +
 +    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
-+        cvt(unsafe {
-+            sysc::syscall3(sysc::WRITE, self.fd as usize, buf.as_ptr() as usize, buf.len())
-+        })
++        self.0.write(buf)
 +    }
 +
 +    pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-+        let n = bufs.len().min(IOV_MAX);
-+        cvt(unsafe {
-+            sysc::syscall3(sysc::WRITEV, self.fd as usize, bufs.as_ptr() as usize, n)
-+        })
++        self.0.write_vectored(bufs)
 +    }
 +
 +    #[inline]
@@ -638,7 +617,7 @@ index 00000000..62a39b15
 +            SeekFrom::End(n) => (SEEK_END, n),
 +            SeekFrom::Current(n) => (SEEK_CUR, n),
 +        };
-+        cvt(unsafe { sysc::syscall3(sysc::LSEEK, self.fd as usize, off as usize, whence) })
++        cvt(unsafe { sysc::syscall3(sysc::LSEEK, self.raw(), off as usize, whence) })
 +            .map(|n| n as u64)
 +    }
 +
@@ -647,50 +626,35 @@ index 00000000..62a39b15
 +    }
 +
 +    pub fn duplicate(&self) -> io::Result<File> {
-+        let fd = cvt(unsafe {
-+            sysc::syscall3(sysc::FCNTL, self.fd as usize, F_DUPFD_CLOEXEC, 0)
-+        })?;
-+        Ok(File { fd: fd as i32 })
++        Ok(File(self.0.duplicate()?))
 +    }
 +
 +    pub fn set_permissions(&self, perm: FilePermissions) -> io::Result<()> {
-+        cvt(unsafe { sysc::syscall2(sysc::FCHMOD, self.fd as usize, perm.mode as usize) }).map(drop)
++        cvt(unsafe { sysc::syscall2(sysc::FCHMOD, self.raw(), perm.mode as usize) }).map(drop)
 +    }
 +
 +    pub fn set_times(&self, times: FileTimes) -> io::Result<()> {
 +        let ts = [to_timespec(times.accessed), to_timespec(times.modified)];
-+        cvt(unsafe {
-+            sysc::syscall4(sysc::UTIMENSAT, self.fd as usize, 0, ts.as_ptr() as usize, 0)
-+        })
-+        .map(drop)
++        cvt(unsafe { sysc::syscall4(sysc::UTIMENSAT, self.raw(), 0, ts.as_ptr() as usize, 0) })
++            .map(drop)
 +    }
 +
 +    pub(crate) fn as_raw_fd(&self) -> i32 {
-+        self.fd
++        self.0.raw()
 +    }
 +
 +    pub(crate) fn into_raw_fd(self) -> i32 {
-+        let fd = self.fd;
-+        mem::forget(self);
-+        fd
++        self.0.into_raw()
 +    }
 +
 +    pub(crate) unsafe fn from_raw_fd(fd: i32) -> File {
-+        File { fd }
-+    }
-+}
-+
-+impl Drop for File {
-+    fn drop(&mut self) {
-+        unsafe {
-+            sysc::syscall1(sysc::CLOSE, self.fd as usize);
-+        }
++        File(FileDesc::from_raw(fd))
 +    }
 +}
 +
 +impl fmt::Debug for File {
 +    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-+        f.debug_struct("File").field("fd", &self.fd).finish()
++        f.debug_struct("File").field("fd", &self.0.raw()).finish()
 +    }
 +}
 +
@@ -1060,7 +1024,7 @@ index 00000000..62a39b15
 +            0,
 +        )
 +    })? as i32;
-+    let guard = File { fd }; // closes the dir fd on the way out
++    let guard = unsafe { File::from_raw_fd(fd) }; // closes the dir fd on the way out
 +
 +    let mut dir = Vec::new();
 +    let mut buf = [0u8; 4096];
@@ -1195,7 +1159,7 @@ index 00000000..62a39b15
 +            0,
 +        )
 +    })? as i32;
-+    let guard = File { fd };
++    let guard = unsafe { File::from_raw_fd(fd) };
 +    let proc = PathBuf::from(format!("/proc/self/fd/{fd}"));
 +    let real = readlink(&proc);
 +    drop(guard);
@@ -1320,22 +1284,23 @@ index 4d0365d4..23e41308 100644
              pub use unsupported::*;
 diff --git a/library/std/src/sys/net/connection/fullrust.rs b/library/std/src/sys/net/connection/fullrust.rs
 new file mode 100644
-index 00000000..847fe7b5
+index 00000000..ef638608
 --- /dev/null
 +++ b/library/std/src/sys/net/connection/fullrust.rs
-@@ -0,0 +1,941 @@
+@@ -0,0 +1,915 @@
 +//! TCP/UDP sockets and DNS for the fullrust target, on raw Linux syscalls.
 +//!
-+//! A single `Socket` (an owned fd) backs `TcpStream`, `TcpListener`, and
-+//! `UdpSocket`; the public types are thin wrappers exposing the std interface.
-+//! Addresses are marshalled to/from raw `sockaddr_in`/`sockaddr_in6` bytes. All
-+//! sends use `MSG_NOSIGNAL` because this target installs no `SIGPIPE` handler —
-+//! a write to a closed peer must return `EPIPE`, not kill the process. Name
-+//! resolution is a self-contained DNS client (`/etc/hosts` + `/etc/resolv.conf`
-+//! + UDP queries), since there is no libc `getaddrinfo`.
++//! A single `Socket` (an owned [`FileDesc`]) backs `TcpStream`, `TcpListener`,
++//! and `UdpSocket`; the public types are thin wrappers exposing the std
++//! interface. Addresses are marshalled to/from raw `sockaddr_in`/`sockaddr_in6`
++//! bytes. Single-buffer sends use `MSG_NOSIGNAL` so a write to a closed peer
++//! yields `EPIPE` rather than a signal, matching unix std. Name resolution is a
++//! self-contained DNS client (`/etc/hosts` + `/etc/resolv.conf` + UDP queries),
++//! since there is no libc `getaddrinfo`.
 +
 +use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
 +use crate::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6};
++use crate::sys::pal::fd::{cvt, FileDesc};
 +use crate::sys::pal::sysc;
 +use crate::time::Duration;
 +use crate::{fmt, mem};
@@ -1373,19 +1338,8 @@ index 00000000..847fe7b5
 +// send/recv flags and shutdown / fcntl bits.
 +const MSG_PEEK: usize = 2;
 +const MSG_NOSIGNAL: usize = 0x4000;
-+const O_NONBLOCK: usize = 0o4000;
-+const F_GETFL: usize = 3;
-+const F_SETFL: usize = 4;
-+const F_DUPFD_CLOEXEC: usize = 1030;
 +const POLLOUT: i16 = 0x4;
 +const EINPROGRESS: i32 = 115;
-+// Maximum iovec count the kernel accepts in one readv/writev (UIO_MAXIOV).
-+const IOV_MAX: usize = 1024;
-+
-+#[inline]
-+fn cvt(r: usize) -> io::Result<usize> {
-+    sysc::ret(r).map_err(io::Error::from_raw_os_error)
-+}
 +
 +// ---------------------------------------------------------------------------
 +// sockaddr marshalling
@@ -1437,14 +1391,22 @@ index 00000000..847fe7b5
 +// Socket
 +// ---------------------------------------------------------------------------
 +
-+pub struct Socket {
-+    fd: i32,
-+}
++/// A socket. Read/read_buf/vectored I/O, `dup`, and `set_nonblocking` come from
++/// the shared [`FileDesc`]; this type adds the socket-specific syscalls
++/// (`connect`, `accept`, `getsockopt`/`setsockopt`, `recvfrom`/`sendto`, …).
++/// Sends use `MSG_NOSIGNAL` so a write to a closed peer yields `EPIPE`
++/// regardless of the process's SIGPIPE disposition, matching unix std.
++pub struct Socket(FileDesc);
 +
 +impl Socket {
++    #[inline]
++    fn raw(&self) -> usize {
++        self.0.raw() as usize
++    }
++
 +    fn new_raw(family: usize, ty: usize) -> io::Result<Socket> {
 +        let fd = cvt(unsafe { sysc::syscall3(sysc::SOCKET, family, ty | SOCK_CLOEXEC, 0) })?;
-+        Ok(Socket { fd: fd as i32 })
++        Ok(Socket(FileDesc::from_raw(fd as i32)))
 +    }
 +
 +    fn new(addr: &SocketAddr, ty: usize) -> io::Result<Socket> {
@@ -1459,7 +1421,7 @@ index 00000000..847fe7b5
 +        cvt(unsafe {
 +            sysc::syscall5(
 +                sysc::SETSOCKOPT,
-+                self.fd as usize,
++                self.raw(),
 +                level,
 +                name,
 +                &value as *const T as usize,
@@ -1476,7 +1438,7 @@ index 00000000..847fe7b5
 +            let mut len = mem::size_of::<T>() as u32;
 +            cvt(sysc::syscall5(
 +                sysc::GETSOCKOPT,
-+                self.fd as usize,
++                self.raw(),
 +                level,
 +                name,
 +                &mut val as *mut T as usize,
@@ -1490,7 +1452,7 @@ index 00000000..847fe7b5
 +        let mut raw = [0u8; 28];
 +        let len = addr_to_raw(addr, &mut raw);
 +        cvt(unsafe {
-+            sysc::syscall3(sysc::CONNECT, self.fd as usize, raw.as_ptr() as usize, len)
++            sysc::syscall3(sysc::CONNECT, self.raw(), raw.as_ptr() as usize, len)
 +        })?;
 +        Ok(())
 +    }
@@ -1500,7 +1462,7 @@ index 00000000..847fe7b5
 +        let mut raw = [0u8; 28];
 +        let len = addr_to_raw(addr, &mut raw);
 +        let r = sysc::ret(unsafe {
-+            sysc::syscall3(sysc::CONNECT, self.fd as usize, raw.as_ptr() as usize, len)
++            sysc::syscall3(sysc::CONNECT, self.raw(), raw.as_ptr() as usize, len)
 +        });
 +        let result = match r {
 +            Ok(_) => Ok(()),
@@ -1531,7 +1493,7 @@ index 00000000..847fe7b5
 +            ms = 1;
 +        }
 +        let ms = ms.min(i32::MAX as u128) as i32;
-+        let mut pfd = PollFd { fd: self.fd, events: POLLOUT, revents: 0 };
++        let mut pfd = PollFd { fd: self.0.raw(), events: POLLOUT, revents: 0 };
 +        loop {
 +            match sysc::ret(unsafe {
 +                sysc::syscall3(sysc::POLL, &mut pfd as *mut PollFd as usize, 1, ms as usize)
@@ -1558,27 +1520,43 @@ index 00000000..847fe7b5
 +        let fd = cvt(unsafe {
 +            sysc::syscall4(
 +                sysc::ACCEPT4,
-+                self.fd as usize,
++                self.raw(),
 +                storage.as_mut_ptr() as usize,
 +                &mut len as *mut u32 as usize,
 +                SOCK_CLOEXEC,
 +            )
 +        })?;
-+        Ok((Socket { fd: fd as i32 }, raw_to_addr(&storage)?))
++        Ok((Socket(FileDesc::from_raw(fd as i32)), raw_to_addr(&storage)?))
 +    }
 +
 +    fn duplicate(&self) -> io::Result<Socket> {
-+        let fd = cvt(unsafe {
-+            sysc::syscall3(sysc::FCNTL, self.fd as usize, F_DUPFD_CLOEXEC, 0)
-+        })?;
-+        Ok(Socket { fd: fd as i32 })
++        Ok(Socket(self.0.duplicate()?))
++    }
++
++    // Plain read/read_buf/read_vectored/write_vectored on a connected socket are
++    // ordinary fd I/O; only `peek` (MSG_PEEK) and the `*_from`/`send` paths need
++    // socket-specific flags/addresses.
++    fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
++        self.0.read(buf)
++    }
++
++    fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
++        self.0.read_vectored(bufs)
++    }
++
++    fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
++        self.0.write_vectored(bufs)
++    }
++
++    fn read_buf(&self, cursor: BorrowedCursor<'_>) -> io::Result<()> {
++        self.0.read_buf(cursor)
 +    }
 +
 +    fn recv_with_flags(&self, buf: &mut [u8], flags: usize) -> io::Result<usize> {
 +        cvt(unsafe {
 +            sysc::syscall6(
 +                sysc::RECVFROM,
-+                self.fd as usize,
++                self.raw(),
 +                buf.as_mut_ptr() as usize,
 +                buf.len(),
 +                flags,
@@ -1588,37 +1566,8 @@ index 00000000..847fe7b5
 +        })
 +    }
 +
-+    fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-+        self.recv_with_flags(buf, 0)
-+    }
-+
-+    fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
-+        // `IoSliceMut` is `repr(transparent)` over `iovec`; cap at IOV_MAX.
-+        let n = bufs.len().min(IOV_MAX);
-+        cvt(unsafe {
-+            sysc::syscall3(sysc::READV, self.fd as usize, bufs.as_mut_ptr() as usize, n)
-+        })
-+    }
-+
-+    fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-+        // Safe without MSG_NOSIGNAL because SIGPIPE is ignored process-wide.
-+        let n = bufs.len().min(IOV_MAX);
-+        cvt(unsafe {
-+            sysc::syscall3(sysc::WRITEV, self.fd as usize, bufs.as_ptr() as usize, n)
-+        })
-+    }
-+
 +    fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
 +        self.recv_with_flags(buf, MSG_PEEK)
-+    }
-+
-+    fn read_buf(&self, mut cursor: BorrowedCursor<'_>) -> io::Result<()> {
-+        let n = cvt(unsafe {
-+            let dst = cursor.as_mut().as_mut_ptr() as usize;
-+            sysc::syscall6(sysc::RECVFROM, self.fd as usize, dst, cursor.capacity(), 0, 0, 0)
-+        })?;
-+        unsafe { cursor.advance_unchecked(n) };
-+        Ok(())
 +    }
 +
 +    fn recv_from_with_flags(
@@ -1631,7 +1580,7 @@ index 00000000..847fe7b5
 +        let n = cvt(unsafe {
 +            sysc::syscall6(
 +                sysc::RECVFROM,
-+                self.fd as usize,
++                self.raw(),
 +                buf.as_mut_ptr() as usize,
 +                buf.len(),
 +                flags,
@@ -1646,7 +1595,7 @@ index 00000000..847fe7b5
 +        cvt(unsafe {
 +            sysc::syscall6(
 +                sysc::SENDTO,
-+                self.fd as usize,
++                self.raw(),
 +                buf.as_ptr() as usize,
 +                buf.len(),
 +                MSG_NOSIGNAL,
@@ -1662,7 +1611,7 @@ index 00000000..847fe7b5
 +        cvt(unsafe {
 +            sysc::syscall6(
 +                sysc::SENDTO,
-+                self.fd as usize,
++                self.raw(),
 +                buf.as_ptr() as usize,
 +                buf.len(),
 +                MSG_NOSIGNAL,
@@ -1676,7 +1625,7 @@ index 00000000..847fe7b5
 +        let mut storage = [0u8; 28];
 +        let mut len = storage.len() as u32;
 +        cvt(unsafe {
-+            sysc::syscall3(which, self.fd as usize, storage.as_mut_ptr() as usize, &mut len
++            sysc::syscall3(which, self.raw(), storage.as_mut_ptr() as usize, &mut len
 +                as *mut u32 as usize)
 +        })?;
 +        raw_to_addr(&storage)
@@ -1688,15 +1637,12 @@ index 00000000..847fe7b5
 +            Shutdown::Write => 1,
 +            Shutdown::Both => 2,
 +        };
-+        cvt(unsafe { sysc::syscall2(sysc::SHUTDOWN, self.fd as usize, how) })?;
++        cvt(unsafe { sysc::syscall2(sysc::SHUTDOWN, self.raw(), how) })?;
 +        Ok(())
 +    }
 +
 +    fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
-+        let flags = cvt(unsafe { sysc::syscall3(sysc::FCNTL, self.fd as usize, F_GETFL, 0) })?;
-+        let new = if nonblocking { flags | O_NONBLOCK } else { flags & !O_NONBLOCK };
-+        cvt(unsafe { sysc::syscall3(sysc::FCNTL, self.fd as usize, F_SETFL, new) })?;
-+        Ok(())
++        self.0.set_nonblocking(nonblocking)
 +    }
 +
 +    fn set_timeout(&self, dur: Option<Duration>, opt: usize) -> io::Result<()> {
@@ -1736,17 +1682,9 @@ index 00000000..847fe7b5
 +    }
 +}
 +
-+impl Drop for Socket {
-+    fn drop(&mut self) {
-+        unsafe {
-+            sysc::syscall1(sysc::CLOSE, self.fd as usize);
-+        }
-+    }
-+}
-+
 +impl fmt::Debug for Socket {
 +    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-+        f.debug_struct("Socket").field("fd", &self.fd).finish()
++        f.debug_struct("Socket").field("fd", &self.0.raw()).finish()
 +    }
 +}
 +
@@ -1856,7 +1794,7 @@ index 00000000..847fe7b5
 +
 +impl fmt::Debug for TcpStream {
 +    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-+        f.debug_struct("TcpStream").field("fd", &self.inner.fd).finish()
++        f.debug_struct("TcpStream").field("fd", &self.inner.0.raw()).finish()
 +    }
 +}
 +
@@ -1877,9 +1815,9 @@ index 00000000..847fe7b5
 +        let mut raw = [0u8; 28];
 +        let len = addr_to_raw(addr, &mut raw);
 +        cvt(unsafe {
-+            sysc::syscall3(sysc::BIND, sock.fd as usize, raw.as_ptr() as usize, len)
++            sysc::syscall3(sysc::BIND, sock.raw(), raw.as_ptr() as usize, len)
 +        })?;
-+        cvt(unsafe { sysc::syscall2(sysc::LISTEN, sock.fd as usize, 128) })?;
++        cvt(unsafe { sysc::syscall2(sysc::LISTEN, sock.raw(), 128) })?;
 +        Ok(TcpListener { inner: sock })
 +    }
 +
@@ -1917,7 +1855,7 @@ index 00000000..847fe7b5
 +
 +impl fmt::Debug for TcpListener {
 +    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-+        f.debug_struct("TcpListener").field("fd", &self.inner.fd).finish()
++        f.debug_struct("TcpListener").field("fd", &self.inner.0.raw()).finish()
 +    }
 +}
 +
@@ -1936,7 +1874,7 @@ index 00000000..847fe7b5
 +        let mut raw = [0u8; 28];
 +        let len = addr_to_raw(addr, &mut raw);
 +        cvt(unsafe {
-+            sysc::syscall3(sysc::BIND, sock.fd as usize, raw.as_ptr() as usize, len)
++            sysc::syscall3(sysc::BIND, sock.raw(), raw.as_ptr() as usize, len)
 +        })?;
 +        Ok(UdpSocket { inner: sock })
 +    }
@@ -2054,7 +1992,7 @@ index 00000000..847fe7b5
 +
 +impl fmt::Debug for UdpSocket {
 +    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-+        f.debug_struct("UdpSocket").field("fd", &self.inner.fd).finish()
++        f.debug_struct("UdpSocket").field("fd", &self.inner.0.raw()).finish()
 +    }
 +}
 +
@@ -2413,10 +2351,10 @@ index 00000000..b3c920de
 +}
 diff --git a/library/std/src/sys/pal/fullrust/eh_frame.rs b/library/std/src/sys/pal/fullrust/eh_frame.rs
 new file mode 100644
-index 00000000..4124202b
+index 00000000..0f4de215
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/eh_frame.rs
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,80 @@
 +//! Runtime `.eh_frame` discovery for the pure-Rust `unwinding` backend.
 +//!
 +//! The unwinder (via `library/unwind`, `fde-custom` feature) needs to be told
@@ -2426,9 +2364,8 @@ index 00000000..4124202b
 +//! `PT_GNU_EH_FRAME` segment (`.eh_frame_hdr`) and the text `PT_LOAD` — exactly
 +//! what the `unwinding` crate's `fde-phdr-aux` path does, without libc.
 +
-+use super::tls;
++use super::{rd_u32, rd_u64, tls};
 +use crate::ops::Range;
-+use crate::ptr;
 +
 +// Elf64_Phdr field offsets.
 +const PH_TYPE: usize = 0; // u32
@@ -2438,15 +2375,6 @@ index 00000000..4124202b
 +const PT_LOAD: u32 = 1;
 +const PT_PHDR: u32 = 6;
 +const PT_GNU_EH_FRAME: u32 = 0x6474_e550;
-+
-+#[inline]
-+unsafe fn rd_u32(addr: usize) -> u32 {
-+    unsafe { *ptr::with_exposed_provenance::<u32>(addr) }
-+}
-+#[inline]
-+unsafe fn rd_u64(addr: usize) -> u64 {
-+    unsafe { *ptr::with_exposed_provenance::<u64>(addr) }
-+}
 +
 +struct PhdrFinder;
 +static FINDER: PhdrFinder = PhdrFinder;
@@ -2506,6 +2434,120 @@ index 00000000..4124202b
 +/// unwinding can occur.
 +pub fn init() {
 +    let _ = unwind::set_custom_eh_frame_finder(&FINDER);
++}
+diff --git a/library/std/src/sys/pal/fullrust/fd.rs b/library/std/src/sys/pal/fullrust/fd.rs
+new file mode 100644
+index 00000000..b78ce1cc
+--- /dev/null
++++ b/library/std/src/sys/pal/fullrust/fd.rs
+@@ -0,0 +1,108 @@
++//! An owned file descriptor and the operations common to everything backed by
++//! one — `File`, `AnonPipe`, and the socket layer. Each of those wraps a
++//! `FileDesc` instead of re-implementing read/write/vectored I/O, `dup`, and
++//! close, so the raw-syscall plumbing lives in exactly one place.
++
++use super::sysc;
++use crate::fmt;
++use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
++use crate::mem;
++
++// fcntl(2) commands / flags used here.
++const F_GETFL: usize = 3;
++const F_SETFL: usize = 4;
++const F_DUPFD_CLOEXEC: usize = 1030;
++const O_NONBLOCK: usize = 0o4000;
++// Maximum iovec count the kernel accepts in one readv/writev (UIO_MAXIOV).
++const IOV_MAX: usize = 1024;
++
++/// Interpret a raw syscall return as `io::Result<usize>` (an `Err` is the errno).
++/// The one place this mapping lives; every fullrust `sys` module routes through it.
++#[inline]
++pub(crate) fn cvt(r: usize) -> io::Result<usize> {
++    sysc::ret(r).map_err(io::Error::from_raw_os_error)
++}
++
++/// A file descriptor that closes itself on drop.
++pub struct FileDesc(i32);
++
++impl FileDesc {
++    #[inline]
++    pub fn from_raw(fd: i32) -> FileDesc {
++        FileDesc(fd)
++    }
++
++    #[inline]
++    pub fn raw(&self) -> i32 {
++        self.0
++    }
++
++    /// Consume without closing, returning the raw descriptor.
++    #[inline]
++    pub fn into_raw(self) -> i32 {
++        let fd = self.0;
++        mem::forget(self);
++        fd
++    }
++
++    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
++        cvt(unsafe {
++            sysc::syscall3(sysc::READ, self.0 as usize, buf.as_mut_ptr() as usize, buf.len())
++        })
++    }
++
++    pub fn read_buf(&self, mut cursor: BorrowedCursor<'_>) -> io::Result<()> {
++        let n = cvt(unsafe {
++            let dst = cursor.as_mut().as_mut_ptr() as usize;
++            sysc::syscall3(sysc::READ, self.0 as usize, dst, cursor.capacity())
++        })?;
++        // SAFETY: the kernel initialized the first `n` bytes of the cursor.
++        unsafe { cursor.advance_unchecked(n) };
++        Ok(())
++    }
++
++    pub fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
++        // `IoSliceMut` is `repr(transparent)` over `iovec`, so the slice is a
++        // ready-made iovec array; cap the count at IOV_MAX.
++        let n = bufs.len().min(IOV_MAX);
++        cvt(unsafe { sysc::syscall3(sysc::READV, self.0 as usize, bufs.as_mut_ptr() as usize, n) })
++    }
++
++    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
++        cvt(unsafe {
++            sysc::syscall3(sysc::WRITE, self.0 as usize, buf.as_ptr() as usize, buf.len())
++        })
++    }
++
++    pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
++        let n = bufs.len().min(IOV_MAX);
++        cvt(unsafe { sysc::syscall3(sysc::WRITEV, self.0 as usize, bufs.as_ptr() as usize, n) })
++    }
++
++    /// Duplicate the descriptor, close-on-exec (`F_DUPFD_CLOEXEC`).
++    pub fn duplicate(&self) -> io::Result<FileDesc> {
++        let fd = cvt(unsafe { sysc::syscall3(sysc::FCNTL, self.0 as usize, F_DUPFD_CLOEXEC, 0) })?;
++        Ok(FileDesc(fd as i32))
++    }
++
++    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
++        let flags = cvt(unsafe { sysc::syscall3(sysc::FCNTL, self.0 as usize, F_GETFL, 0) })?;
++        let new = if nonblocking { flags | O_NONBLOCK } else { flags & !O_NONBLOCK };
++        cvt(unsafe { sysc::syscall3(sysc::FCNTL, self.0 as usize, F_SETFL, new) })?;
++        Ok(())
++    }
++}
++
++impl Drop for FileDesc {
++    fn drop(&mut self) {
++        unsafe {
++            sysc::syscall1(sysc::CLOSE, self.0 as usize);
++        }
++    }
++}
++
++impl fmt::Debug for FileDesc {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("FileDesc").field("fd", &self.0).finish()
++    }
 +}
 diff --git a/library/std/src/sys/pal/fullrust/futex.rs b/library/std/src/sys/pal/fullrust/futex.rs
 new file mode 100644
@@ -2577,10 +2619,10 @@ index 00000000..47cf7101
 +}
 diff --git a/library/std/src/sys/pal/fullrust/heap.rs b/library/std/src/sys/pal/fullrust/heap.rs
 new file mode 100644
-index 00000000..a3d33c2c
+index 00000000..da8bd67d
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/heap.rs
-@@ -0,0 +1,1230 @@
+@@ -0,0 +1,1201 @@
 +//! A mimalloc-class global allocator for the fullrust target.
 +//!
 +//! The design follows mimalloc's "free-list sharding" model, adapted to a
@@ -2839,39 +2881,10 @@ index 00000000..a3d33c2c
 +}
 +
 +// --- raw OS memory --------------------------------------------------------
-+
-+#[inline]
-+fn os_mmap(len: usize) -> *mut u8 {
-+    let r = unsafe {
-+        sysc::syscall6(
-+            sysc::MMAP,
-+            0,
-+            len,
-+            sysc::PROT_READ | sysc::PROT_WRITE,
-+            sysc::MAP_PRIVATE | sysc::MAP_ANONYMOUS,
-+            usize::MAX, // fd = -1
-+            0,
-+        )
-+    };
-+    match sysc::ret(r) {
-+        Ok(p) => ptr::with_exposed_provenance_mut(p),
-+        Err(_) => ptr::null_mut(),
-+    }
-+}
-+
-+#[inline]
-+unsafe fn os_munmap(addr: usize, len: usize) {
-+    unsafe {
-+        sysc::syscall2(sysc::MUNMAP, addr, len);
-+    }
-+}
-+
-+#[inline]
-+unsafe fn os_madvise(addr: usize, len: usize, advice: usize) {
-+    unsafe {
-+        sysc::syscall3(sysc::MADVISE, addr, len, advice);
-+    }
-+}
++// The plain anonymous-mmap helpers live in the pal root (shared with thread
++// stacks, the signal alt-stack, and TLS); the allocator's `os_alloc_segment`
++// below adds the 4 MiB alignment on top.
++use super::{madvise as os_madvise, mmap_anon as os_mmap, munmap as os_munmap};
 +
 +/// Map a fresh 4 MiB segment aligned to its size (over-map by one segment, then
 +/// trim the head and tail). Returns the aligned base, or null.
@@ -3813,10 +3826,10 @@ index 00000000..a3d33c2c
 +}
 diff --git a/library/std/src/sys/pal/fullrust/mod.rs b/library/std/src/sys/pal/fullrust/mod.rs
 new file mode 100644
-index 00000000..37452308
+index 00000000..b3c2c4e3
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/mod.rs
-@@ -0,0 +1,234 @@
+@@ -0,0 +1,289 @@
 +//! The `fullrust` platform abstraction layer: libc-free Linux on raw syscalls.
 +//!
 +//! This pal provides what a hosted std gets from libc + crt0: the process entry
@@ -3829,6 +3842,7 @@ index 00000000..37452308
 +
 +#[cfg(feature = "panic_unwind")]
 +pub mod eh_frame;
++pub mod fd;
 +pub mod futex;
 +pub mod heap;
 +pub mod os;
@@ -3985,6 +3999,60 @@ index 00000000..37452308
 +        let s = r as isize;
 +        if (-4095..0).contains(&s) { Err(-s as i32) } else { Ok(r) }
 +    }
++}
++
++// ---------------------------------------------------------------------------
++// Low-level helpers shared across the pal. Kept dependency-free (no allocation,
++// no `io::Error`) so even the allocator (`heap`) can use them.
++// ---------------------------------------------------------------------------
++
++/// `mmap` an anonymous, private, read-write region. Returns null on failure.
++#[inline]
++pub(crate) fn mmap_anon(len: usize) -> *mut u8 {
++    let r = unsafe {
++        sysc::syscall6(
++            sysc::MMAP,
++            0,
++            len,
++            sysc::PROT_READ | sysc::PROT_WRITE,
++            sysc::MAP_PRIVATE | sysc::MAP_ANONYMOUS,
++            usize::MAX, // fd = -1
++            0,
++        )
++    };
++    match sysc::ret(r) {
++        Ok(p) => core::ptr::with_exposed_provenance_mut(p),
++        Err(_) => core::ptr::null_mut(),
++    }
++}
++
++/// `munmap` a region.
++#[inline]
++pub(crate) unsafe fn munmap(addr: usize, len: usize) {
++    unsafe {
++        sysc::syscall2(sysc::MUNMAP, addr, len);
++    }
++}
++
++/// `madvise` a region (e.g. `MADV_FREE`/`MADV_DONTNEED`).
++#[inline]
++pub(crate) unsafe fn madvise(addr: usize, len: usize, advice: usize) {
++    unsafe {
++        sysc::syscall3(sysc::MADVISE, addr, len, advice);
++    }
++}
++
++/// Read a `u32`/`u64` from an integer address (program headers, TLS image, …).
++///
++/// # Safety
++/// `addr` must point at a valid, correctly-aligned value for the read length.
++#[inline]
++pub(crate) unsafe fn rd_u32(addr: usize) -> u32 {
++    unsafe { *core::ptr::with_exposed_provenance::<u32>(addr) }
++}
++#[inline]
++pub(crate) unsafe fn rd_u64(addr: usize) -> u64 {
++    unsafe { *core::ptr::with_exposed_provenance::<u64>(addr) }
 +}
 +
 +// ---------------------------------------------------------------------------
@@ -4279,10 +4347,10 @@ index 00000000..5ecc9e6b
 +}
 diff --git a/library/std/src/sys/pal/fullrust/pipe.rs b/library/std/src/sys/pal/fullrust/pipe.rs
 new file mode 100644
-index 00000000..818bcb39
+index 00000000..a5a42eff
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/pipe.rs
-@@ -0,0 +1,186 @@
+@@ -0,0 +1,144 @@
 +//! Anonymous pipes for the fullrust target, on raw Linux syscalls.
 +//!
 +//! `AnonPipe` owns one end of a kernel pipe (an fd) and closes it on drop. Pipes
@@ -4291,67 +4359,43 @@ index 00000000..818bcb39
 +//! spawner. `read2` drains two pipes concurrently via `poll` so capturing both a
 +//! child's stdout and stderr can't deadlock.
 +
++use super::fd::{cvt, FileDesc};
 +use super::sysc;
 +use crate::fmt;
 +use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
 +
-+// open/fcntl flags used here.
++// pipe2(2) flag / poll(2) events.
 +const O_CLOEXEC: usize = 0o2000000;
-+const O_NONBLOCK: usize = 0o4000;
-+const F_GETFL: usize = 3;
-+const F_SETFL: usize = 4;
-+const F_DUPFD_CLOEXEC: usize = 1030;
-+// poll(2) events.
 +const POLLIN: i16 = 0x1;
-+// Maximum iovec count the kernel accepts in one readv/writev (UIO_MAXIOV).
-+const IOV_MAX: usize = 1024;
 +
-+#[inline]
-+fn cvt(r: usize) -> io::Result<usize> {
-+    sysc::ret(r).map_err(io::Error::from_raw_os_error)
-+}
-+
-+pub struct AnonPipe {
-+    fd: i32,
-+}
++/// One end of a kernel pipe. Read/write/dup/close come from the shared
++/// [`FileDesc`]; this type adds only pipe-specific helpers (`read_to_end`,
++/// `read2`).
++pub struct AnonPipe(FileDesc);
 +
 +impl AnonPipe {
 +    pub(crate) fn from_fd(fd: i32) -> AnonPipe {
-+        AnonPipe { fd }
++        AnonPipe(FileDesc::from_raw(fd))
 +    }
 +
 +    pub(crate) fn as_raw_fd(&self) -> i32 {
-+        self.fd
++        self.0.raw()
 +    }
 +
 +    pub fn try_clone(&self) -> io::Result<Self> {
-+        let fd = cvt(unsafe {
-+            sysc::syscall3(sysc::FCNTL, self.fd as usize, F_DUPFD_CLOEXEC, 0)
-+        })?;
-+        Ok(AnonPipe { fd: fd as i32 })
++        Ok(AnonPipe(self.0.duplicate()?))
 +    }
 +
 +    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-+        cvt(unsafe {
-+            sysc::syscall3(sysc::READ, self.fd as usize, buf.as_mut_ptr() as usize, buf.len())
-+        })
++        self.0.read(buf)
 +    }
 +
-+    pub fn read_buf(&self, mut cursor: BorrowedCursor<'_>) -> io::Result<()> {
-+        let n = cvt(unsafe {
-+            let dst = cursor.as_mut().as_mut_ptr() as usize;
-+            sysc::syscall3(sysc::READ, self.fd as usize, dst, cursor.capacity())
-+        })?;
-+        unsafe { cursor.advance_unchecked(n) };
-+        Ok(())
++    pub fn read_buf(&self, cursor: BorrowedCursor<'_>) -> io::Result<()> {
++        self.0.read_buf(cursor)
 +    }
 +
 +    pub fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
-+        // `IoSliceMut` is `repr(transparent)` over `iovec`; cap at IOV_MAX.
-+        let n = bufs.len().min(IOV_MAX);
-+        cvt(unsafe {
-+            sysc::syscall3(sysc::READV, self.fd as usize, bufs.as_mut_ptr() as usize, n)
-+        })
++        self.0.read_vectored(bufs)
 +    }
 +
 +    pub fn is_read_vectored(&self) -> bool {
@@ -4376,16 +4420,11 @@ index 00000000..818bcb39
 +    }
 +
 +    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
-+        cvt(unsafe {
-+            sysc::syscall3(sysc::WRITE, self.fd as usize, buf.as_ptr() as usize, buf.len())
-+        })
++        self.0.write(buf)
 +    }
 +
 +    pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-+        let n = bufs.len().min(IOV_MAX);
-+        cvt(unsafe {
-+            sysc::syscall3(sysc::WRITEV, self.fd as usize, bufs.as_ptr() as usize, n)
-+        })
++        self.0.write_vectored(bufs)
 +    }
 +
 +    pub fn is_write_vectored(&self) -> bool {
@@ -4393,17 +4432,9 @@ index 00000000..818bcb39
 +    }
 +}
 +
-+impl Drop for AnonPipe {
-+    fn drop(&mut self) {
-+        unsafe {
-+            sysc::syscall1(sysc::CLOSE, self.fd as usize);
-+        }
-+    }
-+}
-+
 +impl fmt::Debug for AnonPipe {
 +    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-+        f.debug_struct("AnonPipe").field("fd", &self.fd).finish()
++        f.debug_struct("AnonPipe").field("fd", &self.0.raw()).finish()
 +    }
 +}
 +
@@ -4411,7 +4442,7 @@ index 00000000..818bcb39
 +pub fn pipe() -> io::Result<(AnonPipe, AnonPipe)> {
 +    let mut fds = [0i32; 2];
 +    cvt(unsafe { sysc::syscall2(sysc::PIPE2, fds.as_mut_ptr() as usize, O_CLOEXEC) })?;
-+    Ok((AnonPipe { fd: fds[0] }, AnonPipe { fd: fds[1] }))
++    Ok((AnonPipe::from_fd(fds[0]), AnonPipe::from_fd(fds[1])))
 +}
 +
 +#[repr(C)]
@@ -4419,12 +4450,6 @@ index 00000000..818bcb39
 +    fd: i32,
 +    events: i16,
 +    revents: i16,
-+}
-+
-+fn set_nonblocking(fd: i32) -> io::Result<()> {
-+    let flags = cvt(unsafe { sysc::syscall3(sysc::FCNTL, fd as usize, F_GETFL, 0) })?;
-+    cvt(unsafe { sysc::syscall3(sysc::FCNTL, fd as usize, F_SETFL, flags | O_NONBLOCK) })?;
-+    Ok(())
 +}
 +
 +/// Drain one pipe into `v` until it would block; returns `true` at end-of-file.
@@ -4444,13 +4469,14 @@ index 00000000..818bcb39
 +/// Read two pipes to EOF concurrently, so a child that fills one stream while we
 +/// drain the other cannot deadlock.
 +pub fn read2(p1: AnonPipe, v1: &mut Vec<u8>, p2: AnonPipe, v2: &mut Vec<u8>) -> io::Result<()> {
-+    set_nonblocking(p1.fd)?;
-+    set_nonblocking(p2.fd)?;
++    p1.0.set_nonblocking(true)?;
++    p2.0.set_nonblocking(true)?;
++    let (fd1, fd2) = (p1.0.raw(), p2.0.raw());
 +    let mut done = [false, false];
 +    while !(done[0] && done[1]) {
 +        let mut fds = [
-+            PollFd { fd: if done[0] { -1 } else { p1.fd }, events: POLLIN, revents: 0 },
-+            PollFd { fd: if done[1] { -1 } else { p2.fd }, events: POLLIN, revents: 0 },
++            PollFd { fd: if done[0] { -1 } else { fd1 }, events: POLLIN, revents: 0 },
++            PollFd { fd: if done[1] { -1 } else { fd2 }, events: POLLIN, revents: 0 },
 +        ];
 +        // poll(fds, 2, -1): wait indefinitely until at least one is readable.
 +        match sysc::ret(unsafe {
@@ -4471,10 +4497,10 @@ index 00000000..818bcb39
 +}
 diff --git a/library/std/src/sys/pal/fullrust/stack_overflow.rs b/library/std/src/sys/pal/fullrust/stack_overflow.rs
 new file mode 100644
-index 00000000..f744e454
+index 00000000..5cf0bc8b
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/stack_overflow.rs
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,165 @@
 +//! Stack-overflow detection for the fullrust target, on raw Linux syscalls.
 +//!
 +//! A process-wide `SIGSEGV`/`SIGBUS` handler runs on a per-thread *alternate*
@@ -4490,6 +4516,7 @@ index 00000000..f744e454
 +//! `[stack]` mapping in `/proc/self/maps` (the kernel enforces the real guard).
 +
 +use super::sysc;
++use super::{mmap_anon, munmap};
 +use crate::cell::Cell;
 +
 +const PAGE: usize = 4096;
@@ -4511,25 +4538,6 @@ index 00000000..f744e454
 +// the unix pal.
 +thread_local! {
 +    static GUARD: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
-+}
-+
-+#[inline]
-+fn os_mmap(len: usize) -> *mut u8 {
-+    let r = unsafe {
-+        sysc::syscall6(
-+            sysc::MMAP,
-+            0,
-+            len,
-+            sysc::PROT_READ | sysc::PROT_WRITE,
-+            sysc::MAP_PRIVATE | sysc::MAP_ANONYMOUS,
-+            usize::MAX,
-+            0,
-+        )
-+    };
-+    match sysc::ret(r) {
-+        Ok(p) => crate::ptr::with_exposed_provenance_mut(p),
-+        Err(_) => crate::ptr::null_mut(),
-+    }
 +}
 +
 +/// Signal restorer. On x86-64 the kernel has no default sigreturn trampoline, so
@@ -4575,7 +4583,7 @@ index 00000000..f744e454
 +/// Install this thread's alternate signal stack. Returns its base (to free at
 +/// thread exit), or null if the mapping failed.
 +unsafe fn install_altstack() -> *mut u8 {
-+    let base = os_mmap(ALTSTACK_SIZE);
++    let base = mmap_anon(ALTSTACK_SIZE);
 +    if base.is_null() {
 +        return base;
 +    }
@@ -4611,7 +4619,7 @@ index 00000000..f744e454
 +    let ss: [usize; 3] = [0, SS_DISABLE, 0];
 +    unsafe {
 +        sysc::syscall2(sysc::SIGALTSTACK, ss.as_ptr() as usize, 0);
-+        sysc::syscall2(sysc::MUNMAP, altstack as usize, ALTSTACK_SIZE);
++        munmap(altstack as usize, ALTSTACK_SIZE);
 +    }
 +}
 +
@@ -4660,11 +4668,12 @@ index 00000000..f744e454
 +}
 diff --git a/library/std/src/sys/pal/fullrust/thread.rs b/library/std/src/sys/pal/fullrust/thread.rs
 new file mode 100644
-index 00000000..2196ed4e
+index 00000000..a3a2965d
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/thread.rs
-@@ -0,0 +1,267 @@
+@@ -0,0 +1,250 @@
 +use super::sysc;
++use super::{mmap_anon as mmap_stack, munmap};
 +use crate::ffi::CStr;
 +use crate::io;
 +use crate::num::NonZero;
@@ -4794,24 +4803,6 @@ index 00000000..2196ed4e
 +    }
 +}
 +
-+fn mmap_stack(size: usize) -> *mut u8 {
-+    let r = unsafe {
-+        sysc::syscall6(
-+            sysc::MMAP,
-+            0,
-+            size,
-+            sysc::PROT_READ | sysc::PROT_WRITE,
-+            sysc::MAP_PRIVATE | sysc::MAP_ANONYMOUS,
-+            usize::MAX,
-+            0,
-+        )
-+    };
-+    match sysc::ret(r) {
-+        Ok(p) => crate::ptr::with_exposed_provenance_mut(p),
-+        Err(_) => crate::ptr::null_mut(),
-+    }
-+}
-+
 +impl Thread {
 +    // unsafe: see thread::Builder::spawn_unchecked for safety requirements
 +    pub unsafe fn new(stack: usize, p: Box<dyn FnOnce()>) -> io::Result<Thread> {
@@ -4837,7 +4828,7 @@ index 00000000..2196ed4e
 +        if tp.is_null() {
 +            drop(unsafe { Box::from_raw(arg as *mut Payload) });
 +            unsafe {
-+                sysc::syscall2(sysc::MUNMAP, base as usize, size);
++                munmap(base as usize, size);
 +            }
 +            return Err(io::Error::from_raw_os_error(12)); // ENOMEM
 +        }
@@ -4856,9 +4847,9 @@ index 00000000..2196ed4e
 +        if r <= 0 {
 +            drop(unsafe { Box::from_raw(arg as *mut Payload) });
 +            unsafe {
-+                sysc::syscall2(sysc::MUNMAP, base as usize, size);
++                munmap(base as usize, size);
 +                if !tls_base.is_null() {
-+                    sysc::syscall2(sysc::MUNMAP, tls_base as usize, tls_size);
++                    munmap(tls_base as usize, tls_size);
 +                }
 +            }
 +            return Err(io::Error::from_raw_os_error(if r < 0 { -r as i32 } else { 11 }));
@@ -4910,9 +4901,9 @@ index 00000000..2196ed4e
 +        // kernel has finished writing the TLS exit handshake, so its `%fs` block
 +        // is dead too. Free both.
 +        unsafe {
-+            sysc::syscall2(sysc::MUNMAP, self.stack_base as usize, self.stack_size);
++            munmap(self.stack_base as usize, self.stack_size);
 +            if !self.tls_base.is_null() {
-+                sysc::syscall2(sysc::MUNMAP, self.tls_base as usize, self.tls_size);
++                munmap(self.tls_base as usize, self.tls_size);
 +            }
 +        }
 +    }
@@ -5006,10 +4997,10 @@ index 00000000..8ee3776b
 +}
 diff --git a/library/std/src/sys/pal/fullrust/tls.rs b/library/std/src/sys/pal/fullrust/tls.rs
 new file mode 100644
-index 00000000..2ce50801
+index 00000000..6c7d7d3a
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/tls.rs
-@@ -0,0 +1,280 @@
+@@ -0,0 +1,253 @@
 +//! Native ELF thread-local storage (`%fs`-based, variant II) for the fullrust
 +//! target — the libc-free equivalent of glibc/musl's `__init_tls`/`__copy_tls`.
 +//!
@@ -5105,36 +5096,9 @@ index 00000000..2ce50801
 +}
 +
 +// The program headers and the TLS init image live in the process's own loaded
-+// image, at addresses the kernel reported via the auxv — not memory we
-+// allocated. Reach them through exposed provenance (the strict-provenance escape
-+// hatch for addresses that originate outside Rust's allocation model).
-+#[inline]
-+unsafe fn rd_u32(addr: usize) -> u32 {
-+    unsafe { *ptr::with_exposed_provenance::<u32>(addr) }
-+}
-+#[inline]
-+unsafe fn rd_u64(addr: usize) -> u64 {
-+    unsafe { *ptr::with_exposed_provenance::<u64>(addr) }
-+}
-+
-+#[inline]
-+fn mmap(len: usize) -> *mut u8 {
-+    let r = unsafe {
-+        sysc::syscall6(
-+            sysc::MMAP,
-+            0,
-+            len,
-+            sysc::PROT_READ | sysc::PROT_WRITE,
-+            sysc::MAP_PRIVATE | sysc::MAP_ANONYMOUS,
-+            usize::MAX,
-+            0,
-+        )
-+    };
-+    match sysc::ret(r) {
-+        Ok(p) => ptr::with_exposed_provenance_mut(p),
-+        Err(_) => ptr::null_mut(),
-+    }
-+}
++// image, at addresses the kernel reported via the auxv (not memory we allocated),
++// so they are read through exposed provenance via the shared `rd_u32`/`rd_u64`.
++use super::{mmap_anon as mmap, rd_u32, rd_u64};
 +
 +/// Read the current thread's TCB via the `%fs:0` self-pointer. The thread
 +/// pointer is constant for the life of a thread, so this is `pure`/`readonly`.
