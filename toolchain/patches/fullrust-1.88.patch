@@ -126,6 +126,32 @@ index 00000000..d20db759
 +        options: base,
 +    }
 +}
+diff --git a/library/panic_abort/Cargo.toml b/library/panic_abort/Cargo.toml
+index 6f43ac48..ada8029e 100644
+--- a/library/panic_abort/Cargo.toml
++++ b/library/panic_abort/Cargo.toml
+@@ -17,5 +17,6 @@ cfg-if = { version = "1.0", features = ['rustc-dep-of-std'] }
+ core = { path = "../core" }
+ compiler_builtins = "0.1.0"
+ 
+-[target.'cfg(not(all(windows, target_env = "msvc")))'.dependencies]
++# `fullrust` aborts via `core::intrinsics::abort()` — no libc.
++[target.'cfg(all(not(target_os = "fullrust"), not(all(windows, target_env = "msvc"))))'.dependencies]
+ libc = { version = "0.2", default-features = false }
+diff --git a/library/panic_unwind/Cargo.toml b/library/panic_unwind/Cargo.toml
+index d176434e..18f46fb9 100644
+--- a/library/panic_unwind/Cargo.toml
++++ b/library/panic_unwind/Cargo.toml
+@@ -18,7 +18,8 @@ unwind = { path = "../unwind" }
+ compiler_builtins = "0.1.0"
+ cfg-if = { version = "1.0", features = ['rustc-dep-of-std'] }
+ 
+-[target.'cfg(not(all(windows, target_env = "msvc")))'.dependencies]
++# `fullrust` uses the pure-Rust gcc-personality path and no libc.
++[target.'cfg(all(not(target_os = "fullrust"), not(all(windows, target_env = "msvc"))))'.dependencies]
+ libc = { version = "0.2", default-features = false }
+ 
+ [lints.rust.unexpected_cfgs]
 diff --git a/library/panic_unwind/build.rs b/library/panic_unwind/build.rs
 new file mode 100644
 index 00000000..a6481350
@@ -151,6 +177,21 @@ index 50bd933a..e89abb9a 100644
          target_os = "solid_asp3",
          all(target_family = "unix", not(any(target_os = "espidf", target_os = "nuttx"))),
          all(target_vendor = "fortanix", target_env = "sgx"),
+diff --git a/library/std/Cargo.toml b/library/std/Cargo.toml
+index 7915196e..f90474dd 100644
+--- a/library/std/Cargo.toml
++++ b/library/std/Cargo.toml
+@@ -34,7 +34,9 @@ rustc-demangle = { version = "0.1.24", features = ['rustc-dep-of-std'] }
+ miniz_oxide = { version = "0.8.0", optional = true, default-features = false }
+ addr2line = { version = "0.24.0", optional = true, default-features = false }
+ 
+-[target.'cfg(not(all(windows, target_env = "msvc")))'.dependencies]
++# `fullrust` is libc-free by construction: its `std::sys::pal` talks to the
++# kernel directly, so it must not pull the `libc` crate into the build graph.
++[target.'cfg(all(not(target_os = "fullrust"), not(all(windows, target_env = "msvc"))))'.dependencies]
+ libc = { version = "0.2.172", default-features = false, features = [
+     'rustc-dep-of-std',
+ ], public = true }
 diff --git a/library/std/build.rs b/library/std/build.rs
 index ef695601..f4f4971b 100644
 --- a/library/std/build.rs
@@ -175,6 +216,20 @@ index ef695601..f4f4971b 100644
  
          // See src/bootstrap/src/core/build_steps/synthetic_targets.rs
          || env::var("RUSTC_BOOTSTRAP_SYNTHETIC_TARGET").is_ok()
+diff --git a/library/std/src/lib.rs b/library/std/src/lib.rs
+index c011f966..d1ce111d 100644
+--- a/library/std/src/lib.rs
++++ b/library/std/src/lib.rs
+@@ -444,7 +444,8 @@
+ // so include it here even if it's unused.
+ #[doc(masked)]
+ #[allow(unused_extern_crates)]
+-#[cfg(not(all(windows, target_env = "msvc")))]
++// `fullrust` has no libc; it is excluded from the `libc` dependency entirely.
++#[cfg(all(not(target_os = "fullrust"), not(all(windows, target_env = "msvc"))))]
+ extern crate libc;
+ 
+ // We always need an unwinder currently for backtraces
 diff --git a/library/std/src/os/fd/owned.rs b/library/std/src/os/fd/owned.rs
 index 10e1e73a..f7a5b72d 100644
 --- a/library/std/src/os/fd/owned.rs
@@ -6754,12 +6809,29 @@ index 9fafac3a..4630f37c 100644
          if #[cfg(any(
              all(
                  not(target_vendor = "apple"),
+diff --git a/library/test/Cargo.toml b/library/test/Cargo.toml
+index 2a32a7dd..7918b5b3 100644
+--- a/library/test/Cargo.toml
++++ b/library/test/Cargo.toml
+@@ -10,5 +10,6 @@ getopts = { version = "0.2.21", features = ['rustc-dep-of-std'] }
+ std = { path = "../std", public = true }
+ core = { path = "../core", public = true }
+ 
+-[target.'cfg(not(all(windows, target_env = "msvc")))'.dependencies]
++# `fullrust` is libc-free; its `test` signal handling avoids libc.
++[target.'cfg(all(not(target_os = "fullrust"), not(all(windows, target_env = "msvc"))))'.dependencies]
+ libc = { version = "0.2.150", default-features = false }
 diff --git a/library/unwind/Cargo.toml b/library/unwind/Cargo.toml
-index df43e6ae..94936c07 100644
+index df43e6ae..854a0aae 100644
 --- a/library/unwind/Cargo.toml
 +++ b/library/unwind/Cargo.toml
-@@ -21,7 +21,7 @@ cfg-if = "1.0"
- [target.'cfg(not(all(windows, target_env = "msvc")))'.dependencies]
+@@ -18,10 +18,11 @@ core = { path = "../core" }
+ compiler_builtins = "0.1.0"
+ cfg-if = "1.0"
+ 
+-[target.'cfg(not(all(windows, target_env = "msvc")))'.dependencies]
++# `fullrust` uses the pure-Rust `unwinding` backend (below) and no libc.
++[target.'cfg(all(not(target_os = "fullrust"), not(all(windows, target_env = "msvc"))))'.dependencies]
  libc = { version = "0.2.140", features = ['rustc-dep-of-std'], default-features = false }
  
 -[target.'cfg(target_os = "xous")'.dependencies]
@@ -6781,10 +6853,29 @@ index 00000000..a6481350
 +    println!("cargo:rustc-check-cfg=cfg(target_os, values(\"fullrust\"))");
 +}
 diff --git a/library/unwind/src/lib.rs b/library/unwind/src/lib.rs
-index 5451a38a..72f12a8e 100644
+index 5451a38a..7935e2f2 100644
 --- a/library/unwind/src/lib.rs
 +++ b/library/unwind/src/lib.rs
-@@ -34,7 +34,7 @@
+@@ -3,7 +3,7 @@
+ #![feature(cfg_emscripten_wasm_eh)]
+ #![feature(link_cfg)]
+ #![feature(staged_api)]
+-#![cfg_attr(not(target_env = "msvc"), feature(libc))]
++#![cfg_attr(all(not(target_env = "msvc"), not(target_os = "fullrust")), feature(libc))]
+ #![cfg_attr(
+     all(target_family = "wasm", any(not(target_os = "emscripten"), emscripten_wasm_eh)),
+     feature(simd_wasm64, wasm_exception_handling_intrinsics)
+@@ -12,7 +12,8 @@
+ #![deny(unsafe_op_in_unsafe_fn)]
+ 
+ // Force libc to be included even if unused. This is required by many platforms.
+-#[cfg(not(all(windows, target_env = "msvc")))]
++// `fullrust` is deliberately libc-free, so it is excluded.
++#[cfg(all(not(target_os = "fullrust"), not(all(windows, target_env = "msvc"))))]
+ extern crate libc as _;
+ 
+ cfg_if::cfg_if! {
+@@ -34,7 +35,7 @@
      ))] {
          mod libunwind;
          pub use libunwind::*;
@@ -6840,3 +6931,234 @@ index ceac24d4..5dce690c 100644
          .host(&build.build.triple);
      match build.crt_static(target) {
          Some(a) => {
+diff --git a/library/backtrace/Cargo.toml b/library/backtrace/Cargo.toml
+index b363e45..2fe68b4 100644
+--- a/library/backtrace/Cargo.toml
++++ b/library/backtrace/Cargo.toml
+@@ -45,6 +45,10 @@ windows-targets = "0.52.6"
+ miniz_oxide = { version = "0.8", default-features = false }
+ ruzstd = { version = "0.7.3", default-features = false, optional = true }
+ addr2line = { version = "0.24.0", default-features = false }
++
++# `fullrust` is libc-free (its symbolizer takes `c_void` from `core::ffi`), so
++# keep the `libc` crate out of its build graph while other targets still get it.
++[target.'cfg(all(not(target_os = "fullrust"), not(all(windows, target_env = "msvc", not(target_vendor = "uwp")))))'.dependencies]
+ libc = { version = "0.2.156", default-features = false }
+ 
+ [target.'cfg(not(all(windows, target_env = "msvc", not(target_vendor = "uwp"))))'.dependencies.object]
+diff --git a/library/backtrace/src/backtrace/frameptr.rs b/library/backtrace/src/backtrace/frameptr.rs
+new file mode 100644
+index 0000000..7c8d533
+--- /dev/null
++++ b/library/backtrace/src/backtrace/frameptr.rs
+@@ -0,0 +1,78 @@
++//! Frame-pointer stack unwinding, for targets with no unwinder or DWARF
++//! `.eh_frame` (e.g. the libc-free `fullrust` target: `panic = abort`, no
++//! libunwind). The target forces frame pointers on (`frame_pointer: Always`),
++//! and its entry points zero the base pointer at the outermost frame, so the
++//! saved-frame-pointer chain is walkable and terminates cleanly.
++
++use core::ffi::c_void;
++
++// Addresses are stored as `usize` (not raw pointers) so a captured `Frame` is
++// `Send + Sync`, which `std::backtrace::Backtrace` requires of stored frames.
++#[derive(Clone)]
++pub struct Frame {
++    ip: usize,
++    sp: usize,
++}
++
++impl Frame {
++    pub fn ip(&self) -> *mut c_void {
++        self.ip as *mut c_void
++    }
++
++    pub fn sp(&self) -> *mut c_void {
++        self.sp as *mut c_void
++    }
++
++    pub fn symbol_address(&self) -> *mut c_void {
++        self.ip as *mut c_void
++    }
++
++    pub fn module_base_address(&self) -> Option<*mut c_void> {
++        None
++    }
++}
++
++/// Walk the saved-frame-pointer chain, invoking `cb` for each return address.
++///
++/// SAFETY: reads the frame-record chain rooted at the current frame pointer.
++/// This is sound only because the target guarantees frame pointers and a
++/// null-terminated chain; the alignment / monotonicity / depth guards below
++/// stop the walk before it can dereference a bogus pointer.
++#[inline(never)]
++pub unsafe fn trace(cb: &mut dyn FnMut(&super::Frame) -> bool) {
++    const WORD: usize = core::mem::size_of::<usize>();
++
++    let mut fp: usize;
++    #[cfg(target_arch = "x86_64")]
++    unsafe {
++        core::arch::asm!("mov {}, rbp", out(reg) fp, options(nomem, nostack, preserves_flags));
++    }
++    #[cfg(target_arch = "aarch64")]
++    unsafe {
++        core::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack, preserves_flags));
++    }
++    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++    {
++        let _ = cb;
++        return;
++    }
++
++    // A standard frame record is `[fp] = caller fp`, `[fp + WORD] = return addr`.
++    // The chain must strictly increase (stacks grow down) and stay word-aligned;
++    // both `_start` and the thread trampoline zero the base pointer at the top.
++    let mut prev = 0usize;
++    let mut depth = 0usize;
++    while fp != 0 && fp & (WORD - 1) == 0 && fp > prev && depth < 256 {
++        let ret = unsafe { ((fp + WORD) as *const usize).read() };
++        if ret == 0 {
++            break;
++        }
++        let frame = super::Frame { inner: Frame { ip: ret, sp: fp + 2 * WORD } };
++        if !cb(&frame) {
++            break;
++        }
++        prev = fp;
++        fp = unsafe { (fp as *const usize).read() };
++        depth += 1;
++    }
++}
+diff --git a/library/backtrace/src/backtrace/mod.rs b/library/backtrace/src/backtrace/mod.rs
+index 2a36214..1c8e4da 100644
+--- a/library/backtrace/src/backtrace/mod.rs
++++ b/library/backtrace/src/backtrace/mod.rs
+@@ -198,6 +198,10 @@ cfg_if::cfg_if! {
+                 pub(crate) use self::win32::Frame as FrameImp;
+             }
+         }
++    } else if #[cfg(all(target_os = "fullrust", any(target_arch = "x86_64", target_arch = "aarch64")))] {
++        mod frameptr;
++        use self::frameptr::trace as trace_imp;
++        pub(crate) use self::frameptr::Frame as FrameImp;
+     } else {
+         mod noop;
+         use self::noop::trace as trace_imp;
+diff --git a/library/backtrace/src/symbolize/gimli.rs b/library/backtrace/src/symbolize/gimli.rs
+index d7ff410..cca6e1e 100644
+--- a/library/backtrace/src/symbolize/gimli.rs
++++ b/library/backtrace/src/symbolize/gimli.rs
+@@ -12,7 +12,12 @@ use super::SymbolName;
+ use addr2line::gimli;
+ use core::convert::TryInto;
+ use core::mem;
++// `libc::c_void` is just a re-export of `core::ffi::c_void`; on the libc-free
++// `fullrust` target take it straight from core so no libc dep is needed.
++#[cfg(not(target_os = "fullrust"))]
+ use libc::c_void;
++#[cfg(target_os = "fullrust")]
++use core::ffi::c_void;
+ use mystd::ffi::OsString;
+ use mystd::fs::File;
+ use mystd::path::Path;
+@@ -247,6 +252,9 @@ cfg_if::cfg_if! {
+     } else if #[cfg(target_os = "aix")] {
+         mod libs_aix;
+         use libs_aix::native_libraries;
++    } else if #[cfg(target_os = "fullrust")] {
++        mod libs_fullrust;
++        use libs_fullrust::native_libraries;
+     } else {
+         // Everything else should doesn't know how to load native libraries.
+         fn native_libraries() -> Vec<Library> {
+diff --git a/library/backtrace/src/symbolize/gimli/elf.rs b/library/backtrace/src/symbolize/gimli/elf.rs
+index a3ddc9d..c047e2f 100644
+--- a/library/backtrace/src/symbolize/gimli/elf.rs
++++ b/library/backtrace/src/symbolize/gimli/elf.rs
+@@ -2,8 +2,28 @@
+ 
+ use super::mystd::ffi::OsStr;
+ use super::mystd::fs;
++#[cfg(not(target_os = "fullrust"))]
+ use super::mystd::os::unix::ffi::OsStrExt;
+ use super::mystd::path::{Path, PathBuf};
++
++// `fullrust` is not in the unix family, so it lacks `os::unix::ffi::OsStrExt`,
++// but its `OsStr` encoding *is* the raw bytes — provide the same two methods on
++// top of the stable byte-exact `OsStr` API.
++#[cfg(target_os = "fullrust")]
++trait OsStrExt {
++    fn from_bytes(slice: &[u8]) -> &OsStr;
++    fn as_bytes(&self) -> &[u8];
++}
++#[cfg(target_os = "fullrust")]
++impl OsStrExt for OsStr {
++    fn from_bytes(slice: &[u8]) -> &OsStr {
++        // SAFETY: every byte sequence is valid `OsStr` content on this target.
++        unsafe { OsStr::from_encoded_bytes_unchecked(slice) }
++    }
++    fn as_bytes(&self) -> &[u8] {
++        self.as_encoded_bytes()
++    }
++}
+ use super::Either;
+ use super::{gimli, Context, Endian, EndianSlice, Mapping, Stash};
+ use alloc::string::String;
+diff --git a/library/backtrace/src/symbolize/gimli/libs_fullrust.rs b/library/backtrace/src/symbolize/gimli/libs_fullrust.rs
+new file mode 100644
+index 0000000..597c86c
+--- /dev/null
++++ b/library/backtrace/src/symbolize/gimli/libs_fullrust.rs
+@@ -0,0 +1,23 @@
++use super::mystd::env;
++use super::{Library, LibrarySegment};
++use alloc::vec;
++use alloc::vec::Vec;
++
++// `fullrust` executables are statically linked and non-PIE, so the ELF's stated
++// virtual addresses equal the runtime addresses: the single mapped image has a
++// bias of 0 and a lone segment covering the whole address space. Symbolization
++// then reads DWARF straight from the on-disk executable (`/proc/self/exe`).
++pub(super) fn native_libraries() -> Vec<Library> {
++    let mut ret = Vec::new();
++    if let Ok(path) = env::current_exe() {
++        ret.push(Library {
++            name: path.into_os_string(),
++            segments: vec![LibrarySegment {
++                stated_virtual_memory_address: 0,
++                len: usize::MAX,
++            }],
++            bias: 0,
++        });
++    }
++    ret
++}
+diff --git a/library/backtrace/src/symbolize/mod.rs b/library/backtrace/src/symbolize/mod.rs
+index 137d2ea..60b1747 100644
+--- a/library/backtrace/src/symbolize/mod.rs
++++ b/library/backtrace/src/symbolize/mod.rs
+@@ -436,7 +436,7 @@ cfg_if::cfg_if! {
+         mod dbghelp;
+         use dbghelp as imp;
+     } else if #[cfg(all(
+-        any(unix, all(windows, target_env = "gnu")),
++        any(unix, all(windows, target_env = "gnu"), target_os = "fullrust"),
+         not(target_vendor = "uwp"),
+         not(target_os = "emscripten"),
+         any(not(backtrace_in_libstd), feature = "backtrace"),
+diff --git a/library/stdarch/crates/std_detect/Cargo.toml b/library/stdarch/crates/std_detect/Cargo.toml
+index b674110..185bb63 100644
+--- a/library/stdarch/crates/std_detect/Cargo.toml
++++ b/library/stdarch/crates/std_detect/Cargo.toml
+@@ -28,7 +28,9 @@ core = { version = "1.0.0", optional = true, package = "rustc-std-workspace-core
+ compiler_builtins = { version = "0.1.2", optional = true }
+ alloc = { version = "1.0.0", optional = true, package = "rustc-std-workspace-alloc" }
+ 
+-[target.'cfg(not(windows))'.dependencies]
++# `fullrust` (x86_64) detects features via cpuid (os/x86.rs), never libc; and it
++# is libc-free by construction, so keep the crate out of its build graph.
++[target.'cfg(all(not(windows), not(target_os = "fullrust")))'.dependencies]
+ libc = { version = "0.2.0", optional = true, default-features = false }
+ 
+ [features]

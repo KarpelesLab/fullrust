@@ -99,9 +99,17 @@ BOOTSTRAP_SKIP_TARGET_SANITY=1 python3 x.py build library --stage 1 \
 To regenerate the overlay after editing the rust tree:
 
 ```console
-cd rust-1.88 && git add -A -- compiler/rustc_target library/std src/bootstrap \
-  && git diff --cached HEAD > ../patches/fullrust-1.88.patch && git reset -q
+./regen-overlay.sh 1.88
 ```
+
+This captures both the main-repo edits **and** the edits inside the vendored
+submodules the overlay patches (`library/backtrace`, `library/stdarch`). A
+superproject `git diff` only sees submodule *pointers*, so those submodules are
+diffed inside themselves and path-prefixed back to the superproject root; the
+combined patch applies with a single `git apply` (which `build-fork.sh` runs
+after `git submodule update --init`-ing those two submodules). Verify the
+regenerated patch is exact with
+`git -C rust-1.88 apply --check --reverse "$PWD/patches/fullrust-1.88.patch"`.
 
 ## Status
 
