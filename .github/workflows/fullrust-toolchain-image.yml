@@ -1,0 +1,106 @@
+name: fullrust toolchain image
+
+# Builds the fullrust *toolchain-fork* image (patched stage1 compiler with the
+# built-in x86_64-unknown-linux-fullrust target + the getrandom/socket2
+# ecosystem bundle) and publishes it to ghcr.io/<owner>/fullrust.
+#
+# The toolchain build is heavy: this repo's bootstrap config builds LLVM from
+# source (CI LLVM for the tag is expired), so expect a multi-hour first run.
+# `actions/cache` on the build dir makes reruns much faster. If a standard
+# runner is too small/slow, use a larger runner or flip `download-ci-llvm = true`
+# in toolchain/bootstrap-1.88.toml (fast, if the tag's CI LLVM is available).
+
+on:
+  workflow_dispatch:
+    inputs:
+      push:
+        description: "Push the image to ghcr.io"
+        type: boolean
+        default: true
+  push:
+    tags: ["toolchain-image-v*"]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  MINOR: "1.88"
+  PATCH_VERSION: "1.88.0"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v6
+
+      # A source LLVM + rustc build needs ~20 GB; reclaim space up front.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          large-packages: false
+          swap-storage: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            python3 cmake ninja-build clang git build-essential
+
+      - name: Compute lowercase image name
+        id: img
+        run: echo "image=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/fullrust" >> "$GITHUB_OUTPUT"
+
+      # The build dir carries the (expensive) LLVM + stage1 artifacts. Keyed on
+      # the overlay patch + bootstrap config so edits invalidate correctly.
+      - name: Cache toolchain build
+        uses: actions/cache@v4
+        with:
+          path: toolchain/rust-${{ env.MINOR }}/build
+          key: fullrust-build-${{ env.MINOR }}-${{ hashFiles(format('toolchain/patches/fullrust-{0}.patch', env.MINOR), format('toolchain/bootstrap-{0}.toml', env.MINOR)) }}
+          restore-keys: fullrust-build-${{ env.MINOR }}-
+
+      - name: Build the fullrust toolchain (clone rust, apply overlay, build stage1)
+        working-directory: toolchain
+        run: ./build-fork.sh "${{ env.PATCH_VERSION }}"
+
+      - name: Build the image
+        working-directory: toolchain
+        run: ./docker/build-image.sh "${{ env.MINOR }}" "${{ steps.img.outputs.image }}:${{ env.MINOR }}"
+
+      - name: Smoke-test — unmodified crate → static, libc-free binary
+        run: |
+          mkdir -p /tmp/demo/src
+          printf '[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n' > /tmp/demo/Cargo.toml
+          printf 'fn main() { println!("built by the fullrust docker image"); }\n' > /tmp/demo/src/main.rs
+          docker run --rm -v /tmp/demo:/src "${{ steps.img.outputs.image }}:${{ env.MINOR }}" build --release
+          bin=/tmp/demo/target/x86_64-unknown-linux-fullrust/release/demo
+          file "$bin" | grep -q "statically linked"
+          ! ldd "$bin" 2>&1 | grep -q "=>"     # no dynamic deps
+          "$bin"
+
+      - name: Smoke-test — ecosystem patch (rand/getrandom) auto-injected
+        run: |
+          mkdir -p /tmp/eco/src
+          printf '[package]\nname = "eco"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\ngetrandom = "0.2"\n' > /tmp/eco/Cargo.toml
+          printf 'fn main() { let mut b = [0u8; 16]; getrandom::getrandom(&mut b).unwrap(); assert!(b.iter().any(|&x| x != 0)); println!("getrandom via ecosystem patch: {b:02x?}"); }\n' > /tmp/eco/src/main.rs
+          docker run --rm -v /tmp/eco:/src "${{ steps.img.outputs.image }}:${{ env.MINOR }}" build --release
+          /tmp/eco/target/x86_64-unknown-linux-fullrust/release/eco
+
+      - name: Log in to ghcr.io
+        if: ${{ github.event_name == 'push' || inputs.push }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag & push
+        if: ${{ github.event_name == 'push' || inputs.push }}
+        run: |
+          img="${{ steps.img.outputs.image }}"
+          docker tag "$img:${{ env.MINOR }}" "$img:latest"
+          docker push "$img:${{ env.MINOR }}"
+          docker push "$img:latest"
