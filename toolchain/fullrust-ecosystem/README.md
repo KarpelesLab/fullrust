@@ -21,10 +21,17 @@ Teaching it fullrust unblocks all of them with no consumer code changes.
 `socket2` is the fd-level socket gateway (used by `mio`, async runtimes, and many
 network crates). Unlike getrandom it isn't a tiny shim: the backend re-implements
 socket2's `sys` interface over raw Linux syscalls (mirroring `std::sys::net`),
-because socket2's stock backend is a ~3300-line libc layer. **Caveat:** the
-backend covers the default surface; socket2's `feature = "all"` pulls in dozens
-more Linux-specific extras (DCCP, `SO_MARK`, `original_dst`, `socketpair`, …)
-that are **not** yet implemented. Build socket2-dependent crates without `all`.
+because socket2's stock backend is a ~3300-line libc layer.
+
+`feature = "all"` **compiles and works** for the portable extras: `Socket::pair`
+(socketpair), `nonblocking()`, and full TCP keepalive (interval/retries). What is
+**not** implemented is the long tail of platform methods socket2 defines inside
+its `sys/unix.rs` `impl Socket` block — `mss`, `mark`, `cork`, `quickack`,
+`device`, `sendfile`, TCP congestion, BPF `attach_filter`, DCCP, vsock — which are
+simply absent for fullrust (they'd each need porting into a fullrust `impl Socket`
+block). The six `target_os = "linux"`-only methods (`ip_transparent`,
+`multicast_all_v4/v6`) also stay gated out (they hard-reference `libc::` consts).
+Everything an ordinary TCP/UDP client or server needs is covered.
 
 `patches/` holds the *diff of our changes only* (on top of the pristine
 crates.io source), for review and for upstreaming the gate broadening.
@@ -70,4 +77,5 @@ purecrypto = { path = "/abs/path/to/purecrypto" }
   `gen`, `shuffle`).
 - `socket2` (0.5.10): a full loopback TCP round-trip — socket/`SO_REUSEADDR`/bind/
   listen/getsockname → connect/`TCP_NODELAY`+getsockopt readback → accept/
-  getpeername → send/recv echo — static and libc-free.
+  getpeername → send/recv echo — plus `feature = "all"`: `Socket::pair`
+  (socketpair) round-trip and `nonblocking()` toggle. Static and libc-free.

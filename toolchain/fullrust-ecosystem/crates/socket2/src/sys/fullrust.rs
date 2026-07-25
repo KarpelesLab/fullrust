@@ -35,6 +35,7 @@ const NR_BIND: usize = 49;
 const NR_LISTEN: usize = 50;
 const NR_GETSOCKNAME: usize = 51;
 const NR_GETPEERNAME: usize = 52;
+const NR_SOCKETPAIR: usize = 53;
 const NR_SETSOCKOPT: usize = 54;
 const NR_GETSOCKOPT: usize = 55;
 const NR_FCNTL: usize = 72;
@@ -276,6 +277,7 @@ pub(crate) const SO_SNDTIMEO: c_int = 21;
 
 pub(crate) const IP_TOS: c_int = 1;
 pub(crate) const IP_TTL: c_int = 2;
+pub(crate) const IP_HDRINCL: c_int = 3;
 pub(crate) const IP_RECVTOS: c_int = 13;
 pub(crate) const IP_MULTICAST_IF: c_int = 32;
 pub(crate) const IP_MULTICAST_TTL: c_int = 33;
@@ -292,6 +294,7 @@ pub(crate) const IPV6_MULTICAST_LOOP: c_int = 19;
 pub(crate) const IPV6_ADD_MEMBERSHIP: c_int = 20;
 pub(crate) const IPV6_DROP_MEMBERSHIP: c_int = 21;
 pub(crate) const IPV6_V6ONLY: c_int = 26;
+pub(crate) const IPV6_RECVHOPLIMIT: c_int = 51;
 pub(crate) const IPV6_RECVTCLASS: c_int = 66;
 pub(crate) const IPV6_TCLASS: c_int = 67;
 
@@ -777,7 +780,39 @@ pub(crate) fn set_tcp_keepalive(fd: Socket, keepalive: &TcpKeepalive) -> io::Res
         let secs = into_secs(time);
         unsafe { setsockopt(fd, IPPROTO_TCP, KEEPALIVE_TIME, secs)? }
     }
+    if let Some(interval) = keepalive.interval {
+        let secs = into_secs(interval);
+        unsafe { setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, secs)? }
+    }
+    if let Some(retries) = keepalive.retries {
+        unsafe { setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, retries as c_int)? }
+    }
     Ok(())
+}
+
+pub(crate) fn nonblocking(fd: Socket) -> io::Result<bool> {
+    let flags = cvt(unsafe { sys3(NR_FCNTL, fd as usize, F_GETFL as usize, 0) })? as c_int;
+    Ok((flags & O_NONBLOCK) != 0)
+}
+
+pub(crate) fn keepalive_time(fd: Socket) -> io::Result<Duration> {
+    unsafe {
+        getsockopt::<c_int>(fd, IPPROTO_TCP, KEEPALIVE_TIME).map(|secs| Duration::from_secs(secs as u64))
+    }
+}
+
+pub(crate) fn socketpair(family: c_int, ty: c_int, protocol: c_int) -> io::Result<[Socket; 2]> {
+    let mut fds = [0 as Socket; 2];
+    cvt(unsafe {
+        sys4(
+            NR_SOCKETPAIR,
+            family as usize,
+            ty as usize,
+            protocol as usize,
+            fds.as_mut_ptr() as usize,
+        )
+    })?;
+    Ok(fds)
 }
 
 // ---------------------------------------------------------------------------

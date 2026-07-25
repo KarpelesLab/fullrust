@@ -151,7 +151,7 @@ impl Socket {
     /// This function sets the same flags as in done for [`Socket::new`],
     /// [`Socket::pair_raw`] can be used if you don't want to set those flags.
     #[doc = man_links!(unix: socketpair(2))]
-    #[cfg(all(feature = "all", unix))]
+    #[cfg(all(feature = "all", any(unix, target_os = "fullrust")))]
     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", unix))))]
     pub fn pair(
         domain: Domain,
@@ -168,7 +168,7 @@ impl Socket {
     /// Creates a pair of sockets which are connected to each other.
     ///
     /// This function corresponds to `socketpair(2)`.
-    #[cfg(all(feature = "all", unix))]
+    #[cfg(all(feature = "all", any(unix, target_os = "fullrust")))]
     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", unix))))]
     pub fn pair_raw(
         domain: Domain,
@@ -384,7 +384,7 @@ impl Socket {
     /// `O_NONBLOCK`.
     ///
     /// On Windows it is not possible retrieve the nonblocking mode status.
-    #[cfg(all(feature = "all", unix))]
+    #[cfg(all(feature = "all", any(unix, target_os = "fullrust")))]
     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", unix))))]
     pub fn nonblocking(&self) -> io::Result<bool> {
         sys::nonblocking(self.as_raw())
