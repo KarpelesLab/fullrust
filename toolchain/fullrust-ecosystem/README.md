@@ -12,10 +12,19 @@ block instead of discovering and patching them one compile-error at a time.
 | crate | version | what the fork adds |
 |-------|---------|--------------------|
 | `getrandom` | 0.2.17 | a `#[cfg(target_os = "fullrust")]` backend issuing the raw Linux `getrandom(2)` syscall (no libc) — see `crates/getrandom/src/fullrust.rs` |
+| `socket2` | 0.5.10 | a full raw-syscall `sys/fullrust.rs` backend (socket/bind/connect/accept/get-setsockopt/send/recv/…) + 3 one-line `#[cfg(unix)]` → `#[cfg(any(unix, target_os = "fullrust"))]` broadenings in shared code |
 
 `getrandom` is the single highest-leverage crate: `rand`, most of the crypto
 ecosystem, `uuid`, `ahash`, and anything needing seed entropy funnel through it.
 Teaching it fullrust unblocks all of them with no consumer code changes.
+
+`socket2` is the fd-level socket gateway (used by `mio`, async runtimes, and many
+network crates). Unlike getrandom it isn't a tiny shim: the backend re-implements
+socket2's `sys` interface over raw Linux syscalls (mirroring `std::sys::net`),
+because socket2's stock backend is a ~3300-line libc layer. **Caveat:** the
+backend covers the default surface; socket2's `feature = "all"` pulls in dozens
+more Linux-specific extras (DCCP, `SO_MARK`, `original_dst`, `socketpair`, …)
+that are **not** yet implemented. Build socket2-dependent crates without `all`.
 
 `patches/` holds the *diff of our changes only* (on top of the pristine
 crates.io source), for review and for upstreaming the gate broadening.
@@ -28,6 +37,7 @@ workspace root), pointing at this directory:
 ```toml
 [patch.crates-io]
 getrandom = { path = "/abs/path/to/fullrust/toolchain/fullrust-ecosystem/crates/getrandom" }
+socket2   = { path = "/abs/path/to/fullrust/toolchain/fullrust-ecosystem/crates/socket2" }
 ```
 
 Then build for the target as usual:
@@ -55,6 +65,9 @@ purecrypto = { path = "/abs/path/to/purecrypto" }
 
 ## Verified
 
-`rand` (0.8) + `getrandom` (0.2.17) compile and run on a static, libc-free
-fullrust binary, with real per-run entropy from the kernel (`thread_rng`, `gen`,
-`shuffle`). See `toolchain`'s scratchpad `rand-probe`.
+- `rand` (0.8) + `getrandom` (0.2.17): compile and run on a static, libc-free
+  fullrust binary, with real per-run entropy from the kernel (`thread_rng`,
+  `gen`, `shuffle`).
+- `socket2` (0.5.10): a full loopback TCP round-trip — socket/`SO_REUSEADDR`/bind/
+  listen/getsockname → connect/`TCP_NODELAY`+getsockopt readback → accept/
+  getpeername → send/recv echo — static and libc-free.
