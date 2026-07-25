@@ -1,0 +1,60 @@
+# fullrust ecosystem bundle
+
+`target_os = "fullrust"` is a brand-new OS, so crates that gate on `cfg(unix)`
+or an explicit `target_os` list don't recognize it. Most **pure-Rust** crates
+need nothing (serde, and rsurl built with zero changes); the friction is a small
+set of **gateway crates** that many others funnel through. This bundle carries a
+fullrust-aware fork of each, so a consumer opts in with a `[patch.crates-io]`
+block instead of discovering and patching them one compile-error at a time.
+
+## Contents
+
+| crate | version | what the fork adds |
+|-------|---------|--------------------|
+| `getrandom` | 0.2.17 | a `#[cfg(target_os = "fullrust")]` backend issuing the raw Linux `getrandom(2)` syscall (no libc) — see `crates/getrandom/src/fullrust.rs` |
+
+`getrandom` is the single highest-leverage crate: `rand`, most of the crypto
+ecosystem, `uuid`, `ahash`, and anything needing seed entropy funnel through it.
+Teaching it fullrust unblocks all of them with no consumer code changes.
+
+`patches/` holds the *diff of our changes only* (on top of the pristine
+crates.io source), for review and for upstreaming the gate broadening.
+
+## Use it in a project
+
+Add to the **workspace root** `Cargo.toml` (patches only take effect at the
+workspace root), pointing at this directory:
+
+```toml
+[patch.crates-io]
+getrandom = { path = "/abs/path/to/fullrust/toolchain/fullrust-ecosystem/crates/getrandom" }
+```
+
+Then build for the target as usual:
+
+```console
+RUSTC_BOOTSTRAP=1 cargo +fullrust-1.88 build --release \
+  --target x86_64-unknown-linux-fullrust
+```
+
+If cargo reports the patch was "not used" because the lockfile pins a different
+source, nudge it: `cargo update -p getrandom`.
+
+## A note on your own crates (e.g. purecrypto)
+
+Crates *you* own don't belong in this bundle — fix them at the source. purecrypto
+already carries a fullrust `OsRng` (gated `cfg(all(feature = "std", target_os =
+"fullrust"))`, reading `/dev/urandom`); the durable fix is to **publish** that
+version so consumers (rsurl) pick it up via the normal version requirement. Until
+then a consumer can path-patch it the same way:
+
+```toml
+[patch.crates-io]
+purecrypto = { path = "/abs/path/to/purecrypto" }
+```
+
+## Verified
+
+`rand` (0.8) + `getrandom` (0.2.17) compile and run on a static, libc-free
+fullrust binary, with real per-run entropy from the kernel (`thread_rng`, `gen`,
+`shuffle`). See `toolchain`'s scratchpad `rand-probe`.
