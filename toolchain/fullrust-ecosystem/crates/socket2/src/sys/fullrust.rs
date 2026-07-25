@@ -10,6 +10,7 @@ use std::io::{self, IoSlice};
 use std::marker::PhantomData;
 use std::mem::{self, size_of, MaybeUninit};
 use std::net::{Ipv4Addr, Ipv6Addr, Shutdown};
+use std::num::NonZeroUsize;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::fullrust::ffi::OsStrExt;
 use std::path::Path;
@@ -23,6 +24,7 @@ use crate::{MsgHdr, MsgHdrMut, RecvFlags, SockAddr, TcpKeepalive};
 // ---------------------------------------------------------------------------
 
 // x86_64 Linux socket-related syscall numbers.
+const NR_SENDFILE: usize = 40;
 const NR_POLL: usize = 7;
 const NR_SOCKET: usize = 41;
 const NR_CONNECT: usize = 42;
@@ -895,6 +897,47 @@ pub(crate) const fn to_mreqn(
             imr_address: to_in_addr(interface),
             imr_ifindex: 0,
         },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Platform methods socket2 defines in its `sys/unix.rs` `impl Socket` block.
+// fullrust uses this file instead of unix.rs, so the ones we support live here.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "all")]
+impl crate::Socket {
+    /// Copies data between a `file` and this socket using the `sendfile(2)`
+    /// syscall (zero-copy), starting at `offset` in the file. `length` bounds
+    /// the number of bytes; `None` sends as many as the kernel allows in one
+    /// call. Returns the number of bytes sent.
+    pub fn sendfile<F>(
+        &self,
+        file: &F,
+        offset: usize,
+        length: Option<NonZeroUsize>,
+    ) -> io::Result<usize>
+    where
+        F: AsRawFd,
+    {
+        // Linux `sendfile(out_fd, in_fd, offset*, count)`. A null offset would
+        // advance the file's own position; we pass a mutable one like socket2.
+        let count = match length {
+            Some(n) => n.get(),
+            // The most the Linux kernel writes in a single call.
+            None => 0x7fff_f000,
+        };
+        let mut offset = offset as i64; // loff_t
+        let n = cvt(unsafe {
+            sys4(
+                NR_SENDFILE,
+                self.as_raw() as usize,
+                file.as_raw_fd() as usize,
+                ptr::addr_of_mut!(offset) as usize,
+                count,
+            )
+        })?;
+        Ok(n as usize)
     }
 }
 
