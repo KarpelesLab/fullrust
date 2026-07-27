@@ -2,6 +2,8 @@ name: Static artifacts (demo)
 
 # Demonstrates the reusable action (./action.yml): build an unmodified crate
 # into a pure libc-free static binary and upload it. Reference for users.
+# Requires the toolchain image (ghcr.io/<owner>/fullrust) to be published first
+# by the `fullrust toolchain image` workflow.
 on:
   workflow_dispatch:
   push:
@@ -39,7 +41,7 @@ jobs:
 
       - name: Show it is libc-free
         run: |
-          BIN=/tmp/demo/target/x86_64-fullrust-linux/release/demo
+          BIN=/tmp/demo/target/x86_64-unknown-linux-fullrust/release/demo
           file "$BIN"
           ldd "$BIN" || true
           "$BIN"
@@ -48,13 +50,13 @@ jobs:
         run: |
           name="demo-x86_64-linux-static"
           mkdir -p "dist/$name"
-          cp /tmp/demo/target/x86_64-fullrust-linux/release/demo "dist/$name/"
+          cp /tmp/demo/target/x86_64-unknown-linux-fullrust/release/demo "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
 
       - name: Upload as a workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: demo-x86_64-fullrust-linux
+          name: demo-x86_64-unknown-linux-fullrust
           path: dist/demo-x86_64-linux-static.tar.gz
           if-no-files-found: error
 

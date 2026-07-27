@@ -1,45 +1,54 @@
 name: "fullrust static build"
-description: "Build a Rust crate into a libc-free, fully-static binary with cargo-fullrust (no libc, no C toolchain)."
+description: "Build a Rust crate into a libc-free, fully-static x86_64-unknown-linux-fullrust binary using the fullrust toolchain image (no libc, no C toolchain)."
 branding:
   icon: package
   color: orange
 
+# Runs the prebuilt fullrust toolchain image against your checked-out crate. The
+# image ships a patched rustc with the built-in `x86_64-unknown-linux-fullrust`
+# target and the getrandom/socket2 ecosystem patches (auto-applied); your
+# Cargo.toml is never modified. Any unmodified crate builds into a static,
+# libc-free binary — no attributes, no fullrust dependency.
+
 inputs:
+  command:
+    description: "cargo subcommand: build, test, run, check, clippy, …"
+    default: "build"
   args:
-    description: "Arguments passed to `cargo fullrust build` (e.g. `--release --bin myapp`)."
+    description: "Arguments passed to cargo (e.g. `--release --bin myapp`)."
     default: "--release"
   working-directory:
     description: "Directory containing the crate to build."
     default: "."
-  mode:
-    description: "Build mode: `zero-touch` (default; unmodified crate) or `runtime` (crate uses #![no_std] + fullrust::entry!)."
-    default: "zero-touch"
-  version:
-    description: "cargo-fullrust version to install (default: latest on crates.io)."
-    default: ""
+  image:
+    description: "fullrust toolchain image (override to pin a digest or version)."
+    default: "ghcr.io/karpeleslab/fullrust:1.88"
+  no-ecosystem:
+    description: "Skip the getrandom/socket2 [patch.crates-io] injection."
+    default: "false"
 
 runs:
   using: composite
   steps:
-    - name: Install nightly Rust + rust-src
-      uses: dtolnay/rust-toolchain@nightly
-      with:
-        components: rust-src
-
-    - name: Install cargo-fullrust
-      shell: bash
-      run: |
-        if [ -n "${{ inputs.version }}" ]; then
-          cargo install cargo-fullrust --version "${{ inputs.version }}" --locked
-        else
-          cargo install cargo-fullrust --locked || cargo install cargo-fullrust
-        fi
-
-    - name: Build static binary
+    - name: Build with the fullrust toolchain image
       shell: bash
       working-directory: ${{ inputs.working-directory }}
+      # Inputs are passed via env (not interpolated into the script) to avoid
+      # shell-injection; `$FR_ARGS` is intentionally word-split into cargo args.
+      env:
+        FR_IMAGE: ${{ inputs.image }}
+        FR_COMMAND: ${{ inputs.command }}
+        FR_ARGS: ${{ inputs.args }}
+        FR_NO_ECO: ${{ inputs.no-ecosystem }}
       run: |
-        flag=""
-        [ "${{ inputs.mode }}" = "runtime" ] && flag="--runtime"
-        cargo fullrust build $flag ${{ inputs.args }}
-        echo "Static binaries are under: target/x86_64-fullrust-linux/"
+        set -euo pipefail
+        run=(docker run --rm -v "$PWD":/src -w /src)
+        [ "$FR_NO_ECO" = "true" ] && run+=(-e FULLRUST_NO_ECOSYSTEM=1)
+        run+=("$FR_IMAGE" "$FR_COMMAND" $FR_ARGS)
+        echo "::group::${run[*]}"
+        "${run[@]}"
+        echo "::endgroup::"
+        # The container builds as root; return outputs to the runner user so
+        # later steps (packaging, upload-artifact) can manage them.
+        [ -d target ] && sudo chown -R "$(id -u):$(id -g)" target || true
+        echo "Static binaries under: target/x86_64-unknown-linux-fullrust/"
