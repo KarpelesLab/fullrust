@@ -40,9 +40,14 @@ fi
 
 cp "$CONFIG" "$RUST/bootstrap.toml"
 
-echo "== building stage1 + std for x86_64-unknown-linux-fullrust =="
+echo "== building stage1 + std for HOST (x86_64-unknown-linux-gnu) + fullrust =="
 cd "$RUST"
+# Build BOTH targets: the host std/core must be in the sysroot too, or cargo
+# can't compile build scripts / proc-macros (they run on the host) — real crates
+# (serde, thiserror, …) then fail with `can't find crate for std`. Building the
+# fullrust target ALONE drops the host libs from the stage1 sysroot.
 BOOTSTRAP_SKIP_TARGET_SANITY=1 \
-  python3 x.py build library --target x86_64-unknown-linux-fullrust --stage 1
+  python3 x.py build library \
+    --target x86_64-unknown-linux-gnu,x86_64-unknown-linux-fullrust --stage 1
 
 echo "== done. verify with: $HERE/link-and-test.sh $MINOR =="
