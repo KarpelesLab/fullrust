@@ -64,3 +64,46 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           build-args: |
             FULLRUST_TOOLCHAIN_URL=${{ steps.meta.outputs.url }}
+
+  # Prove the published image actually compiles AND runs a fullrust binary — the
+  # real end-to-end check the build-time smoke test can't do (it can't run cargo
+  # against the target). Exercises the exact consumer path: `docker run <img>
+  # build --release` on a fresh crate, then asserts the output is a static,
+  # libc-free ELF and executes it on the stock runner.
+  verify:
+    name: verify image builds & runs a fullrust binary
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build, inspect, and run a hello-world via the image
+        run: |
+          set -euxo pipefail
+          repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+          minor="${{ inputs.minor || '1.88' }}"
+          mkdir -p proj/src
+          printf '[package]\nname = "hello"\nversion = "0.0.0"\nedition = "2021"\n\n[[bin]]\nname = "hello"\npath = "src/main.rs"\n' > proj/Cargo.toml
+          printf 'fn main() { println!("hello from fullrust"); }\n' > proj/src/main.rs
+
+          # Build exactly as a consumer would (the composite action's docker-run path).
+          docker run --rm -v "$PWD/proj:/src" "${repo}:${minor}" build --release
+
+          bin="proj/target/x86_64-unknown-linux-fullrust/release/hello"
+          test -f "$bin"
+          file "$bin"
+          file "$bin" | grep -q 'statically linked'
+          # A libc-free static binary must declare no dynamic dependencies.
+          if readelf -d "$bin" 2>/dev/null | grep -qi NEEDED; then
+            echo "::error::binary has dynamic NEEDED deps — not libc-free"; readelf -d "$bin" | grep NEEDED; exit 1
+          fi
+          # It's a self-contained static ELF making raw syscalls — runs on a stock host.
+          out="$(./"$bin")"
+          echo "ran fullrust binary → $out"
+          [ "$out" = "hello from fullrust" ]
+          echo "OK: image builds a static, libc-free fullrust binary that runs"
