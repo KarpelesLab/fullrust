@@ -307,7 +307,29 @@ unix-gated (but otherwise portable) code is invisible unless it also has a
 
 ## Version matrix
 
-The goal is to track `1.88 … 1.96` and observe how `std::sys::pal` shifts across
+The goal is to track `1.88 … 1.97` and observe how `std::sys::pal` shifts across
 versions (the pal interface is deliberately unstable upstream). Each `rust-<v>`
 checkout is gitignored; the overlay of source changes above is what we carry
-forward and re-apply per version.
+forward and re-apply per version (`git apply --reject patches/fullrust-<prev>.patch`,
+fix the rejects, `./regen-overlay.sh <v>`).
+
+| Rust | overlay | status |
+|------|---------|--------|
+| 1.88 | `patches/fullrust-1.88.patch` | full — frozen on the `1.88` branch |
+| 1.89 | `patches/fullrust-1.89.patch` | builds + all test crates green |
+
+**1.88 → 1.89 drift was small:** only 7 hunks rejected on re-apply — all
+mechanical `Cargo.toml` libc-gate edits (dependency version bumps) + one moved
+function in `cc_detect.rs`; `panic_abort`'s libc became `target_os = "android"`-only
+so that edit is now a no-op. Two build-surfaced pal adaptations: `sys::fs::File`
+gained a `size() -> Option<io::Result<u64>>` (a `read_to_end` size hint), and
+`Thread::new` gained a `name: Option<&str>` parameter (the child sets it via
+`prctl` before running the closure).
+
+**Build tip:** a released tag's CI LLVM is usually expired (`download-ci-llvm`
+404s), so LLVM builds from source (~1–2 h). Adjacent versions often share an LLVM
+major (1.88/1.89 are both 20.1.x) — you can reuse an already-built LLVM via
+`[target.<host>] llvm-config = ".../rust-<prev>/build/.../llvm/bin/llvm-config"`,
+but then bootstrap won't copy `rust-lld` into the sysroot, so copy it (and
+`gcc-ld/`) from the previous stage1 by hand. The canonical from-source build
+needs neither.
