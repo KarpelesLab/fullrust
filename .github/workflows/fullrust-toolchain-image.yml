@@ -75,10 +75,18 @@ jobs:
           mkdir -p /tmp/demo/src
           printf '[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n' > /tmp/demo/Cargo.toml
           printf 'fn main() { println!("built by the fullrust docker image"); }\n' > /tmp/demo/src/main.rs
-          docker run --rm -v /tmp/demo:/src "${{ steps.img.outputs.image }}:${{ env.MINOR }}" build --release
+          img="${{ steps.img.outputs.image }}:${{ env.MINOR }}"
+          # Method 1: the entrypoint (what the action / `docker run` use).
+          docker run --rm -v /tmp/demo:/src "$img" build --release
           bin=/tmp/demo/target/x86_64-unknown-linux-fullrust/release/demo
           file "$bin" | grep -q "statically linked"
           ! ldd "$bin" 2>&1 | grep -q "=>"     # no dynamic deps
+          "$bin"
+          # Method 2: a raw `cargo build` (what a `container:` job runs) must
+          # produce the same fullrust build from the baked env + config.
+          rm -rf /tmp/demo/target
+          docker run --rm -v /tmp/demo:/src "$img" bash -c "cargo build --release"
+          file "$bin" | grep -q "statically linked"
           "$bin"
 
       - name: Smoke-test — ecosystem patch (rand/getrandom) auto-injected

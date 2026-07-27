@@ -117,38 +117,55 @@ A prebuilt image (`ghcr.io/karpeleslab/fullrust`) turns **any** Cargo project
 into a static, libc-free `x86_64-unknown-linux-fullrust` binary with no local
 toolchain setup. It bundles the patched stage1 compiler (the `fullrust` target
 is compiled in) plus the [ecosystem bundle](fullrust-ecosystem/) (getrandom /
-socket2), auto-applied via `cargo --config` so your `Cargo.toml` is never
-touched.
+socket2).
+
+The compiler, the default target, the ecosystem `[patch.crates-io]`, and
+`RUSTC_BOOTSTRAP` are baked into the image env + cargo config, so **a plain
+`cargo build` inside the image already produces the fullrust build** — your
+`Cargo.toml` is never touched. That is deliberate: it makes the two ways of
+using the image produce the *identical* build.
+
+**1. `docker run` (or the reusable action):**
 
 ```console
-# build the crate in the current directory (default: build --release)
-docker run --rm -v "$PWD:/src" ghcr.io/karpeleslab/fullrust:1.88
+docker run --rm -v "$PWD:/src" ghcr.io/karpeleslab/fullrust:1.88            # build --release
 # → target/x86_64-unknown-linux-fullrust/release/<bin>  (statically linked, no libc)
-
 docker run --rm -v "$PWD:/src" ghcr.io/karpeleslab/fullrust:1.88 test
 docker run --rm -v "$PWD:/src" -it ghcr.io/karpeleslab/fullrust:1.88 bash   # escape hatch
 ```
 
-The first positional arg is a cargo subcommand (`build`/`test`/`run`/`check`/…);
-`--target x86_64-unknown-linux-fullrust` and the ecosystem `[patch.crates-io]`
-are appended automatically. Anything else (e.g. `bash`) runs verbatim. Env:
-`FULLRUST_NO_ECOSYSTEM=1` skips the getrandom/socket2 patches; `FULLRUST_TARGET`
-overrides the triple.
+The first positional arg is a cargo subcommand (`build`/`test`/`run`/…); anything
+else (e.g. `bash`) runs verbatim. `FULLRUST_NO_ECOSYSTEM=1` builds against
+upstream getrandom/socket2; `CARGO_BUILD_TARGET` overrides the triple. In another
+repo's workflow this is just `uses: KarpelesLab/fullrust@…` (see `action.yml`).
 
-Use it as a base image in your own CI/Dockerfile:
+**2. GitHub `container:` job** — run the whole job inside the image (no
+docker-in-docker; most efficient for a repo's own CI):
 
-```dockerfile
-FROM ghcr.io/karpeleslab/fullrust:1.88
-COPY . /src
-RUN fullrust-build build --release
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: ghcr.io/karpeleslab/fullrust:1.88
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --release        # same fullrust build as `docker run` above
 ```
 
-**Building the image.** It is a *packaging* image — it copies a prebuilt stage1
-rather than building the toolchain from source (which would rebuild LLVM). Build
-the toolchain first (`./build-fork.sh 1.88.0`), then
+The raw `cargo build` gets rustc, the target, and the patches from the image env
++ config — identical to method 1. (Caveat: GitHub runs JS actions like
+`actions/checkout` *inside* the container, which needs Node.js; this slim image
+has `git` but not `node`, so either add node, `git clone` manually, or prefer
+method 1 for checkout-heavy jobs.)
+
+**Building the image.** A *packaging* image — it copies a prebuilt stage1 (and
+the bootstrap `cargo`) rather than building from source (which would rebuild
+LLVM). Slim base: `debian-slim` + `build-essential` (host cc for
+proc-macros/build-scripts) + that cargo + the stage1 — no unused stock rustc/std.
+Build the toolchain first (`./build-fork.sh 1.88.0`), then
 `./docker/build-image.sh 1.88 ghcr.io/karpeleslab/fullrust:1.88`. CI does both
-and pushes: `.github/workflows/fullrust-toolchain-image.yml` (manual dispatch or
-a `toolchain-image-v*` tag). See [`docker/`](docker/).
+and pushes: `.github/workflows/fullrust-toolchain-image.yml`. See
+[`docker/`](docker/).
 
 ## Status
 

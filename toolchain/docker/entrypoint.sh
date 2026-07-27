@@ -1,37 +1,32 @@
 #!/usr/bin/env bash
-# Build (or test/run/check/…) the Cargo project in the working directory for the
-# fullrust target, with the ecosystem `[patch.crates-io]` injected via
-# `cargo --config` so the consumer's Cargo.toml is never touched.
+# Thin convenience wrapper for the fullrust toolchain image.
+#
+# rustc, the target, the getrandom/socket2 ecosystem [patch.crates-io], and
+# RUSTC_BOOTSTRAP are all baked into the image env + CARGO_HOME config, so a
+# plain `cargo build` is already a fullrust build (the same build a GitHub
+# `container:` job gets). This wrapper only chooses cargo-vs-verbatim and honors
+# the FULLRUST_NO_ECOSYSTEM escape hatch.
 #
 #   docker run --rm -v "$PWD:/src" ghcr.io/karpeleslab/fullrust:1.88            # build --release
-#   docker run --rm -v "$PWD:/src" ghcr.io/karpeleslab/fullrust:1.88 build
 #   docker run --rm -v "$PWD:/src" ghcr.io/karpeleslab/fullrust:1.88 test
 #   docker run --rm -v "$PWD:/src" -it ghcr.io/karpeleslab/fullrust:1.88 bash   # escape hatch
 #
 # Env:
-#   FULLRUST_NO_ECOSYSTEM=1     don't inject the getrandom/socket2 patches
-#   FULLRUST_TARGET=<triple>    override the target (default x86_64-unknown-linux-fullrust)
-#   FULLRUST_TOOLCHAIN=<name>   rustup toolchain name (default "fullrust")
+#   FULLRUST_NO_ECOSYSTEM=1   build against upstream getrandom/socket2 (no patch)
+#   CARGO_BUILD_TARGET=…      override the target triple
 set -euo pipefail
 
-target="${FULLRUST_TARGET:-x86_64-unknown-linux-fullrust}"
-toolchain="${FULLRUST_TOOLCHAIN:-fullrust}"
+# Opt out of the ecosystem patches by pointing at a config-less CARGO_HOME
+# (rustc + target still come from the image env).
+[ -n "${FULLRUST_NO_ECOSYSTEM:-}" ] && export CARGO_HOME=/opt/fullrust/cargo-noeco
 
-# Ecosystem [patch.crates-io], one --config per bundled crate. A patch for a
-# crate not in the dep graph is a harmless "patch not used" cargo warning.
-patch_args=()
-if [ -z "${FULLRUST_NO_ECOSYSTEM:-}" ] && [ -d "${FULLRUST_HOME}/ecosystem/crates" ]; then
-  for dir in "${FULLRUST_HOME}"/ecosystem/crates/*/; do
-    name="$(basename "$dir")"
-    patch_args+=(--config "patch.crates-io.${name}.path=\"${dir%/}\"")
-  done
-fi
+# No args at all → `cargo build` (the Dockerfile CMD normally supplies these).
+[ $# -eq 0 ] && set -- build
 
-sub="${1:-build}"
+sub="$1"
 case "$sub" in
-  build|b|test|t|run|r|check|c|rustc|clippy|bench|doc|tree|metadata)
-    shift || true
-    exec cargo "+${toolchain}" "$sub" "$@" --target "$target" "${patch_args[@]}"
+  build|b|test|t|run|r|check|c|rustc|clippy|bench|doc|tree|metadata|update|fetch|add|remove|fix|vendor)
+    exec cargo "$@"
     ;;
   *)
     # Not a cargo subcommand — run verbatim (e.g. `bash`, a raw binary, …).
