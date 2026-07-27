@@ -1,0 +1,68 @@
+name: fullrust toolchain
+
+# Build the patched stage1 compiler and attach it (with the bootstrap cargo) as a
+# release asset. This is the slow, rare half (LLVM + rustc from source, ~1–2 h);
+# the fast `fullrust image` workflow packages the asset into a container. Run it
+# once per Rust version. Analogous to decryptd's Release workflow producing the
+# binary that its Docker workflow then ships.
+
+on:
+  workflow_dispatch:
+    inputs:
+      minor:
+        description: "Rust minor to build (e.g. 1.88)"
+        required: true
+        default: "1.88"
+        type: string
+
+permissions:
+  contents: write        # create/update the toolchain release + upload the asset
+
+jobs:
+  build:
+    name: build stage1 (${{ inputs.minor }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          large-packages: false
+          swap-storage: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            python3 cmake ninja-build clang git build-essential
+
+      - name: Cache toolchain build
+        uses: actions/cache@v4
+        with:
+          path: toolchain/rust-${{ inputs.minor }}/build
+          key: fullrust-build-${{ inputs.minor }}-${{ hashFiles(format('toolchain/patches/fullrust-{0}.patch', inputs.minor), format('toolchain/bootstrap-{0}.toml', inputs.minor)) }}
+          restore-keys: fullrust-build-${{ inputs.minor }}-
+
+      - name: Build the fullrust toolchain
+        working-directory: toolchain
+        run: ./build-fork.sh "${{ inputs.minor }}.0"
+
+      - name: Package stage1 + cargo
+        working-directory: toolchain
+        run: ./docker/package-toolchain.sh "${{ inputs.minor }}" "$GITHUB_WORKSPACE/fullrust-toolchain-${{ inputs.minor }}-x86_64.tar.gz"
+
+      - name: Publish toolchain release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: toolchain-${{ inputs.minor }}
+          name: fullrust toolchain ${{ inputs.minor }}
+          files: fullrust-toolchain-${{ inputs.minor }}-x86_64.tar.gz
+          body: |
+            Prebuilt fullrust stage1 toolchain (rustc with the built-in
+            `x86_64-unknown-linux-fullrust` target + host & fullrust sysroots +
+            rust-lld) and the bootstrap cargo, for Rust ${{ inputs.minor }}.
+            Consumed by the `fullrust image` workflow to build
+            `ghcr.io/${{ github.repository_owner }}/fullrust`.

@@ -1,36 +1,64 @@
 # fullrust toolchain image — compile any Cargo project into a static, libc-free
 # `x86_64-unknown-linux-fullrust` binary.
 #
-# Packaging image (built by ./build-image.sh from a prebuilt stage1; building the
-# toolchain from source would rebuild LLVM). Slim base: debian-slim + the cargo
-# from the rust bootstrap + our patched stage1 — no unused stock rustc/std.
+# Like KarpelesLab/decryptd, this image is a thin package around a published
+# release asset: it downloads the prebuilt fullrust stage1 toolchain tarball
+# (rustc + host & fullrust sysroots + rust-lld + the bootstrap cargo) and adds
+# the ecosystem bundle + entrypoint. The heavy toolchain build runs once in the
+# `fullrust toolchain` workflow (which attaches the tarball to a release); this
+# Dockerfile just repackages it, so the image rebuilds in seconds — e.g. when
+# only the ecosystem bundle changes — without rebuilding the compiler.
+#
+# Build context is `toolchain/`; built in CI by docker/fullrust-image.yml via
+# docker/build-push-action with --build-arg FULLRUST_TOOLCHAIN_URL=<asset>.
 #
 # rustc, target, the ecosystem patches, and RUSTC_BOOTSTRAP are baked into the
 # image env + cargo config, so a plain `cargo build` here is already a fullrust
-# build. That means the composite action (`docker run …`) and a GitHub
-# `container:` job that runs a raw `cargo build` produce the IDENTICAL build.
+# build — the composite action (`docker run …`) and a GitHub `container:` job
+# running a raw `cargo build` produce the IDENTICAL build.
 
-# Node.js (what actions/checkout@v6 targets — node 24; GitHub is retiring node
-# 20) so GitHub `container:` jobs can run JS actions in-container. Lean: just the
-# node binary; its libstdc++6/libc deps come from build-essential below. Same
-# debian-bookworm base → ABI matches.
+# Node.js (what actions/checkout@v6 targets — node 24) so GitHub `container:`
+# jobs can run JS actions in-container. Lean: just the node binary; its
+# libstdc++6/libc deps come from build-essential. Same debian-bookworm base.
 FROM node:24-bookworm-slim AS node
 
 FROM debian:bookworm-slim
 
-# Host toolchain for build scripts / proc-macros (compiled for the host) +
-# cargo's libgcc_s + node's libstdc++6 + TLS roots + git for git deps. The
-# fullrust *target* links with the bundled rust-lld and pulls in no C.
+# Host toolchain for build scripts / proc-macros + cargo's libgcc_s + node's
+# libstdc++6 + TLS roots + git; curl to fetch the toolchain tarball at build.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential ca-certificates git \
+        build-essential ca-certificates git curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=node   /usr/local/bin/node /usr/local/bin/node
-COPY cargo         /usr/local/bin/cargo
-COPY stage1        /opt/fullrust/stage1
-COPY ecosystem     /opt/fullrust/ecosystem
-COPY config.toml   /opt/fullrust/cargo/config.toml
-COPY entrypoint.sh /usr/local/bin/fullrust-build
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+
+# The prebuilt stage1 toolchain + bootstrap cargo, a GitHub release asset (the
+# tarball extracts to `stage1/` + `cargo`). Override to pin a specific version.
+ARG FULLRUST_TOOLCHAIN_URL
+RUN set -eux; \
+    test -n "${FULLRUST_TOOLCHAIN_URL}"; \
+    mkdir -p /opt/fullrust; \
+    curl -fSL --retry 5 --retry-delay 3 --retry-all-errors "${FULLRUST_TOOLCHAIN_URL}" \
+      | tar -xz --no-same-owner -C /opt/fullrust; \
+    mv /opt/fullrust/cargo /usr/local/bin/cargo; \
+    chmod +x /usr/local/bin/cargo
+
+# Ecosystem bundle (getrandom 0.2/0.4, socket2 forks) + entrypoint, from the
+# repo (context = toolchain/). Generate the cargo config that patches those
+# crates for fullrust: patch KEY = dir name (so two majors of one crate coexist),
+# `package` = the real crate name cargo matches by version.
+COPY fullrust-ecosystem /opt/fullrust/ecosystem
+COPY docker/entrypoint.sh /usr/local/bin/fullrust-build
+RUN set -eux; \
+    mkdir -p /opt/fullrust/cargo /opt/fullrust/cargo-noeco; \
+    { echo "# Generated: ecosystem [patch.crates-io] for the fullrust target."; \
+      echo "[patch.crates-io]"; \
+      for d in /opt/fullrust/ecosystem/crates/*/; do \
+        dir="$(basename "$d")"; \
+        pkg="$(sed -n 's/^name *= *"\([^"]*\)".*/\1/p' "$d/Cargo.toml" | head -1)"; \
+        echo "\"$dir\" = { path = \"/opt/fullrust/ecosystem/crates/$dir\", package = \"$pkg\" }"; \
+      done; } > /opt/fullrust/cargo/config.toml; \
+    chmod +x /usr/local/bin/fullrust-build
 
 ENV FULLRUST_HOME=/opt/fullrust \
     RUSTC=/opt/fullrust/stage1/bin/rustc \
@@ -38,13 +66,10 @@ ENV FULLRUST_HOME=/opt/fullrust \
     CARGO_HOME=/opt/fullrust/cargo \
     RUSTC_BOOTSTRAP=1
 
-RUN chmod +x /usr/local/bin/fullrust-build /usr/local/bin/cargo \
-    && mkdir -p /opt/fullrust/cargo-noeco \
-    # Sanity: the target is built into this rustc, cargo drives it, node runs
-    # (its shared-lib deps are satisfied).
-    && "$RUSTC" --print target-list | grep -q '^x86_64-unknown-linux-fullrust$' \
-    && cargo --version >/dev/null \
-    && node --version >/dev/null
+RUN set -eux; \
+    "$RUSTC" --print target-list | grep -q '^x86_64-unknown-linux-fullrust$'; \
+    cargo --version >/dev/null; \
+    node --version >/dev/null
 
 WORKDIR /src
 ENTRYPOINT ["/usr/local/bin/fullrust-build"]

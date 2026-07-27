@@ -1,0 +1,9 @@
+# Docker build context is `toolchain/`. Keep it tiny: the image only needs
+# docker/entrypoint.sh + fullrust-ecosystem/ (the stage1 comes from a release
+# asset URL, not the context). Exclude the giant rust checkouts and build output.
+rust-*/
+**/target/
+**/build/
+docker/context/
+patches/
+*.log

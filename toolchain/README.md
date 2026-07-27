@@ -156,14 +156,23 @@ The raw `cargo build` gets rustc, the target, and the patches from the image env
 + config — identical to method 1. The image ships Node.js 24, so JS actions like
 `actions/checkout@v6` run in-container as usual.
 
-**Building the image.** A *packaging* image — it copies a prebuilt stage1 (and
-the bootstrap `cargo`) rather than building from source (which would rebuild
-LLVM). Slim base: `debian-slim` + `build-essential` (host cc for
-proc-macros/build-scripts) + that cargo + the stage1 — no unused stock rustc/std.
-Build the toolchain first (`./build-fork.sh 1.88.0`), then
-`./docker/build-image.sh 1.88 ghcr.io/karpeleslab/fullrust:1.88`. CI does both
-and pushes: `.github/workflows/fullrust-toolchain-image.yml`. See
-[`docker/`](docker/).
+**How the image is built.** It's a *packaging* image (debian-slim + host `cc` +
+node + the ecosystem bundle), and it downloads a **prebuilt stage1** rather than
+building from source — same idea as `KarpelesLab/decryptd`'s container. This
+splits into two CI workflows (repo root `.github/workflows/`):
+
+- **`fullrust toolchain`** — the slow, rare half: builds the stage1 from source
+  (LLVM + rustc, ~1–2 h) and attaches `fullrust-toolchain-<minor>-x86_64.tar.gz`
+  (stage1 + bootstrap cargo) to a `toolchain-<minor>` release. Run once per Rust
+  version (`docker/package-toolchain.sh` makes the tarball).
+- **`fullrust image`** — the fast half: `docker/build-push-action` builds the
+  Dockerfile (which `curl`s that release asset via `FULLRUST_TOOLCHAIN_URL`) and
+  pushes `ghcr.io/<owner>/fullrust:<minor>`,`:latest`. Re-runs on every ecosystem
+  change — a seconds-long repackage, no compiler rebuild.
+
+Locally: `./build-fork.sh 1.88.0`, then `./docker/build-image.sh 1.88 <tag>`
+(packages the stage1 and serves it over localhost so the same URL-based
+Dockerfile works unchanged). See [`docker/`](docker/).
 
 ## Status
 

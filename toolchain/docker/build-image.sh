@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Stage a build context (bootstrap cargo + prebuilt stage1 + ecosystem + a cargo
-# config carrying the ecosystem patches) and build the fullrust toolchain image.
-# Run ../build-fork.sh first so the stage1 + bootstrap cargo exist.
+# Build the fullrust toolchain image locally, mirroring what the CI does: package
+# the prebuilt stage1 into the tarball the Dockerfile downloads, then build. CI
+# fetches the tarball from a release asset; here we serve it over localhost so the
+# same URL-based Dockerfile works unchanged. Run ../build-fork.sh first.
 #
 # Usage:  ./build-image.sh [minor] [tag]
 #   ./build-image.sh 1.88 ghcr.io/karpeleslab/fullrust:1.88
@@ -11,37 +12,20 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 MINOR="${1:-1.88}"
 TAG="${2:-fullrust:$MINOR}"
-BUILD="$ROOT/rust-$MINOR/build/x86_64-unknown-linux-gnu"
-STAGE1="$BUILD/stage1"
-CARGO="$BUILD/stage0/bin/cargo"
+PORT="${FULLRUST_HTTP_PORT:-8231}"
 
-[[ -d "$STAGE1" ]] || { echo "missing $STAGE1 — run $ROOT/build-fork.sh first" >&2; exit 1; }
-[[ -x "$CARGO"  ]] || { echo "missing bootstrap cargo $CARGO" >&2; exit 1; }
+TARBALL="$HERE/fullrust-toolchain-$MINOR-x86_64.tar.gz"
+"$HERE/package-toolchain.sh" "$MINOR" "$TARBALL"
 
-CTX="$HERE/context"
-rm -rf "$CTX"; mkdir -p "$CTX"
-cp -al "$STAGE1" "$CTX/stage1"                 # hardlinks: instant, no extra disk
-cp -a  "$CARGO"  "$CTX/cargo"
-cp -a  "$ROOT/fullrust-ecosystem" "$CTX/ecosystem"
-cp -a  "$HERE/entrypoint.sh" "$CTX/entrypoint.sh"
-cp -a  "$HERE/Dockerfile"    "$CTX/Dockerfile"
-
-# Cargo config: one [patch.crates-io] entry per bundled crate, pointing at its
-# in-image path. rustc + target are set via env in the Dockerfile.
-{
-  echo "# Ecosystem forks teaching gateway crates the fullrust target. Generated"
-  echo "# by build-image.sh from fullrust-ecosystem/crates/*. The patch KEY is the"
-  echo "# directory name (so two majors of one crate — e.g. getrandom 0.2 and 0.4"
-  echo "# — coexist); 'package' is the real crate name cargo matches by version."
-  echo "[patch.crates-io]"
-  for d in "$ROOT/fullrust-ecosystem/crates"/*/; do
-    dir="$(basename "$d")"
-    pkg="$(sed -n 's/^name *= *"\([^"]*\)".*/\1/p' "$d/Cargo.toml" | head -1)"
-    echo "\"$dir\" = { path = \"/opt/fullrust/ecosystem/crates/$dir\", package = \"$pkg\" }"
-  done
-} > "$CTX/config.toml"
+# Serve the tarball so the Dockerfile's curl can fetch it (build runs with
+# --network host so it can reach 127.0.0.1).
+python3 -m http.server "$PORT" --directory "$HERE" --bind 127.0.0.1 >/dev/null 2>&1 &
+srv=$!
+trap 'kill "$srv" 2>/dev/null || true; rm -f "$TARBALL"' EXIT
+sleep 1
 
 echo "== docker build $TAG =="
-docker build -t "$TAG" "$CTX"
-rm -rf "$CTX"
+docker build --network host \
+  --build-arg "FULLRUST_TOOLCHAIN_URL=http://127.0.0.1:${PORT}/$(basename "$TARBALL")" \
+  -f "$HERE/Dockerfile" -t "$TAG" "$ROOT"
 echo "== built $TAG =="

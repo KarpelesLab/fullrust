@@ -1,0 +1,66 @@
+name: fullrust image
+
+# Build ghcr.io/<owner>/fullrust and push it, tagged with the Rust minor and
+# `latest`. The image just repackages the prebuilt stage1 (a release asset from
+# the `fullrust toolchain` workflow) plus the ecosystem bundle, so this is fast —
+# it runs on every ecosystem change without rebuilding the compiler. Mirrors
+# KarpelesLab/decryptd's Docker workflow (build-push-action off a release asset).
+#
+# Triggers: manual; after a new toolchain release; and when the ecosystem
+# bundle / docker files change on master.
+
+on:
+  workflow_dispatch:
+    inputs:
+      minor:
+        description: "Rust minor to package (must have a toolchain-<minor> release)"
+        required: false
+        default: "1.88"
+        type: string
+  workflow_run:
+    workflows: ["fullrust toolchain"]
+    types: [completed]
+  push:
+    branches: [master]
+    paths:
+      - "toolchain/fullrust-ecosystem/**"
+      - "toolchain/docker/**"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    name: build & push to GHCR
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve version, tags, and toolchain asset URL
+        id: meta
+        run: |
+          minor="${{ inputs.minor || '1.88' }}"
+          repo="ghcr.io/${GITHUB_REPOSITORY,,}"      # GHCR names are lowercase
+          echo "tags=${repo}:${minor},${repo}:latest" >> "$GITHUB_OUTPUT"
+          echo "url=https://github.com/${GITHUB_REPOSITORY}/releases/download/toolchain-${minor}/fullrust-toolchain-${minor}-x86_64.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: toolchain
+          file: toolchain/docker/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            FULLRUST_TOOLCHAIN_URL=${{ steps.meta.outputs.url }}
