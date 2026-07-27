@@ -153,10 +153,8 @@ jobs:
 ```
 
 The raw `cargo build` gets rustc, the target, and the patches from the image env
-+ config — identical to method 1. (Caveat: GitHub runs JS actions like
-`actions/checkout` *inside* the container, which needs Node.js; this slim image
-has `git` but not `node`, so either add node, `git clone` manually, or prefer
-method 1 for checkout-heavy jobs.)
++ config — identical to method 1. The image ships Node.js 20, so JS actions like
+`actions/checkout@v4` run in-container as usual.
 
 **Building the image.** A *packaging* image — it copies a prebuilt stage1 (and
 the bootstrap `cargo`) rather than building from source (which would rebuild

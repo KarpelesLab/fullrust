@@ -9,15 +9,22 @@
 # image env + cargo config, so a plain `cargo build` here is already a fullrust
 # build. That means the composite action (`docker run …`) and a GitHub
 # `container:` job that runs a raw `cargo build` produce the IDENTICAL build.
+
+# Node.js (what actions/checkout@v4 targets) so GitHub `container:` jobs can run
+# JS actions in-container. Lean: just the node binary; its libstdc++6/libc deps
+# come from build-essential below. Same debian-bookworm base → ABI matches.
+FROM node:20-bookworm-slim AS node
+
 FROM debian:bookworm-slim
 
 # Host toolchain for build scripts / proc-macros (compiled for the host) +
-# cargo's libgcc_s + TLS roots + git for git deps. The fullrust *target* links
-# with the bundled rust-lld and pulls in no C — the binary stays libc-free.
+# cargo's libgcc_s + node's libstdc++6 + TLS roots + git for git deps. The
+# fullrust *target* links with the bundled rust-lld and pulls in no C.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 
+COPY --from=node   /usr/local/bin/node /usr/local/bin/node
 COPY cargo         /usr/local/bin/cargo
 COPY stage1        /opt/fullrust/stage1
 COPY ecosystem     /opt/fullrust/ecosystem
@@ -32,9 +39,11 @@ ENV FULLRUST_HOME=/opt/fullrust \
 
 RUN chmod +x /usr/local/bin/fullrust-build /usr/local/bin/cargo \
     && mkdir -p /opt/fullrust/cargo-noeco \
-    # Sanity: the target is built into this rustc and cargo drives it.
+    # Sanity: the target is built into this rustc, cargo drives it, node runs
+    # (its shared-lib deps are satisfied).
     && "$RUSTC" --print target-list | grep -q '^x86_64-unknown-linux-fullrust$' \
-    && cargo --version >/dev/null
+    && cargo --version >/dev/null \
+    && node --version >/dev/null
 
 WORKDIR /src
 ENTRYPOINT ["/usr/local/bin/fullrust-build"]
