@@ -1,0 +1,27 @@
+# fullrust support for getrandom 0.4.3 — enable its raw-syscall linux_raw
+# backend on the libc-free Linux ABI (auto-selected, no rustflags).
+# Applied on top of crates.io getrandom 0.4.3 (vendored in crates/getrandom-0.4/).
+
+--- a/src/backends.rs	2006-07-24 10:21:28.000000000 +0900
++++ b/src/backends.rs	2026-07-27 23:26:50.747693209 +0900
+@@ -35,7 +35,8 @@
+     } else if #[cfg(getrandom_backend = "extern_impl")] {
+         pub(crate) mod extern_impl;
+         pub use extern_impl::*;
+-    } else if #[cfg(all(target_os = "linux", target_env = ""))] {
++    } else if #[cfg(any(all(target_os = "linux", target_env = ""), target_os = "fullrust"))] {
++        // `fullrust` is the libc-free Linux ABI: use the raw-syscall backend.
+         mod linux_raw;
+         pub use linux_raw::*;
+     } else if #[cfg(target_os = "espidf")] {
+--- a/src/backends/linux_raw.rs	2006-07-24 10:21:28.000000000 +0900
++++ b/src/backends/linux_raw.rs	2026-07-27 23:26:55.351091985 +0900
+@@ -2,7 +2,7 @@
+ pub use crate::util::{inner_u32, inner_u64};
+ use crate::{Error, MaybeUninit};
+ 
+-#[cfg(not(any(target_os = "android", target_os = "linux")))]
++#[cfg(not(any(target_os = "android", target_os = "linux", target_os = "fullrust")))]
+ compile_error!("`linux_raw` backend can be enabled only for Linux/Android targets!");
+ 
+ #[path = "../utils/sanitizer.rs"]
