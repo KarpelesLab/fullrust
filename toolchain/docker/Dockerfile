@@ -10,10 +10,11 @@
 # build. That means the composite action (`docker run …`) and a GitHub
 # `container:` job that runs a raw `cargo build` produce the IDENTICAL build.
 
-# Node.js (what actions/checkout@v4 targets) so GitHub `container:` jobs can run
-# JS actions in-container. Lean: just the node binary; its libstdc++6/libc deps
-# come from build-essential below. Same debian-bookworm base → ABI matches.
-FROM node:20-bookworm-slim AS node
+# Node.js (what actions/checkout@v6 targets — node 24; GitHub is retiring node
+# 20) so GitHub `container:` jobs can run JS actions in-container. Lean: just the
+# node binary; its libstdc++6/libc deps come from build-essential below. Same
+# debian-bookworm base → ABI matches.
+FROM node:24-bookworm-slim AS node
 
 FROM debian:bookworm-slim
 
