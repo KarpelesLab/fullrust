@@ -21,7 +21,21 @@ CONFIG="$HERE/bootstrap-$MINOR.toml"
 
 if [[ ! -d "$RUST/.git" ]]; then
   echo "== cloning rust $VER =="
+  # A restored build cache may have recreated $RUST/build without the source
+  # (no .git), and git clone refuses a non-empty target. Preserve the cached
+  # build/ (same-fs temp → the move is a rename, not a 2 GB copy), clone the
+  # source fresh, then fold the build dir back in so the compile stays incremental.
+  saved_build=""
+  if [[ -d "$RUST/build" ]]; then
+    saved_build="$(mktemp -d -p "$HERE")"
+    mv "$RUST/build" "$saved_build/build"
+  fi
+  rm -rf "$RUST"
   git clone --depth 1 --branch "$VER" https://github.com/rust-lang/rust.git "$RUST"
+  if [[ -n "$saved_build" ]]; then
+    mv "$saved_build/build" "$RUST/build"
+    rmdir "$saved_build"
+  fi
 fi
 
 # The overlay patches vendored submodules (backtrace, stdarch); they must be
