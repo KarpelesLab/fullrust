@@ -21,7 +21,11 @@ permissions:
 jobs:
   build:
     name: build stage1 (${{ inputs.minor }})
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest: the host rustc/cargo produced here link the
+    # runner's glibc/libstdc++ (GLIBC_2.39 / GLIBCXX_3.4.32 on 24.04). The image
+    # (docker/Dockerfile) bases on debian:trixie to satisfy exactly that floor;
+    # letting the runner drift to a newer Ubuntu would raise it and break the image.
+    runs-on: ubuntu-24.04
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v6

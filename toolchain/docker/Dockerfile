@@ -19,10 +19,15 @@
 
 # Node.js (what actions/checkout@v6 targets — node 24) so GitHub `container:`
 # jobs can run JS actions in-container. Lean: just the node binary; its
-# libstdc++6/libc deps come from build-essential. Same debian-bookworm base.
+# libstdc++6/libc deps come from build-essential. The bookworm-built node binary
+# runs fine on the newer trixie base (forward-compatible glibc/libstdc++).
 FROM node:24-bookworm-slim AS node
 
-FROM debian:bookworm-slim
+# Trixie (glibc 2.41 / libstdc++ from GCC 14), NOT bookworm: the host rustc/cargo
+# shipped in the toolchain asset are built on the ubuntu-24.04 CI runner and
+# require GLIBC_2.39 + GLIBCXX_3.4.32, which bookworm (glibc 2.36 / GCC 12) lacks.
+# `fullrust-toolchain.yml` pins runs-on: ubuntu-24.04 so this floor stays fixed.
+FROM debian:trixie-slim
 
 # Host toolchain for build scripts / proc-macros + cargo's libgcc_s + node's
 # libstdc++6 + TLS roots + git; curl to fetch the toolchain tarball at build.
