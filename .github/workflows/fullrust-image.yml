@@ -6,8 +6,10 @@ name: fullrust image
 # it runs on every ecosystem change without rebuilding the compiler. Mirrors
 # KarpelesLab/decryptd's Docker workflow (build-push-action off a release asset).
 #
-# Triggers: manual; after a new toolchain release; and when the ecosystem
-# bundle / docker files change on master.
+# Triggers: manual (pick the minor), and when the ecosystem bundle / docker files
+# change on master. NOT auto-triggered by the toolchain workflow: workflow_run
+# can't tell which minor was just built (it would default to 1.88 and flap the
+# `latest` tag), so each version's image is dispatched explicitly with its minor.
 
 on:
   workflow_dispatch:
@@ -17,9 +19,6 @@ on:
         required: false
         default: "1.88"
         type: string
-  workflow_run:
-    workflows: ["fullrust toolchain"]
-    types: [completed]
   push:
     branches: [master]
     paths:
@@ -34,7 +33,6 @@ jobs:
   publish:
     name: build & push to GHCR
     runs-on: ubuntu-latest
-    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     steps:
       - uses: actions/checkout@v6
       - uses: docker/setup-buildx-action@v3
