@@ -2,7 +2,7 @@
 // open/read/seek, metadata (size + type + mtime), permissions, directory
 // creation + listing, rename, symlink + read_link, hard link, canonicalize,
 // copy, file locks, and recursive removal. Unmodified std; static, no libc.
-#![feature(file_lock)]
+// (file_lock was unstable through 1.88 but stabilized in 1.89 — no gate needed.)
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
