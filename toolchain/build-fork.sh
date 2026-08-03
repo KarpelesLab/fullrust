@@ -38,11 +38,18 @@ if [[ ! -d "$RUST/.git" ]]; then
   fi
 fi
 
-# The overlay patches vendored submodules (backtrace, stdarch); they must be
-# checked out BEFORE the patch (x.py only initializes them later, at build time,
-# which is too late for `git apply`). Keep this list in sync with regen-overlay.sh.
+# The overlay patches vendored submodules; they must be checked out BEFORE the
+# patch (x.py only initializes them later, at build time, too late for `git
+# apply`). Which of these are actually submodules varies by version: stdarch was
+# a submodule through 1.89 but de-vendored into the main tree in 1.90 (and
+# std_detect moved to library/std_detect), so only init the ones this version
+# actually registers. Keep this candidate list in sync with regen-overlay.sh.
 echo "== initializing vendored submodules the overlay patches =="
-git -C "$RUST" submodule update --init library/backtrace library/stdarch
+for sm in library/backtrace library/stdarch; do
+  if grep -qE "^[[:space:]]*path = $sm[[:space:]]*\$" "$RUST/.gitmodules" 2>/dev/null; then
+    git -C "$RUST" submodule update --init "$sm"
+  fi
+done
 
 # Apply the overlay unless it is already applied (reverse-check succeeds).
 if git -C "$RUST" apply --check --reverse "$PATCH" 2>/dev/null; then

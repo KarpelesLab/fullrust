@@ -14,10 +14,21 @@ MINOR="${1:?usage: regen-overlay.sh <minor, e.g. 1.88>}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 RUST="$HERE/rust-$MINOR"
 PATCH="$HERE/patches/fullrust-$MINOR.patch"
-# Vendored submodules the overlay edits. Keep in sync with build-fork.sh.
-SUBMODULES=(library/backtrace library/stdarch)
 
 [[ -d "$RUST/.git" ]] || { echo "missing checkout $RUST" >&2; exit 1; }
+
+# Vendored submodules the overlay may edit — but ONLY those this version actually
+# registers as submodules. stdarch was a submodule through 1.89 but de-vendored
+# into the main tree in 1.90 (std_detect moved to library/std_detect); on 1.90+
+# its edits ride the main-repo diff (step 1), not a per-submodule diff (step 2).
+# Keep this candidate list in sync with build-fork.sh.
+SUBMODULES=()
+for sm in library/backtrace library/stdarch; do
+  if grep -qE "^[[:space:]]*path = $sm[[:space:]]*\$" "$RUST/.gitmodules" 2>/dev/null; then
+    SUBMODULES+=("$sm")
+  fi
+done
+
 cd "$RUST"
 
 # 1. Main repo: every tracked edit + new file, EXCLUDING the patched submodules
