@@ -1,0 +1,96 @@
+name: action selftest
+
+# Proves the two ways a consumer actually builds with fullrust work end to end in
+# real GitHub Actions, on a REAL proc-macro crate (serde derive — exercises host
+# std + the getrandom/socket2 ecosystem [patch.crates-io]):
+#   1. the composite action  `uses: KarpelesLab/fullrust`  (here `uses: ./`),
+#      tested against both the oldest (1.88) and newest (1.95) published images;
+#   2. a `container:` job running a raw `cargo build` (the baked env makes it a
+#      fullrust build — this is the "identical build both ways" guarantee).
+# Each asserts the output is a statically-linked, NEEDED-free ELF that runs.
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [master]
+    paths:
+      - "action.yml"
+      - "toolchain/docker/**"
+      - "toolchain/fullrust-ecosystem/**"
+      - ".github/workflows/action-selftest.yml"
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  composite-action:
+    name: composite action (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - ghcr.io/karpeleslab/fullrust:1.88
+          - ghcr.io/karpeleslab/fullrust:1.95
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Create a real proc-macro crate
+        run: |
+          mkdir -p probe/src
+          printf '[package]\nname = "probe"\nversion = "0.0.0"\nedition = "2021"\n\n[[bin]]\nname = "probe"\npath = "src/main.rs"\n\n[dependencies]\nserde = { version = "1", features = ["derive"] }\nserde_json = "1"\n' > probe/Cargo.toml
+          printf 'use serde::Serialize;\n#[derive(Serialize)]\nstruct P { msg: &%sstatic str }\nfn main() { println!("{}", serde_json::to_string(&P { msg: "built by the fullrust action" }).unwrap()); }\n' "'" > probe/src/main.rs
+
+      - name: Build via the composite action
+        uses: ./
+        with:
+          working-directory: probe
+          image: ${{ matrix.image }}
+          args: --release
+
+      - name: Assert static, libc-free, and runs
+        run: |
+          set -euxo pipefail
+          bin=probe/target/x86_64-unknown-linux-fullrust/release/probe
+          test -f "$bin"
+          file "$bin" | grep -q 'statically linked'
+          if readelf -l "$bin" | grep -qi interp; then echo "::error::dynamic (has PT_INTERP)"; exit 1; fi
+          if readelf -d "$bin" 2>/dev/null | grep -qi needed; then echo "::error::has NEEDED deps"; exit 1; fi
+          out="$(./"$bin")"
+          echo "ran → $out"
+          [ "$out" = '{"msg":"built by the fullrust action"}' ]
+
+  container-job:
+    name: container job (raw cargo build in :latest)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/karpeleslab/fullrust:latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Create a real proc-macro crate
+        run: |
+          mkdir -p probe/src
+          printf '[package]\nname = "probe"\nversion = "0.0.0"\nedition = "2021"\n\n[[bin]]\nname = "probe"\npath = "src/main.rs"\n\n[dependencies]\nserde = { version = "1", features = ["derive"] }\nserde_json = "1"\n' > probe/Cargo.toml
+          printf 'use serde::Serialize;\n#[derive(Serialize)]\nstruct P { msg: &%sstatic str }\nfn main() { println!("{}", serde_json::to_string(&P { msg: "built by the fullrust action" }).unwrap()); }\n' "'" > probe/src/main.rs
+
+      # No `uses: ./` here — the image env (RUSTC / CARGO_BUILD_TARGET / CARGO_HOME
+      # with the ecosystem [patch] / RUSTC_BOOTSTRAP) already makes plain cargo a
+      # fullrust build. This is exactly what a `container:` job consumer gets.
+      - name: Raw cargo build (baked env → fullrust target)
+        working-directory: probe
+        run: cargo build --release
+
+      - name: Assert static, libc-free, and runs
+        working-directory: probe
+        run: |
+          set -euxo pipefail
+          bin=target/x86_64-unknown-linux-fullrust/release/probe
+          test -f "$bin"
+          if readelf -l "$bin" | grep -qi interp; then echo "::error::dynamic (has PT_INTERP)"; exit 1; fi
+          if readelf -d "$bin" 2>/dev/null | grep -qi needed; then echo "::error::has NEEDED deps"; exit 1; fi
+          out="$(./"$bin")"
+          echo "ran → $out"
+          [ "$out" = '{"msg":"built by the fullrust action"}' ]
