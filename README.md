@@ -1,27 +1,20 @@
 # fullrust
 
-**Fully-static, libc-free, pure-Rust Linux binaries.**
+**Compile unmodified Rust crates into fully-static, libc-free Linux binaries.**
 
-`fullrust` is the `no_std` runtime that pairs with
-[`purestd`](https://github.com/KarpelesLab/purestd) — a libc-free standard
-library on raw syscalls — to let you write ordinary-looking Rust programs (with
-`println!`, `Vec`, `String`, `format!`, command-line arguments, files, threads)
-and compile them into Linux ELF executables that link **no libc and no C runtime
-at all**. fullrust itself is small: it provides only what a hosted build gets
-from crt0 and compiler_builtins — the process entry point and the `mem*`/unwind
-symbols — while purestd is the standard library. Like the Go runtime, it talks to the
-kernel directly through raw `syscall` instructions (see
-[Why a standalone `std`](#why-a-standalone-std-the-go-no-cgo-model)), and is
-linked with the Rust-bundled LLVM linker, so **no C toolchain is involved** in
-the build.
+fullrust is a patched Rust toolchain whose standard library talks to the Linux
+kernel through raw `syscall` instructions instead of libc. An **ordinary crate —
+no code changes, no attributes, no `fullrust` dependency** — compiles to a static
+`x86_64-unknown-linux-fullrust` ELF that links **no libc and no C runtime**: no
+interpreter (`PT_INTERP`), no `.dynamic` section, zero `NEEDED` libraries. The
+only thing the binary needs to run is the Linux kernel.
 
-An ordinary crate — **no fullrust dependency, no attributes, plain `fn main`** —
-builds into a libc-free static binary:
+You use it as a **GitHub Action** or a **Docker image** — no local toolchain to
+install, no nightly, no `-Z build-std`, no target JSON.
 
 ```rust
-// src/main.rs
+// src/main.rs — a completely ordinary program
 use std::collections::BTreeMap;
-
 fn main() {
     let mut counts = BTreeMap::new();
     for w in "the quick brown fox the fox".split_whitespace() {
@@ -32,97 +25,44 @@ fn main() {
 ```
 
 ```console
-$ cargo install cargo-fullrust
-$ cargo fullrust build --release
-$ file    target/x86_64-fullrust-linux/release/wordcount
+$ file    target/x86_64-unknown-linux-fullrust/release/wordcount
 ELF 64-bit LSB executable, x86-64, statically linked
-$ ldd     target/x86_64-fullrust-linux/release/wordcount
+$ ldd     target/x86_64-unknown-linux-fullrust/release/wordcount
         not a dynamic executable
-$ readelf -d target/x86_64-fullrust-linux/release/wordcount
+$ readelf -d target/x86_64-unknown-linux-fullrust/release/wordcount
 There is no dynamic section in this file.
 ```
 
-There is no interpreter (`PT_INTERP`), no `.dynamic` section, and zero `NEEDED`
-libraries. The only thing the binary needs to run is the Linux kernel.
-
-A direct consequence — and an intended guard-rail — is that **any program that
-tries to FFI into a dynamic library, or call an unprovided C symbol, fails at
-link time**. Pure-Rust code links; anything reaching for libc does not.
+Anything that reaches for a C library fails at **link** time — pure-Rust code
+links, FFI into a `.so` does not. That's an intended guard-rail, not a bug.
 
 ---
 
-## Quick start
+## Use it in a GitHub workflow
 
-The default (zero-touch) path needs a nightly toolchain with `rust-src`; the
-`--stable` explicit-runtime path needs only stable:
-
-```console
-rustup toolchain install nightly
-rustup component add rust-src --toolchain nightly
-```
-
-### Zero-touch: `cargo fullrust` on an unmodified crate
-
-Install the subcommand once, then build a **completely ordinary** crate — plain
-`fn main`, `use std::…`, no dependency on fullrust, no attributes — into a
-libc-free static binary:
-
-```console
-cargo install cargo-fullrust
-```
-```rust
-// src/main.rs — nothing fullrust-specific
-use std::collections::BTreeMap;
-fn main() {
-    let mut m = BTreeMap::new();
-    *m.entry("hi").or_insert(0) += 1;
-    println!("{m:?}");
-}
-```
-```console
-cargo fullrust build --release       # -> target/x86_64-fullrust-linux/release/<bin>
-cargo fullrust run -- arg1
-```
-
-How: `cargo fullrust` builds (and caches) a **sysroot whose `std` is fullrust's
-own standard library**, then compiles your crate against it. Your `use std::…`
-resolves to the syscall-backed std, and the binary links no libc. Needs a
-nightly toolchain with `rust-src`
-(`rustup component add rust-src --toolchain nightly`). Coverage is whatever
-[`purestd`](https://github.com/KarpelesLab/purestd) implements — gaps surface as
-ordinary "not found in `std`" errors as the stdlib grows.
-
-### GitHub Action
-
-Build static artifacts in CI with the reusable action (see
-[`action.yml`](action.yml)). To keep them as workflow artifacts:
+One step. It runs the fullrust toolchain image against your checked-out crate and
+leaves the binary under `target/x86_64-unknown-linux-fullrust/release/`.
 
 ```yaml
+- uses: actions/checkout@v6
 - uses: KarpelesLab/fullrust@master
   with:
-    working-directory: .       # your crate
-    args: --release
-- uses: actions/upload-artifact@v4
-  with:
-    path: target/x86_64-fullrust-linux/release/<your-bin>
+    args: --release --bin myapp
 ```
 
-#### Attach a static binary to a GitHub Release
-
-On a tag (or a published release), build with the action and upload the binary
-as a release asset. Note the **`contents: write`** permission:
+### Attach a static binary to a GitHub Release
 
 ```yaml
 name: Release
 on:
   push:
-    tags: ["v*"]            # or: release: { types: [published] }
+    tags: ["v*"]          # or: release: { types: [published] }
 
 permissions:
-  contents: write           # required to upload release assets
+  contents: write          # required to upload release assets
 
 jobs:
-  static-linux:
+  linux-x86_64-static:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -130,323 +70,148 @@ jobs:
       - name: Build the libc-free static binary
         uses: KarpelesLab/fullrust@master
         with:
-          args: --release --bin myapp     # your binary
+          args: --release --bin myapp
 
-      - name: Package as a .tar.gz
+      - name: Package + attach
         run: |
-          name="myapp-${{ github.ref_name }}-x86_64-linux-static"
-          mkdir -p "dist/$name"
-          cp target/x86_64-fullrust-linux/release/myapp "dist/$name/"
-          cp README.md LICENSE* "dist/$name/" 2>/dev/null || true
-          tar -C dist -czf "dist/$name.tar.gz" "$name"
-
-      - name: Attach to the release
-        uses: softprops/action-gh-release@v2
+          tar -C target/x86_64-unknown-linux-fullrust/release \
+              -czf "myapp-${{ github.ref_name }}-linux-x86_64-static.tar.gz" myapp
+      - uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.tar.gz
+          files: myapp-*-linux-x86_64-static.tar.gz
 ```
 
-`softprops/action-gh-release` creates/updates the release for the tag and
-uploads the archive; with the `release: published` trigger it attaches to the
-existing release instead. (Equivalent with the CLI:
-`gh release upload "$TAG" dist/*.tar.gz`.)
+### Action inputs
 
-The output path is `target/x86_64-fullrust-linux/release/<bin>` relative to the
-crate's workspace root (so if you set `working-directory:`, the binary still
-lands under that workspace's `target/`).
+| input | default | meaning |
+|---|---|---|
+| `command` | `build` | cargo subcommand: `build`, `test`, `run`, `clippy`, … |
+| `args` | `--release` | extra cargo args, e.g. `--release --bin myapp --no-default-features` |
+| `working-directory` | `.` | the crate to build |
+| `image` | `ghcr.io/karpeleslab/fullrust:1.88` | pin a Rust version (see [Versions](#versions)) |
+| `no-ecosystem` | `false` | skip the `getrandom`/`socket2` `[patch.crates-io]` injection |
 
-### Explicit-runtime crates: `--runtime`
+---
 
-If you'd rather opt in directly (smaller surface, works without the sysroot),
-write a `no_std` crate against the runtime and pass `--runtime`:
+## Use it as a `container:` job
 
-```toml
-[dependencies]
-fullrust = "0.1"
+The image bakes the toolchain into its environment (`RUSTC`, `CARGO_BUILD_TARGET`,
+a `CARGO_HOME` carrying the ecosystem `[patch]`), so a **plain `cargo build` is
+already a fullrust build** — the same static, libc-free binary the action
+produces:
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: ghcr.io/karpeleslab/fullrust:latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: cargo build --release
 ```
-```rust
-#![no_std]
-#![no_main]
-use fullrust::prelude::*;
-fn main() { println!("hello from libc-free rust"); }
-fullrust::entry!(main);
-```
-```console
-cargo fullrust --runtime build --release   # build-std (nightly)
-cargo fullrust --stable build              # precompiled core/alloc, no nightly
-```
 
-### Working inside this repo: `./x`
+## Build locally with Docker
 
-The `./x` wrapper is the in-repo equivalent of `cargo fullrust` (it predates the
-subcommand and is what CI uses):
+No toolchain install — mount your crate and build:
 
 ```console
-./x build                      # all examples, stable path
-./x run -p hello               # build + run one example
-./x run -p args -- a b c       # pass arguments
-./x build --nightly --release  # smaller binaries via build-std
+docker run --rm -v "$PWD":/src ghcr.io/karpeleslab/fullrust:latest build --release
+# `test`, `run`, `clippy` work the same way; run `bash` for an interactive shell.
 ```
 
-Examples live in [`examples/`](examples/): `hello`, `args`, `alloc-demo`,
-`panic-demo`, `std-smoke`.
+The binary lands in your crate's `target/x86_64-unknown-linux-fullrust/release/`.
 
 ---
 
-## Why a standalone `std` (the Go "no cgo" model)
+## Versions
 
-fullrust pairs with **a standalone standard library** —
-[`purestd`](https://github.com/KarpelesLab/purestd) — implemented directly on
-Linux syscalls, instead of reusing the platform libc or the upstream `std` that
-sits on top of it. This is the same architecture as the
-**Go runtime**: Go issues syscalls itself and only touches libc when you opt into
-cgo. fullrust is, in effect, *Rust with cgo off* — programs are written against
-fullrust's std, and the binary's only boundary to the outside world is the
-`syscall` instruction.
-
-There are three ways one could get a libc-free Rust, and we deliberately chose
-the first:
-
-1. **Own std (what fullrust does).** A bespoke standard library on raw syscalls.
-   Crates opt in (`#![no_std]` + the `std` alias; `cargo fullrust` drives the
-   build). Purest binaries, full control.
-2. **Port upstream `std`'s platform backend.** Add a freestanding `sys` backend
-   inside Rust's own `library/std` (as the SGX/UEFI/Hermit targets do) and
-   `build-std` the real std. Truly "it *is* `std`," but means maintaining a fork
-   of the standard library pinned to a nightly — large and perpetual.
-3. **A pure-Rust libc (the Eyra / `c-scape` model).** Keep the real `std` and
-   satisfy the libc symbols it calls with Rust implementations.
-
-### Why own std, and explicitly *not* a libc shim
-
-The deciding principle is **keeping Rust's guarantees end-to-end, all the way to
-the kernel.** Routing the standard library through a libc-shaped ABI (option 3)
-gives that up at a C-shaped wall in the middle of every OS interaction:
-
-- **Zero-cost abstraction survives only without the wall.** In own-std,
-  `io::Write::write` → `syscall` *inlines and monomorphizes end to end* — Rust's
-  signature zero-cost-abstraction property, intact on the hot path. An
-  `extern "C"` libc seam is **opaque to the optimizer**: it cannot be inlined or
-  specialized across, so you forfeit exactly that benefit at exactly the wrong
-  place.
-- **Rust types all the way down.** Our I/O returns `Result` / `Errno`; buffers
-  are slices with lengths; errors are values. A libc seam forces C shapes — raw
-  `*mut u8`, `c_int`, NUL-terminated strings, `struct stat`, and `errno` as a
-  thread-local int — with a double-translation tax on every call.
-- **A tiny `unsafe` surface instead of a vast one.** A pure-Rust libc is almost
-  entirely `unsafe`: it *implements* a raw-pointer ABI and must reproduce
-  glibc's quirks exactly — symbol versioning (`memcpy@GLIBC_2.14`), struct
-  layouts, `__errno_location`, the TLS model, `environ`, the `__libc_start_main`
-  handshake. Any subtle mismatch is undefined behavior. own-std's only `unsafe`
-  is the handful of `syscall` sites plus a few compiler-mandated leaf symbols
-  (`memcpy`, `_start`) — not an entire operating-system interface.
-
-A clarification, to be fair to option 3: the `std → libc` boundary *already
-exists* in normal Rust (std reaches glibc through `unsafe extern "C"`). So a libc
-shim would not add unsafe FFI to *your* code, and a plain `extern "C"` call into
-a Rust function is cheap (nothing like cgo's stack-switch cost). What you lose is
-narrower but real: **the optimizer goes blind at the seam, the API degrades to C
-shapes there, and you take on a large unsafe ABI layer to build and maintain.**
-For "the purest possible binaries" on code you control, that trade isn't worth
-it — so fullrust keeps Rust idioms and optimization unbroken from `main` down to
-the `syscall`, and accepts the one cost of the own-std model: like Go, programs
-target fullrust's std rather than running arbitrary upstream-`std` crates
-unmodified. (Pure `no_std + alloc` libraries from crates.io still work as-is;
-only crates that need OS services *through* `std` need to target fullrust's.)
-
----
-
-## The method
-
-A normal Rust binary starts life in libc's `crt0`: the kernel jumps to libc's
-`_start`, which sets up the C runtime and eventually calls your `main`. Removing
-libc means we have to supply everything that machinery provided. There turn out
-to be only a handful of pieces.
-
-### 1. The entry point (`_start`)
-
-On `execve`, the Linux kernel transfers control to the ELF entry symbol
-`_start` with the stack laid out as:
-
-```text
-rsp ->  argc
-        argv[0] … argv[argc-1], NULL
-        envp[0] … envp[m-1],   NULL
-        auxv …
-```
-
-There is no return address. fullrust defines `_start` as a *naked* function
-(no prologue/epilogue) that captures `rsp`, aligns the stack as the SysV ABI
-requires, parses `argc`/`argv`/`envp`, and calls `main` — see
-[`arch/x86_64.rs`](crates/fullrust/src/arch/x86_64.rs) and
-[`start.rs`](crates/fullrust/src/start.rs).
-
-There are two ways `main` gets wired up:
-
-* **Zero-touch (default).** The sysroot `std` provides the `start` lang item, so
-  an ordinary `fn main` links exactly as it would under real std — the
-  compiler-generated entry calls our `lang_start`.
-* **`--runtime`.** A `no_std` crate exports its `main` as `__fullrust_main` via
-  the [`entry!`](crates/fullrust/src/lib.rs) macro, which `_start` calls
-  directly.
-
-Either way the process ends with `exit_group`.
-
-### 2. Syscalls instead of libc
-
-Every interaction with the outside world is a raw `syscall`. The instruction
-wrappers (`syscall0`…`syscall6`) and the syscall-number table are the only
-architecture-specific code; everything else builds on the arch-neutral,
-`Result`-returning wrappers in [`syscall.rs`](crates/fullrust/src/syscall.rs)
-(`read`, `write`, `open`, `close`, `mmap`, `munmap`, `getrandom`,
-`exit_group`, …).
-
-### 3. Symbols the compiler still expects
-
-Even pure Rust expects a few free-standing symbols that libc normally provides.
-fullrust supplies them in [`intrinsics.rs`](crates/fullrust/src/intrinsics.rs):
-
-* **`memcpy` / `memmove` / `memset` / `memcmp` / `bcmp`** — the compiler lowers
-  struct copies, slice fills, comparisons, etc. to these. (They are simple
-  byte loops; LLVM's loop-idiom pass deliberately won't rewrite a loop *inside*
-  `memcpy` into a call to `memcpy`, so there is no self-recursion.)
-* **`strlen`** — used by `core::ffi::CStr::from_ptr`, which we use to read the
-  NUL-terminated `argv`/`envp` strings.
-* **`rust_eh_personality` / `_Unwind_Resume`** — unwinding hooks. We build with
-  `panic = "abort"`, so unwinding never happens and these are abort-stubs that
-  are never actually executed (see the panic discussion below).
-
-### 4. A heap (`alloc`)
-
-To get `Box`, `Vec`, `String` and `format!`, fullrust provides a
-`#[global_allocator]`: a small **mmap-backed segregated free-list** allocator
-(see [`allocator.rs`](crates/fullrust/src/allocator.rs)). Requests up to 64 KiB
-are rounded to a size class and served from per-class free lists carved out of
-1 MiB `mmap` arenas; larger requests get their own `mmap`/`munmap`. It is
-`Sync` via a spinlock guarding the arena state.
-
-### 5. Panics
-
-The binary needs exactly one `#[panic_handler]`. fullrust's
-(in [`panic.rs`](crates/fullrust/src/panic.rs)) prints the message and source
-location to stderr and calls `exit_group(134)` (mimicking `128 + SIGABRT`).
-Because we compile with `panic = "abort"`, panicking never unwinds, so the
-unwind stubs from (3) are never reached.
-
-> The binary-policy symbols — `_start`, the `#[panic_handler]`, and the
-> `#[global_allocator]` static — are gated behind fullrust's default `rt`
-> feature. The `--runtime`/`entry!` model leaves `rt` on so they come from
-> `fullrust`; the zero-touch sysroot `std` turns `rt` off and supplies them
-> itself (you can only have one of each per binary). The *mechanisms* — the
-> syscalls, the `Allocator` type, the mem intrinsics — are always present.
-
-### 6. Linking with no C runtime
-
-The build invokes the LLVM linker (`rust-lld`) **directly** as `ld.lld`, rather
-than through a C compiler driver. That means no `crt0`, no implicit `-lc`, no
-`cc` — just our object files plus `core`/`alloc`. Combined with
-`-relocation-model=static` and `-static`, the result is a position-dependent,
-fully static ELF with no dynamic section. (`rust-lld`'s generic driver picks
-GNU/ELF mode from the name `ld.lld`; the bare name `rust-lld` does not, which is
-why `./x` points at the `gcc-ld/ld.lld` shim.)
-
----
-
-## Build modes
-
-`cargo fullrust` has three ways to produce a binary; all are genuinely libc-free
-and fully static.
-
-| Mode | Crate looks like | Toolchain | How |
-|---|---|---|---|
-| **zero-touch** (default) | unmodified `fn main`, `use std`, no deps | nightly + `rust-src` | sysroot whose `std` is fullrust's, built once and cached; your crate compiles with `--sysroot` |
-| **`--runtime`** | `#![no_std]` + `fullrust::entry!` | nightly + `rust-src` | `-Z build-std` recompiles core/alloc; `fullrust` supplies the runtime |
-| **`--stable`** | `#![no_std]` + `fullrust::entry!` | stable | precompiled core/alloc from the sysroot; our abort-stubs satisfy `alloc`'s unwind references |
-
-The `--runtime`/`--stable` paths use a **different target triple per path** so
-the freestanding linker flags never touch host build scripts (`./x` mirrors this
-in-repo). On a release build a trivial program is well under 10 KiB.
-
-### Why a custom target on nightly?
-
-`-Z build-std` recompiles `compiler_builtins`, whose **build script** must
-compile for the *host* (with the system `cc` and libc). If our freestanding
-crates and that host build script shared a target triple, cargo would apply the
-`-static`/`ld.lld` flags to the build script too and it would fail to link.
-Giving the nightly path its own triple (`x86_64-fullrust-linux`) keeps host
-artifacts on the normal `-gnu` host triple with the system linker, while our
-code builds freestanding. The stable path has no build scripts in its graph, so
-it can stay on the plain `-gnu` triple.
-
----
-
-## Extending
-
-### Add a syscall
-
-1. Add its number to `pub mod nr` in
-   [`arch/x86_64.rs`](crates/fullrust/src/arch/x86_64.rs).
-2. Add a safe wrapper in [`syscall.rs`](crates/fullrust/src/syscall.rs) using
-   the right `syscallN` and `from_ret` for error handling.
-
-### Add an architecture
-
-All CPU/ABI-specific code is confined to `arch/`. To port to, say, `aarch64`:
-
-1. Add `crates/fullrust/src/arch/aarch64.rs` providing `syscall0…6` (the
-   `svc #0` sequence, args in `x0…x5`, number in `x8`), the naked `_start`
-   (stack pointer arrives in `x0`/`sp`), and the `nr` table for that ABI.
-2. Wire it up with a `#[cfg(target_arch = "aarch64")]` arm in
-   [`arch/mod.rs`](crates/fullrust/src/arch/mod.rs).
-3. Add an `aarch64-fullrust-linux.json` target spec (next to the x86_64 one in
-   `crates/cargo-fullrust/`) for the nightly path.
-
-The rest of the crate is written against `arch::syscallN` and `arch::nr` only.
-
----
-
-## Layout
+Images are published per Rust minor, plus `latest` (the newest):
 
 ```
-crates/fullrust/         the runtime (crt0 + compiler_builtins equivalent)
-  src/entry.rs             naked _start: argc/argv/envp -> purestd's `main`
-  src/intrinsics.rs        mem*/strlen + getauxval + _Unwind_Resume stub
-  src/lib.rs               crate root
-                         (the standard library is the separate `purestd` crate;
-                          it provides the API + panic handler + allocator +
-                          rust_eh_personality)
-crates/cargo-fullrust/   the `cargo fullrust` subcommand
-  src/main.rs              builds/caches the sysroot, drives cargo
-  sysroot/std_lib.rs       the sysroot `std` (re-exports purestd + lang_start)
-  x86_64-fullrust-linux.json   freestanding target spec (cargo-fullrust + ./x)
-examples/                hello, args, alloc-demo, panic-demo (purestd + entry!);
-                           std-smoke (net/time/threads; live network, manual);
-                           plain (zero-touch demo: ordinary crate, no deps)
-action.yml               reusable GitHub Action (build static artifacts in CI)
-x                        in-repo build wrapper (linker resolution + path selection)
-.cargo/config.toml       intentionally minimal — see ./x
+ghcr.io/karpeleslab/fullrust:1.88   …   :1.95   :latest
 ```
 
+They're public — no login to pull. Pin one via the action's `image:` input, the
+`container:` image, or the `docker run` tag. The action currently defaults to
+`:1.88`; for the newest Rust, set
+`image: ghcr.io/karpeleslab/fullrust:1.95` (or `:latest`).
+
 ---
+
+## What works
+
+An unmodified crate gets the **real** standard library, with its platform backend
+rewritten on raw syscalls:
+
+- **Threads & sync** — `std::thread` (`clone`-backed, per-thread stacks), futex
+  `Mutex`/`Condvar`/`RwLock`, native `thread_local!` (`%fs`/TCB TLS).
+- **Files & directories**, and **`std::process::Command`** (`fork`+`execve`,
+  pipes, `wait`).
+- **Networking** — TCP/UDP with a self-contained DNS resolver (`/etc/hosts` +
+  `/etc/resolv.conf`, no NSS).
+- **Panics unwind** (`catch_unwind`, `Drop` during unwind), and
+  `RUST_BACKTRACE=1` prints **symbolized backtraces** — with no libunwind and no
+  libc, via an in-tree pure-Rust unwinder.
+- **`std::os::fd`** (`AsFd`/`OwnedFd`/`AsRawFd`/…) for the fd-interop ecosystem.
+- **Dependencies** — pure-Rust crates work as-is (e.g. `serde`/`serde_json`). The
+  image auto-injects a `[patch.crates-io]` so the common not-quite-pure gateways
+  build libc-free too: `getrandom` (and thus `rand`, `uuid`), `socket2` (and thus
+  `mio`/async stacks). Opt out with `no-ecosystem: true`.
 
 ## Limitations
 
-* **Linux + x86-64 only** today (the design isolates arch-specific code; see
-  [Extending](#extending)).
-* **Threads are real**: `clone`-backed with per-thread stacks, futex-based
-  `Mutex`/`Condvar`/`RwLock`, and genuine per-thread TLS (`thread_local!` via
-  `#[thread_local]`, with the thread pointer set from the program's `PT_TLS`
-  image). `thread_local!` needs `feature(thread_local)`, which `cargo fullrust`
-  and `./x` inject automatically on the nightly paths (so the `--stable` path
-  doesn't support `thread_local!`). Still missing: `process::Command`
-  (spawning child processes), and TLS destructors don't run at thread exit.
-* The DNS resolver does plain DNS + `/etc/hosts` (no NSS).
-* **No dynamic linking, by design.** FFI into a `.so` cannot link.
-* **`panic = "abort"` is mandatory** — it's what lets us drop the unwinder.
-* The allocator is deliberately simple (no cross-class coalescing). It is
-  correct and fine for typical workloads, not a general-purpose `malloc`.
-* Build through `cargo fullrust` (or `./x` in-repo); a bare `cargo build` won't
-  have the linker/target wiring.
+- **Linux + x86-64 only** today.
+- **Static only** — no dynamic linking; FFI into a `.so` cannot link (by design).
+- **Not the `unix` target family.** `cfg(unix)` is false — that's exactly what
+  keeps the build graph libc-free — so `std::os::unix` is absent (`std::os::fd`
+  is provided instead). A crate whose `unix`-only path is load-bearing may need
+  the ecosystem `[patch]` or a small fix; in practice most pure-Rust crates need
+  nothing.
+
+---
+
+## Why a standalone `std` (the Go "no-cgo" model)
+
+fullrust gives the standard library its **own platform backend on Linux
+syscalls**, instead of routing it through the platform libc. This is the same
+architecture as the **Go runtime**: Go issues syscalls itself and only touches
+libc when you opt into cgo. fullrust is, in effect, *Rust with cgo off* — the
+binary's only boundary to the outside world is the `syscall` instruction. It is
+still the real `std`, so ordinary crates compile unchanged.
+
+The deciding principle is **keeping Rust's guarantees end-to-end, all the way to
+the kernel** — which a pure-Rust *libc shim* (the Eyra / `c-scape` model) gives
+up at a C-shaped wall in the middle of every OS interaction:
+
+- **Zero-cost abstraction survives only without the wall.** `io::Write::write` →
+  `syscall` inlines and monomorphizes end to end. An `extern "C"` libc seam is
+  opaque to the optimizer — it can't be inlined or specialized across, so you
+  forfeit exactly that benefit at exactly the wrong place.
+- **Rust types all the way down.** I/O returns `Result`; buffers are slices;
+  errors are values — not raw `*mut u8`, `c_int`, NUL-terminated strings and a
+  thread-local `errno`, with a double-translation tax on every call.
+- **A tiny `unsafe` surface instead of a vast one.** The `unsafe` is the handful
+  of `syscall` sites, not an entire glibc-shaped ABI (symbol versioning, struct
+  layouts, the TLS model, the `__libc_start_main` handshake) that a shim must
+  reproduce exactly or hit UB.
+
+The one accepted cost, like Go: programs target fullrust's std rather than being
+able to link arbitrary C libraries. (Pure `no_std + alloc` crates still work
+as-is; only code that needs OS services *through* libc is excluded — on purpose.)
+
+---
+
+## How it's built (internals)
+
+fullrust is a source overlay on the Rust compiler that adds the built-in
+`x86_64-unknown-linux-fullrust` target and a `std::sys` backend on raw syscalls
+(the allocator, native TLS, threads, fs/net/process, the pure-Rust unwinder and
+backtraces), packaged as a thin Docker image around the prebuilt toolchain. It
+tracks released Rust versions (currently 1.88–1.95).
+
+See [`toolchain/README.md`](toolchain/README.md) for the design, the
+syscall-backed platform layer, and how the overlay is built and ported across
+Rust versions.
 
 ## License
 
