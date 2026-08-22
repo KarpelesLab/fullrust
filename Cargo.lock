@@ -20,11 +20,11 @@ dependencies = [
 
 [[package]]
 name = "cargo-fullrust"
-version = "0.1.1"
+version = "0.1.2"
 
 [[package]]
 name = "fullrust"
-version = "0.1.1"
+version = "0.1.2"
 
 [[package]]
 name = "hello"
