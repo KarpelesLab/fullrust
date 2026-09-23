@@ -316,7 +316,7 @@ unix-gated (but otherwise portable) code is invisible unless it also has a
 
 ## Version matrix
 
-The goal is to track `1.88 … 1.97` and observe how `std::sys::pal` shifts across
+The goal is to track `1.88 … 1.98` and observe how `std::sys::pal` shifts across
 versions (the pal interface is deliberately unstable upstream). Each `rust-<v>`
 checkout is gitignored; the overlay of source changes above is what we carry
 forward and re-apply per version (`git apply --reject patches/fullrust-<prev>.patch`,
@@ -324,8 +324,17 @@ fix the rejects, `./regen-overlay.sh <v>`).
 
 | Rust | overlay | status |
 |------|---------|--------|
-| 1.88 | `patches/fullrust-1.88.patch` | full — frozen on the `1.88` branch |
+| 1.88 | `patches/fullrust-1.88.patch` | builds + all test crates green (the pre-matrix original is frozen on the `1.88` branch) |
 | 1.89 | `patches/fullrust-1.89.patch` | builds + all test crates green |
+| 1.90 | `patches/fullrust-1.90.patch` | builds + all test crates green |
+| 1.91 | `patches/fullrust-1.91.patch` | builds + all test crates green |
+| 1.92 | `patches/fullrust-1.92.patch` | builds + all test crates green |
+| 1.93 | `patches/fullrust-1.93.patch` | builds + all test crates green |
+| 1.94 | `patches/fullrust-1.94.patch` | builds + all test crates green |
+| 1.95 | `patches/fullrust-1.95.patch` | builds + all test crates green |
+| 1.96 | `patches/fullrust-1.96.patch` | builds + all test crates green |
+| 1.97 | `patches/fullrust-1.97.patch` | builds + all test crates green |
+| 1.98 | `patches/fullrust-1.98.patch` | builds + all test crates green |
 
 **1.88 → 1.89 drift was small:** only 7 hunks rejected on re-apply — all
 mechanical `Cargo.toml` libc-gate edits (dependency version bumps) + one moved
@@ -334,6 +343,20 @@ so that edit is now a no-op. Two build-surfaced pal adaptations: `sys::fs::File`
 gained a `size() -> Option<io::Result<u64>>` (a `read_to_end` size hint), and
 `Thread::new` gained a `name: Option<&str>` parameter (the child sets it via
 `prctl` before running the closure).
+
+**1.95 → 1.98 drift:**
+
+- **1.96** moved `getcwd`/`chdir`/`current_exe`/`home_dir`/`temp_dir`/path
+  splitting out of each pal's `os.rs` into a new `sys/paths` dispatcher (fullrust
+  re-exports its pal `os` implementations there), and `process::id()` now comes
+  from the process backend's `getpid`.
+- **1.97** requires `Command::get_resolved_envs` and `TcpStream::{set_,}keepalive`
+  from every backend.
+- **1.98** moved `IoSlice` and `io::Error` into `core::io` (fullrust joins core's
+  `repr_iovec` list), made `BorrowedCursor` generic (`BorrowedCursor<'_, u8>`),
+  sealed the `os::*::process` extension traits with `pub impl(self) trait`
+  instead of `Sealed`, and started denying `implicit_provenance_casts`, so
+  syscall pointer arguments are passed as `ptr.expose_provenance()`.
 
 **Build tip:** a released tag's CI LLVM is usually expired (`download-ci-llvm`
 404s), so LLVM builds from source (~1–2 h). Adjacent versions often share an LLVM

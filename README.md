@@ -128,13 +128,17 @@ The binary lands in your crate's `target/x86_64-unknown-linux-fullrust/release/`
 Images are published per Rust minor, plus `latest` (the newest):
 
 ```
-ghcr.io/karpeleslab/fullrust:1.88   …   :1.95   :latest
+ghcr.io/karpeleslab/fullrust:1.88   …   :1.98   :latest
 ```
+
+`:<minor>` and `:latest` move to each new build (e.g. when the ecosystem bundle
+changes). Every build is also tagged `:<minor>-<commit>` (e.g. `:1.98-33782b9`),
+which never moves: pin that, or a digest, for reproducible builds.
 
 They're public — no login to pull. Pin one via the action's `image:` input, the
 `container:` image, or the `docker run` tag. The action currently defaults to
 `:1.88`; for the newest Rust, set
-`image: ghcr.io/karpeleslab/fullrust:1.95` (or `:latest`).
+`image: ghcr.io/karpeleslab/fullrust:1.98` (or `:latest`).
 
 ---
 
@@ -235,7 +239,7 @@ fullrust is a source overlay on the Rust compiler that adds the built-in
 `x86_64-unknown-linux-fullrust` target and a `std::sys` backend on raw syscalls
 (the allocator, native TLS, threads, fs/net/process, the pure-Rust unwinder and
 backtraces), packaged as a thin Docker image around the prebuilt toolchain. It
-tracks released Rust versions (currently 1.88–1.95).
+tracks released Rust versions (currently 1.88–1.98).
 
 See [`toolchain/README.md`](toolchain/README.md) for the design, the
 syscall-backed platform layer, and how the overlay is built and ported across
