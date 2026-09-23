@@ -64,8 +64,11 @@ jobs:
         working-directory: toolchain
         run: ./build-fork.sh "${{ inputs.minor }}.0"
 
+      # Saved even when the build step fails (e.g. a new version's overlay not
+      # compiling yet): LLVM + the compiler are the 1–2 h part, and keeping them
+      # makes the fix-and-rerun loop incremental via the restore-keys prefix.
       - name: Save toolchain build cache
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' && steps.cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: toolchain/rust-${{ inputs.minor }}/build
