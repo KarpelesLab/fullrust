@@ -153,10 +153,38 @@ rewritten on raw syscalls:
   `RUST_BACKTRACE=1` prints **symbolized backtraces** — with no libunwind and no
   libc, via an in-tree pure-Rust unwinder.
 - **`std::os::fd`** (`AsFd`/`OwnedFd`/`AsRawFd`/…) for the fd-interop ecosystem.
+- **Talking to the kernel directly** — see [below](#raw-syscalls-and-exec).
 - **Dependencies** — pure-Rust crates work as-is (e.g. `serde`/`serde_json`). The
   image auto-injects a `[patch.crates-io]` so the common not-quite-pure gateways
   build libc-free too: `getrandom` (and thus `rand`, `uuid`), `socket2` (and thus
   `mio`/async stacks). Opt out with `no-ecosystem: true`.
+
+### Raw syscalls and `exec`
+
+With no libc, the `libc`/`nix` crates aren't available. fullrust's std provides
+the equivalents under `std::os::fullrust` instead (these need
+`#[cfg(target_os = "fullrust")]` in portable code):
+
+- **`std::os::fullrust::process`** — the same API as `std::os::unix::process`:
+  `CommandExt` (`exec`, `pre_exec`, `arg0`, `uid`, `gid`, `process_group`),
+  `ExitStatusExt` (`signal`, `core_dumped`, `from_raw`, …) and `parent_id`.
+  Code written against the Unix extensions only needs a different `use`.
+- **`std::os::fullrust::syscall`** — `syscall0`…`syscall6`, which make the raw
+  `syscall` instruction and turn a `-errno` return into an `io::Error`. It also
+  has `nr` (every x86-64 syscall number) and `errno` (the Linux error numbers).
+  Use it for anything std doesn't wrap.
+
+```rust
+use std::os::fullrust::process::CommandExt;
+use std::os::fullrust::syscall::{self, nr};
+use std::process::Command;
+
+// A kernel call std doesn't wrap:
+let tid = unsafe { syscall::syscall0(nr::GETTID) }?;
+
+// Replace the current process image (execve). Only returns on failure:
+let err = Command::new("/bin/sh").arg0("sh").args(["-c", "echo hi"]).exec();
+```
 
 ## Limitations
 
@@ -164,9 +192,9 @@ rewritten on raw syscalls:
 - **Static only** — no dynamic linking; FFI into a `.so` cannot link (by design).
 - **Not the `unix` target family.** `cfg(unix)` is false — that's exactly what
   keeps the build graph libc-free — so `std::os::unix` is absent (`std::os::fd`
-  is provided instead). A crate whose `unix`-only path is load-bearing may need
-  the ecosystem `[patch]` or a small fix; in practice most pure-Rust crates need
-  nothing.
+  and `std::os::fullrust` are provided instead). A crate whose `unix`-only path
+  is load-bearing may need the ecosystem `[patch]` or a small fix; in practice
+  most pure-Rust crates need nothing.
 
 ---
 
