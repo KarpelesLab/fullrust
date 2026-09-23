@@ -447,10 +447,10 @@ index 000000000..9fa1cf139
 +}
 diff --git a/library/std/src/os/fullrust/process.rs b/library/std/src/os/fullrust/process.rs
 new file mode 100644
-index 000000000..63964bb1d
+index 000000000..11b4587e3
 --- /dev/null
 +++ b/library/std/src/os/fullrust/process.rs
-@@ -0,0 +1,239 @@
+@@ -0,0 +1,238 @@
 +//! `fullrust`-specific extensions to primitives in the [`std::process`] module.
 +//!
 +//! These mirror [`std::os::unix::process`] (same names, same semantics), so
@@ -472,7 +472,6 @@ index 000000000..63964bb1d
 +#![stable(feature = "rust1", since = "1.0.0")]
 +
 +use crate::ffi::OsStr;
-+use crate::sealed::Sealed;
 +use crate::sys::{AsInner, AsInnerMut, FromInner};
 +use crate::{io, process, sys};
 +
@@ -481,7 +480,7 @@ index 000000000..63964bb1d
 +/// This trait is sealed: it cannot be implemented outside the standard library.
 +/// This is so that future additional methods are not breaking changes.
 +#[stable(feature = "rust1", since = "1.0.0")]
-+pub trait CommandExt: Sealed {
++pub impl(self) trait CommandExt {
 +    /// Sets the child process's user ID. This translates to a
 +    /// `setuid` call in the child process. Failure in the `setuid`
 +    /// call will cause the spawn to fail.
@@ -629,7 +628,7 @@ index 000000000..63964bb1d
 +/// This trait is sealed: it cannot be implemented outside the standard library.
 +/// This is so that future additional methods are not breaking changes.
 +#[stable(feature = "rust1", since = "1.0.0")]
-+pub trait ExitStatusExt: Sealed {
++pub impl(self) trait ExitStatusExt {
 +    /// Creates a new `ExitStatus` from the raw underlying wait status.
 +    #[stable(feature = "exit_status_from", since = "1.12.0")]
 +    fn from_raw(raw: i32) -> Self;
