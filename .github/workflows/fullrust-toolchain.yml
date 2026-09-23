@@ -22,6 +22,7 @@ on:
 
 permissions:
   contents: write        # create/update the toolchain release + upload the asset
+  actions: write         # dispatch `fullrust image` for the freshly published minor
 
 jobs:
   build:
@@ -94,3 +95,11 @@ jobs:
             rust-lld) and the bootstrap cargo, for Rust ${{ inputs.minor }}.
             Consumed by the `fullrust image` workflow to build
             `ghcr.io/${{ github.repository_owner }}/fullrust`.
+
+      # A new toolchain asset is useless until it's in the image — rebuild that
+      # minor's image now rather than relying on someone remembering to.
+      - name: Rebuild this minor's image
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run fullrust-image.yml -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" -f minor="${{ inputs.minor }}"

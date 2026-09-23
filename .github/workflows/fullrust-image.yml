@@ -1,23 +1,29 @@
 name: fullrust image
 
-# Build ghcr.io/<owner>/fullrust and push it, tagged with the Rust minor and
-# `latest`. The image just repackages the prebuilt stage1 (a release asset from
-# the `fullrust toolchain` workflow) plus the ecosystem bundle, so this is fast —
-# it runs on every ecosystem change without rebuilding the compiler. Mirrors
-# KarpelesLab/decryptd's Docker workflow (build-push-action off a release asset).
+# Build ghcr.io/<owner>/fullrust and push it. The image just repackages the
+# prebuilt stage1 (a release asset from the `fullrust toolchain` workflow) plus
+# the ecosystem bundle, so this is fast — it runs on every ecosystem change
+# without rebuilding the compiler. Mirrors KarpelesLab/decryptd's Docker workflow
+# (build-push-action off a release asset).
 #
-# Triggers: manual (pick the minor), and when the ecosystem bundle / docker files
-# change on master. NOT auto-triggered by the toolchain workflow: workflow_run
-# can't tell which minor was just built (it would default to 1.88 and flap the
-# `latest` tag), so each version's image is dispatched explicitly with its minor.
+# Tags, per Rust minor:
+#   <minor>            moving — always the newest build for that minor
+#   <minor>-<sha>      immutable — pin this (or a digest) for reproducible builds
+#   latest             moving — the newest build of the highest minor
+#
+# Triggers:
+#   - dispatched by `fullrust toolchain` after it publishes a minor's asset
+#     (or manually) → rebuilds that one minor;
+#   - ecosystem / docker changes on master → rebuilds EVERY minor that has a
+#     `toolchain-<minor>` release, since they all bundle the same ecosystem.
 
 on:
   workflow_dispatch:
     inputs:
       minor:
-        description: "Rust minor to package (must have a toolchain-<minor> release)"
+        description: "Rust minor to package (blank = every minor with a toolchain-<minor> release)"
         required: false
-        default: "1.88"
+        default: ""
         type: string
   push:
     branches: [master]
@@ -30,9 +36,39 @@ permissions:
   packages: write
 
 jobs:
-  publish:
-    name: build & push to GHCR
+  # Work out which minors to build, and which one is the highest (gets `latest`).
+  plan:
     runs-on: ubuntu-latest
+    outputs:
+      minors: ${{ steps.plan.outputs.minors }}
+      newest: ${{ steps.plan.outputs.newest }}
+    steps:
+      - id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_MINOR: ${{ inputs.minor }}
+        run: |
+          set -euo pipefail
+          all="$(gh release list -R "$GITHUB_REPOSITORY" -L 200 --json tagName -q '.[].tagName' \
+                 | sed -n 's/^toolchain-//p' | sort -V)"
+          [ -n "$all" ] || { echo "::error::no toolchain-<minor> releases found"; exit 1; }
+          if [ -n "$INPUT_MINOR" ]; then
+            grep -qxF "$INPUT_MINOR" <<<"$all" || { echo "::error::no toolchain-$INPUT_MINOR release"; exit 1; }
+            minors="$INPUT_MINOR"
+          else
+            minors="$all"
+          fi
+          echo "minors=$(jq -cnR '[inputs]' <<<"$minors")" >> "$GITHUB_OUTPUT"
+          echo "newest=$(tail -n1 <<<"$all")" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: build & push to GHCR (${{ matrix.minor }})
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        minor: ${{ fromJSON(needs.plan.outputs.minors) }}
     steps:
       - uses: actions/checkout@v6
       - uses: docker/setup-buildx-action@v3
@@ -47,9 +83,11 @@ jobs:
       - name: Resolve version, tags, and toolchain asset URL
         id: meta
         run: |
-          minor="${{ inputs.minor || '1.88' }}"
+          minor="${{ matrix.minor }}"
           repo="ghcr.io/${GITHUB_REPOSITORY,,}"      # GHCR names are lowercase
-          echo "tags=${repo}:${minor},${repo}:latest" >> "$GITHUB_OUTPUT"
+          tags="${repo}:${minor},${repo}:${minor}-${GITHUB_SHA::7}"
+          [ "$minor" = "${{ needs.plan.outputs.newest }}" ] && tags="${tags},${repo}:latest"
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
           echo "url=https://github.com/${GITHUB_REPOSITORY}/releases/download/toolchain-${minor}/fullrust-toolchain-${minor}-x86_64.tar.gz" >> "$GITHUB_OUTPUT"
 
       - name: Build & push
@@ -60,6 +98,10 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ matrix.minor }}
           build-args: |
             FULLRUST_TOOLCHAIN_URL=${{ steps.meta.outputs.url }}
 
@@ -69,9 +111,13 @@ jobs:
   # build --release` on a fresh crate, then asserts the output is a static,
   # libc-free ELF and executes it on the stock runner.
   verify:
-    name: verify image builds & runs a fullrust binary
-    needs: publish
+    name: verify image builds & runs a fullrust binary (${{ matrix.minor }})
+    needs: [plan, publish]
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        minor: ${{ fromJSON(needs.plan.outputs.minors) }}
     steps:
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -84,7 +130,8 @@ jobs:
         run: |
           set -euxo pipefail
           repo="ghcr.io/${GITHUB_REPOSITORY,,}"
-          minor="${{ inputs.minor || '1.88' }}"
+          # The immutable tag, so this checks exactly the image just pushed.
+          minor="${{ matrix.minor }}-${GITHUB_SHA::7}"
           mkdir -p proj/src
           # A serde-derive crate on purpose: serde_derive is a PROC-MACRO and
           # serde/serde_json have BUILD SCRIPTS — both compile for the HOST, so
