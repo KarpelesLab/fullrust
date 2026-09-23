@@ -2181,7 +2181,7 @@ index 89856516b..b608bb37e 100644
          pub use windows::*;
 diff --git a/library/std/src/sys/fs/fullrust.rs b/library/std/src/sys/fs/fullrust.rs
 new file mode 100644
-index 000000000..68feacbdf
+index 000000000..5b09c93e9
 --- /dev/null
 +++ b/library/std/src/sys/fs/fullrust.rs
 @@ -0,0 +1,830 @@
@@ -2287,7 +2287,7 @@ index 000000000..68feacbdf
 +            sysc::syscall4(
 +                sysc::OPENAT,
 +                AT_FDCWD,
-+                c.as_ptr() as usize,
++                c.as_ptr().expose_provenance(),
 +                flags as usize,
 +                mode as usize,
 +            )
@@ -2412,7 +2412,7 @@ index 000000000..68feacbdf
 +
 +    pub fn set_times(&self, times: FileTimes) -> io::Result<()> {
 +        let ts = [to_timespec(times.accessed), to_timespec(times.modified)];
-+        cvt(unsafe { sysc::syscall4(sysc::UTIMENSAT, self.raw(), 0, ts.as_ptr() as usize, 0) })
++        cvt(unsafe { sysc::syscall4(sysc::UTIMENSAT, self.raw(), 0, ts.as_ptr().expose_provenance(), 0) })
 +            .map(drop)
 +    }
 +
@@ -2521,10 +2521,10 @@ index 000000000..68feacbdf
 +        sysc::syscall5(
 +            sysc::STATX,
 +            dirfd,
-+            path.as_ptr() as usize,
++            path.as_ptr().expose_provenance(),
 +            flags,
 +            STATX_MASK,
-+            buf.as_mut_ptr() as usize,
++            buf.as_mut_ptr().expose_provenance(),
 +        )
 +    })?;
 +    // statx struct field offsets (linux/stat.h); timestamps are
@@ -2745,7 +2745,7 @@ index 000000000..68feacbdf
 +    pub fn mkdir(&self, path: &Path) -> io::Result<()> {
 +        let c = os::cstr(path)?;
 +        cvt(unsafe {
-+            sysc::syscall3(sysc::MKDIRAT, AT_FDCWD, c.as_ptr() as usize, self.mode as usize)
++            sysc::syscall3(sysc::MKDIRAT, AT_FDCWD, c.as_ptr().expose_provenance(), self.mode as usize)
 +        })
 +        .map(drop)
 +    }
@@ -2848,7 +2848,7 @@ index 000000000..68feacbdf
 +        sysc::syscall4(
 +            sysc::OPENAT,
 +            AT_FDCWD,
-+            c.as_ptr() as usize,
++            c.as_ptr().expose_provenance(),
 +            (O_RDONLY | O_DIRECTORY | O_CLOEXEC) as usize,
 +            0,
 +        )
@@ -2859,7 +2859,7 @@ index 000000000..68feacbdf
 +    let mut buf = [0u8; 4096];
 +    loop {
 +        let n = cvt(unsafe {
-+            sysc::syscall3(sysc::GETDENTS64, fd as usize, buf.as_mut_ptr() as usize, buf.len())
++            sysc::syscall3(sysc::GETDENTS64, fd as usize, buf.as_mut_ptr().expose_provenance(), buf.len())
 +        })?;
 +        if n == 0 {
 +            break;
@@ -2880,12 +2880,12 @@ index 000000000..68feacbdf
 +
 +pub fn unlink(path: &Path) -> io::Result<()> {
 +    let c = os::cstr(path)?;
-+    cvt(unsafe { sysc::syscall3(sysc::UNLINKAT, AT_FDCWD, c.as_ptr() as usize, 0) }).map(drop)
++    cvt(unsafe { sysc::syscall3(sysc::UNLINKAT, AT_FDCWD, c.as_ptr().expose_provenance(), 0) }).map(drop)
 +}
 +
 +pub fn rmdir(path: &Path) -> io::Result<()> {
 +    let c = os::cstr(path)?;
-+    cvt(unsafe { sysc::syscall3(sysc::UNLINKAT, AT_FDCWD, c.as_ptr() as usize, AT_REMOVEDIR) })
++    cvt(unsafe { sysc::syscall3(sysc::UNLINKAT, AT_FDCWD, c.as_ptr().expose_provenance(), AT_REMOVEDIR) })
 +        .map(drop)
 +}
 +
@@ -2896,9 +2896,9 @@ index 000000000..68feacbdf
 +        sysc::syscall4(
 +            sysc::RENAMEAT,
 +            AT_FDCWD,
-+            o.as_ptr() as usize,
++            o.as_ptr().expose_provenance(),
 +            AT_FDCWD,
-+            n.as_ptr() as usize,
++            n.as_ptr().expose_provenance(),
 +        )
 +    })
 +    .map(drop)
@@ -2907,7 +2907,7 @@ index 000000000..68feacbdf
 +pub fn set_perm(path: &Path, perm: FilePermissions) -> io::Result<()> {
 +    let c = os::cstr(path)?;
 +    cvt(unsafe {
-+        sysc::syscall3(sysc::FCHMODAT, AT_FDCWD, c.as_ptr() as usize, perm.mode as usize)
++        sysc::syscall3(sysc::FCHMODAT, AT_FDCWD, c.as_ptr().expose_provenance(), perm.mode as usize)
 +    })
 +    .map(drop)
 +}
@@ -2928,7 +2928,7 @@ index 000000000..68feacbdf
 +    let c = os::cstr(path)?;
 +    let ts = [to_timespec(times.accessed), to_timespec(times.modified)];
 +    cvt(unsafe {
-+        sysc::syscall4(sysc::UTIMENSAT, AT_FDCWD, c.as_ptr() as usize, ts.as_ptr() as usize, flags)
++        sysc::syscall4(sysc::UTIMENSAT, AT_FDCWD, c.as_ptr().expose_provenance(), ts.as_ptr().expose_provenance(), flags)
 +    })
 +    .map(drop)
 +}
@@ -2941,8 +2941,8 @@ index 000000000..68feacbdf
 +            sysc::syscall4(
 +                sysc::READLINKAT,
 +                AT_FDCWD,
-+                c.as_ptr() as usize,
-+                buf.as_mut_ptr() as usize,
++                c.as_ptr().expose_provenance(),
++                buf.as_mut_ptr().expose_provenance(),
 +                buf.len(),
 +            )
 +        })?;
@@ -2962,9 +2962,9 @@ index 000000000..68feacbdf
 +    cvt(unsafe {
 +        sysc::syscall3(
 +            sysc::SYMLINKAT,
-+            target.as_ptr() as usize,
++            target.as_ptr().expose_provenance(),
 +            AT_FDCWD,
-+            linkpath.as_ptr() as usize,
++            linkpath.as_ptr().expose_provenance(),
 +        )
 +    })
 +    .map(drop)
@@ -2977,9 +2977,9 @@ index 000000000..68feacbdf
 +        sysc::syscall5(
 +            sysc::LINKAT,
 +            AT_FDCWD,
-+            o.as_ptr() as usize,
++            o.as_ptr().expose_provenance(),
 +            AT_FDCWD,
-+            l.as_ptr() as usize,
++            l.as_ptr().expose_provenance(),
 +            0,
 +        )
 +    })
@@ -3004,7 +3004,7 @@ index 000000000..68feacbdf
 +        sysc::syscall4(
 +            sysc::OPENAT,
 +            AT_FDCWD,
-+            c.as_ptr() as usize,
++            c.as_ptr().expose_provenance(),
 +            (O_PATH | O_CLOEXEC) as usize,
 +            0,
 +        )
@@ -3059,7 +3059,7 @@ index cc8cda9ae..5392815d7 100644
          pub use unix::*;
 diff --git a/library/std/src/sys/io/is_terminal/fullrust.rs b/library/std/src/sys/io/is_terminal/fullrust.rs
 new file mode 100644
-index 000000000..84aed404e
+index 000000000..12d4bf045
 --- /dev/null
 +++ b/library/std/src/sys/io/is_terminal/fullrust.rs
 @@ -0,0 +1,68 @@
@@ -3084,7 +3084,7 @@ index 000000000..84aed404e
 +    // writes into the buffer on success, and we only care whether it succeeds.
 +    let mut termios = [0u8; 64];
 +    sysc::ret(unsafe {
-+        sysc::syscall3(sysc::IOCTL, fd as usize, TCGETS, termios.as_mut_ptr() as usize)
++        sysc::syscall3(sysc::IOCTL, fd as usize, TCGETS, termios.as_mut_ptr().expose_provenance())
 +    })
 +    .is_ok()
 +}
@@ -3148,10 +3148,10 @@ index 015813717..f80ea9bc4 100644
              pub use unsupported::*;
 diff --git a/library/std/src/sys/net/connection/fullrust.rs b/library/std/src/sys/net/connection/fullrust.rs
 new file mode 100644
-index 000000000..80c3ad802
+index 000000000..e59ca2c22
 --- /dev/null
 +++ b/library/std/src/sys/net/connection/fullrust.rs
-@@ -0,0 +1,1070 @@
+@@ -0,0 +1,1069 @@
 +//! TCP/UDP sockets and DNS for the fullrust target, on raw Linux syscalls.
 +//!
 +//! A single `Socket` (an owned [`FileDesc`]) backs `TcpStream`, `TcpListener`,
@@ -3294,7 +3294,7 @@ index 000000000..80c3ad802
 +                self.raw(),
 +                level,
 +                name,
-+                &value as *const T as usize,
++                (&value as *const T).expose_provenance(),
 +                mem::size_of::<T>(),
 +            )
 +        })?;
@@ -3311,8 +3311,8 @@ index 000000000..80c3ad802
 +                self.raw(),
 +                level,
 +                name,
-+                &mut val as *mut T as usize,
-+                &mut len as *mut u32 as usize,
++                (&mut val as *mut T).expose_provenance(),
++                (&mut len as *mut u32).expose_provenance(),
 +            ))?;
 +            Ok(val)
 +        }
@@ -3322,7 +3322,7 @@ index 000000000..80c3ad802
 +        let mut raw = [0u8; 28];
 +        let len = addr_to_raw(addr, &mut raw);
 +        cvt(unsafe {
-+            sysc::syscall3(sysc::CONNECT, self.raw(), raw.as_ptr() as usize, len)
++            sysc::syscall3(sysc::CONNECT, self.raw(), raw.as_ptr().expose_provenance(), len)
 +        })?;
 +        Ok(())
 +    }
@@ -3332,7 +3332,7 @@ index 000000000..80c3ad802
 +        let mut raw = [0u8; 28];
 +        let len = addr_to_raw(addr, &mut raw);
 +        let r = sysc::ret(unsafe {
-+            sysc::syscall3(sysc::CONNECT, self.raw(), raw.as_ptr() as usize, len)
++            sysc::syscall3(sysc::CONNECT, self.raw(), raw.as_ptr().expose_provenance(), len)
 +        });
 +        let result = match r {
 +            Ok(_) => Ok(()),
@@ -3366,7 +3366,7 @@ index 000000000..80c3ad802
 +        let mut pfd = PollFd { fd: self.0.raw(), events: POLLOUT, revents: 0 };
 +        loop {
 +            match sysc::ret(unsafe {
-+                sysc::syscall3(sysc::POLL, &mut pfd as *mut PollFd as usize, 1, ms as usize)
++                sysc::syscall3(sysc::POLL, (&mut pfd as *mut PollFd).expose_provenance(), 1, ms as usize)
 +            }) {
 +                Ok(0) => {
 +                    return Err(io::const_error!(
@@ -3391,8 +3391,8 @@ index 000000000..80c3ad802
 +            sysc::syscall4(
 +                sysc::ACCEPT4,
 +                self.raw(),
-+                storage.as_mut_ptr() as usize,
-+                &mut len as *mut u32 as usize,
++                storage.as_mut_ptr().expose_provenance(),
++                (&mut len as *mut u32).expose_provenance(),
 +                SOCK_CLOEXEC,
 +            )
 +        })?;
@@ -3427,7 +3427,7 @@ index 000000000..80c3ad802
 +            sysc::syscall6(
 +                sysc::RECVFROM,
 +                self.raw(),
-+                buf.as_mut_ptr() as usize,
++                buf.as_mut_ptr().expose_provenance(),
 +                buf.len(),
 +                flags,
 +                0,
@@ -3451,11 +3451,11 @@ index 000000000..80c3ad802
 +            sysc::syscall6(
 +                sysc::RECVFROM,
 +                self.raw(),
-+                buf.as_mut_ptr() as usize,
++                buf.as_mut_ptr().expose_provenance(),
 +                buf.len(),
 +                flags,
-+                storage.as_mut_ptr() as usize,
-+                &mut len as *mut u32 as usize,
++                storage.as_mut_ptr().expose_provenance(),
++                (&mut len as *mut u32).expose_provenance(),
 +            )
 +        })?;
 +        Ok((n, raw_to_addr(&storage)?))
@@ -3466,7 +3466,7 @@ index 000000000..80c3ad802
 +            sysc::syscall6(
 +                sysc::SENDTO,
 +                self.raw(),
-+                buf.as_ptr() as usize,
++                buf.as_ptr().expose_provenance(),
 +                buf.len(),
 +                MSG_NOSIGNAL,
 +                0,
@@ -3482,10 +3482,10 @@ index 000000000..80c3ad802
 +            sysc::syscall6(
 +                sysc::SENDTO,
 +                self.raw(),
-+                buf.as_ptr() as usize,
++                buf.as_ptr().expose_provenance(),
 +                buf.len(),
 +                MSG_NOSIGNAL,
-+                raw.as_ptr() as usize,
++                raw.as_ptr().expose_provenance(),
 +                len,
 +            )
 +        })
@@ -3495,8 +3495,7 @@ index 000000000..80c3ad802
 +        let mut storage = [0u8; 28];
 +        let mut len = storage.len() as u32;
 +        cvt(unsafe {
-+            sysc::syscall3(which, self.raw(), storage.as_mut_ptr() as usize, &mut len
-+                as *mut u32 as usize)
++            sysc::syscall3(which, self.raw(), storage.as_mut_ptr().expose_provenance(), (&mut len as *mut u32).expose_provenance())
 +        })?;
 +        raw_to_addr(&storage)
 +    }
@@ -3777,7 +3776,7 @@ index 000000000..80c3ad802
 +            let mut raw = [0u8; 28];
 +            let len = addr_to_raw(addr, &mut raw);
 +            cvt(unsafe {
-+                sysc::syscall3(sysc::BIND, sock.raw(), raw.as_ptr() as usize, len)
++                sysc::syscall3(sysc::BIND, sock.raw(), raw.as_ptr().expose_provenance(), len)
 +            })?;
 +            cvt(unsafe { sysc::syscall2(sysc::LISTEN, sock.raw(), 128) })?;
 +            Ok(TcpListener { inner: sock })
@@ -3865,7 +3864,7 @@ index 000000000..80c3ad802
 +            let mut raw = [0u8; 28];
 +            let len = addr_to_raw(addr, &mut raw);
 +            cvt(unsafe {
-+                sysc::syscall3(sysc::BIND, sock.raw(), raw.as_ptr() as usize, len)
++                sysc::syscall3(sysc::BIND, sock.raw(), raw.as_ptr().expose_provenance(), len)
 +            })?;
 +            Ok(UdpSocket { inner: sock })
 +        }
@@ -4239,7 +4238,7 @@ index 84b53fd37..7e8f16f2e 100644
          pub use unsupported::*;
 diff --git a/library/std/src/sys/pal/fullrust/common.rs b/library/std/src/sys/pal/fullrust/common.rs
 new file mode 100644
-index 000000000..b3c920de6
+index 000000000..bb3e96ddf
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/common.rs
 @@ -0,0 +1,124 @@
@@ -4320,7 +4319,7 @@ index 000000000..b3c920de6
 +    let act: [usize; 4] = [disposition, 0, 0, 0];
 +    unsafe {
 +        // Final arg is the sigset size in bytes (8 for the 64-bit kernel mask).
-+        sysc::syscall4(sysc::RT_SIGACTION, SIGPIPE, act.as_ptr() as usize, 0, 8);
++        sysc::syscall4(sysc::RT_SIGACTION, SIGPIPE, act.as_ptr().expose_provenance(), 0, 8);
 +    }
 +}
 +
@@ -4455,7 +4454,7 @@ index 000000000..0f4de2157
 +}
 diff --git a/library/std/src/sys/pal/fullrust/fd.rs b/library/std/src/sys/pal/fullrust/fd.rs
 new file mode 100644
-index 000000000..c6caa0915
+index 000000000..1c1f15146
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/fd.rs
 @@ -0,0 +1,224 @@
@@ -4540,13 +4539,13 @@ index 000000000..c6caa0915
 +
 +    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
 +        cvt(unsafe {
-+            sysc::syscall3(sysc::READ, self.raw() as usize, buf.as_mut_ptr() as usize, buf.len())
++            sysc::syscall3(sysc::READ, self.raw() as usize, buf.as_mut_ptr().expose_provenance(), buf.len())
 +        })
 +    }
 +
 +    pub fn read_buf(&self, mut cursor: BorrowedCursor<'_, u8>) -> io::Result<()> {
 +        let n = cvt(unsafe {
-+            let dst = cursor.as_mut().as_mut_ptr() as usize;
++            let dst = cursor.as_mut().as_mut_ptr().expose_provenance();
 +            sysc::syscall3(sysc::READ, self.raw() as usize, dst, cursor.capacity())
 +        })?;
 +        // SAFETY: the kernel initialized the first `n` bytes of the cursor.
@@ -4559,19 +4558,19 @@ index 000000000..c6caa0915
 +        // ready-made iovec array; cap the count at IOV_MAX.
 +        let n = bufs.len().min(IOV_MAX);
 +        cvt(unsafe {
-+            sysc::syscall3(sysc::READV, self.raw() as usize, bufs.as_mut_ptr() as usize, n)
++            sysc::syscall3(sysc::READV, self.raw() as usize, bufs.as_mut_ptr().expose_provenance(), n)
 +        })
 +    }
 +
 +    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
 +        cvt(unsafe {
-+            sysc::syscall3(sysc::WRITE, self.raw() as usize, buf.as_ptr() as usize, buf.len())
++            sysc::syscall3(sysc::WRITE, self.raw() as usize, buf.as_ptr().expose_provenance(), buf.len())
 +        })
 +    }
 +
 +    pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
 +        let n = bufs.len().min(IOV_MAX);
-+        cvt(unsafe { sysc::syscall3(sysc::WRITEV, self.raw() as usize, bufs.as_ptr() as usize, n) })
++        cvt(unsafe { sysc::syscall3(sysc::WRITEV, self.raw() as usize, bufs.as_ptr().expose_provenance(), n) })
 +    }
 +
 +    /// Duplicate the descriptor, close-on-exec (`F_DUPFD_CLOEXEC`).
@@ -4685,7 +4684,7 @@ index 000000000..c6caa0915
 +}
 diff --git a/library/std/src/sys/pal/fullrust/futex.rs b/library/std/src/sys/pal/fullrust/futex.rs
 new file mode 100644
-index 000000000..47cf71011
+index 000000000..7082dcbef
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/futex.rs
 @@ -0,0 +1,62 @@
@@ -4716,7 +4715,7 @@ index 000000000..47cf71011
 +/// Waits for a `futex_wake` operation to wake us, returning early if the futex
 +/// no longer holds `expected`. Returns false on timeout, true otherwise.
 +pub fn futex_wait(futex: &Atomic<u32>, expected: u32, timeout: Option<Duration>) -> bool {
-+    let ptr = futex as *const Atomic<u32> as usize;
++    let ptr = (futex as *const Atomic<u32>).expose_provenance();
 +    // `FUTEX_WAIT` takes a *relative* timeout (timespec), or NULL for forever.
 +    let ts = timeout.map(|d| [d.as_secs() as i64, d.subsec_nanos() as i64]);
 +    loop {
@@ -4724,7 +4723,7 @@ index 000000000..47cf71011
 +        if futex.load(Relaxed) != expected {
 +            return true;
 +        }
-+        let ts_ptr = ts.as_ref().map_or(0usize, |t| t.as_ptr() as usize);
++        let ts_ptr = ts.as_ref().map_or(0usize, |t| t.as_ptr().expose_provenance());
 +        let r = unsafe {
 +            sysc::syscall6(SYS_FUTEX, ptr, FUTEX_WAIT_PRIVATE, expected as usize, ts_ptr, 0, 0)
 +        };
@@ -4739,14 +4738,14 @@ index 000000000..47cf71011
 +/// Wakes one thread blocked on `futex_wait` on this futex. Returns whether a
 +/// thread was actually woken.
 +pub fn futex_wake(futex: &Atomic<u32>) -> bool {
-+    let ptr = futex as *const Atomic<u32> as usize;
++    let ptr = (futex as *const Atomic<u32>).expose_provenance();
 +    let r = unsafe { sysc::syscall3(SYS_FUTEX, ptr, FUTEX_WAKE_PRIVATE, 1) };
 +    sysc::ret(r).map(|n| n > 0).unwrap_or(false)
 +}
 +
 +/// Wakes all threads blocked on `futex_wait` on this futex.
 +pub fn futex_wake_all(futex: &Atomic<u32>) {
-+    let ptr = futex as *const Atomic<u32> as usize;
++    let ptr = (futex as *const Atomic<u32>).expose_provenance();
 +    unsafe {
 +        sysc::syscall3(SYS_FUTEX, ptr, FUTEX_WAKE_PRIVATE, i32::MAX as usize);
 +    }
@@ -6258,7 +6257,7 @@ index 000000000..301e058a0
 +}
 diff --git a/library/std/src/sys/pal/fullrust/os.rs b/library/std/src/sys/pal/fullrust/os.rs
 new file mode 100644
-index 000000000..5ecc9e6b4
+index 000000000..a8e06a61d
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/os.rs
 @@ -0,0 +1,220 @@
@@ -6357,7 +6356,7 @@ index 000000000..5ecc9e6b4
 +
 +pub fn getcwd() -> io::Result<PathBuf> {
 +    let mut buf = [0u8; 4096];
-+    let r = unsafe { sysc::syscall2(sysc::GETCWD, buf.as_mut_ptr() as usize, buf.len()) };
++    let r = unsafe { sysc::syscall2(sysc::GETCWD, buf.as_mut_ptr().expose_provenance(), buf.len()) };
 +    match sysc::ret(r) {
 +        // getcwd writes the path plus a trailing NUL and returns the total length.
 +        Ok(len) => {
@@ -6370,7 +6369,7 @@ index 000000000..5ecc9e6b4
 +
 +pub fn chdir(path: &path::Path) -> io::Result<()> {
 +    let p = cstr(path)?;
-+    let r = unsafe { sysc::syscall1(sysc::CHDIR, p.as_ptr() as usize) };
++    let r = unsafe { sysc::syscall1(sysc::CHDIR, p.as_ptr().expose_provenance()) };
 +    sysc::ret(r).map(|_| ()).map_err(io::Error::from_raw_os_error)
 +}
 +
@@ -6450,8 +6449,8 @@ index 000000000..5ecc9e6b4
 +    let r = unsafe {
 +        sysc::syscall3(
 +            sysc::READLINK,
-+            link.as_ptr() as usize,
-+            buf.as_mut_ptr() as usize,
++            link.as_ptr().expose_provenance(),
++            buf.as_mut_ptr().expose_provenance(),
 +            buf.len(),
 +        )
 +    };
@@ -6484,7 +6483,7 @@ index 000000000..5ecc9e6b4
 +}
 diff --git a/library/std/src/sys/pal/fullrust/pipe.rs b/library/std/src/sys/pal/fullrust/pipe.rs
 new file mode 100644
-index 000000000..f2bc7720c
+index 000000000..27d085a99
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/pipe.rs
 @@ -0,0 +1,137 @@
@@ -6571,7 +6570,7 @@ index 000000000..f2bc7720c
 +/// Create a `(read, write)` pair of pipe ends, both close-on-exec.
 +pub fn pipe() -> io::Result<(AnonPipe, AnonPipe)> {
 +    let mut fds = [0i32; 2];
-+    cvt(unsafe { sysc::syscall2(sysc::PIPE2, fds.as_mut_ptr() as usize, O_CLOEXEC) })?;
++    cvt(unsafe { sysc::syscall2(sysc::PIPE2, fds.as_mut_ptr().expose_provenance(), O_CLOEXEC) })?;
 +    Ok((AnonPipe::from_fd(fds[0]), AnonPipe::from_fd(fds[1])))
 +}
 +
@@ -6610,7 +6609,7 @@ index 000000000..f2bc7720c
 +        ];
 +        // poll(fds, 2, -1): wait indefinitely until at least one is readable.
 +        match sysc::ret(unsafe {
-+            sysc::syscall3(sysc::POLL, fds.as_mut_ptr() as usize, 2, (-1isize) as usize)
++            sysc::syscall3(sysc::POLL, fds.as_mut_ptr().expose_provenance(), 2, (-1isize) as usize)
 +        }) {
 +            Ok(_) => {}
 +            Err(4) => continue, // EINTR
@@ -6627,7 +6626,7 @@ index 000000000..f2bc7720c
 +}
 diff --git a/library/std/src/sys/pal/fullrust/stack_overflow.rs b/library/std/src/sys/pal/fullrust/stack_overflow.rs
 new file mode 100644
-index 000000000..683fc99a4
+index 000000000..a948e8689
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/stack_overflow.rs
 @@ -0,0 +1,165 @@
@@ -6703,10 +6702,10 @@ index 000000000..683fc99a4
 +    let act: [usize; 4] = if handler_addr == SIG_DFL {
 +        [SIG_DFL, 0, 0, 0]
 +    } else {
-+        [handler_addr, flags | SA_RESTORER, restorer as *const () as usize, 0]
++        [handler_addr, flags | SA_RESTORER, (restorer as *const ()).expose_provenance(), 0]
 +    };
 +    unsafe {
-+        sysc::syscall4(sysc::RT_SIGACTION, sig, act.as_ptr() as usize, 0, 8);
++        sysc::syscall4(sysc::RT_SIGACTION, sig, act.as_ptr().expose_provenance(), 0, 8);
 +    }
 +}
 +
@@ -6718,9 +6717,9 @@ index 000000000..683fc99a4
 +        return base;
 +    }
 +    // struct sigaltstack { void* ss_sp; int ss_flags; size_t ss_size; }
-+    let ss: [usize; 3] = [base as usize, 0, ALTSTACK_SIZE];
++    let ss: [usize; 3] = [base.expose_provenance(), 0, ALTSTACK_SIZE];
 +    unsafe {
-+        sysc::syscall2(sysc::SIGALTSTACK, ss.as_ptr() as usize, 0);
++        sysc::syscall2(sysc::SIGALTSTACK, ss.as_ptr().expose_provenance(), 0);
 +    }
 +    base
 +}
@@ -6729,9 +6728,9 @@ index 000000000..683fc99a4
 +/// return its `[start, end)` range. Called by `thread.rs` in the parent.
 +pub unsafe fn protect_stack(base: *mut u8) -> (usize, usize) {
 +    unsafe {
-+        sysc::syscall3(sysc::MPROTECT, base as usize, PAGE, PROT_NONE);
++        sysc::syscall3(sysc::MPROTECT, base.expose_provenance(), PAGE, PROT_NONE);
 +    }
-+    (base as usize, base as usize + PAGE)
++    (base.expose_provenance(), base.expose_provenance() + PAGE)
 +}
 +
 +/// Record a spawned thread's guard region and install its alternate signal
@@ -6748,8 +6747,8 @@ index 000000000..683fc99a4
 +    }
 +    let ss: [usize; 3] = [0, SS_DISABLE, 0];
 +    unsafe {
-+        sysc::syscall2(sysc::SIGALTSTACK, ss.as_ptr() as usize, 0);
-+        munmap(altstack as usize, ALTSTACK_SIZE);
++        sysc::syscall2(sysc::SIGALTSTACK, ss.as_ptr().expose_provenance(), 0);
++        munmap(altstack.expose_provenance(), ALTSTACK_SIZE);
 +    }
 +}
 +
@@ -6772,7 +6771,7 @@ index 000000000..683fc99a4
 +fn main_guard() -> (usize, usize) {
 +    let mut rl = [0u64; 2]; // { rlim_cur, rlim_max }
 +    let r =
-+        unsafe { sysc::syscall4(sysc::PRLIMIT64, 0, RLIMIT_STACK, 0, rl.as_mut_ptr() as usize) };
++        unsafe { sysc::syscall4(sysc::PRLIMIT64, 0, RLIMIT_STACK, 0, rl.as_mut_ptr().expose_provenance()) };
 +    let limit = match sysc::ret(r) {
 +        Ok(_) => rl[0] as usize,
 +        Err(_) => 8 << 20, // 8 MiB default
@@ -6792,13 +6791,13 @@ index 000000000..683fc99a4
 +    // The main thread's altstack lives for the whole process; intentionally leak.
 +    let _ = unsafe { install_altstack() };
 +    unsafe {
-+        set_handler(SIGSEGV, handler as *const () as usize, SA_SIGINFO | SA_ONSTACK);
-+        set_handler(SIGBUS, handler as *const () as usize, SA_SIGINFO | SA_ONSTACK);
++        set_handler(SIGSEGV, (handler as *const ()).expose_provenance(), SA_SIGINFO | SA_ONSTACK);
++        set_handler(SIGBUS, (handler as *const ()).expose_provenance(), SA_SIGINFO | SA_ONSTACK);
 +    }
 +}
 diff --git a/library/std/src/sys/pal/fullrust/time.rs b/library/std/src/sys/pal/fullrust/time.rs
 new file mode 100644
-index 000000000..8e4c583c5
+index 000000000..092c11e08
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/time.rs
 @@ -0,0 +1,72 @@
@@ -6817,7 +6816,7 @@ index 000000000..8e4c583c5
 +    // struct timespec { i64 tv_sec; i64 tv_nsec; }
 +    let mut ts = [0i64; 2];
 +    unsafe {
-+        sysc::syscall2(sysc::CLOCK_GETTIME, id, ts.as_mut_ptr() as usize);
++        sysc::syscall2(sysc::CLOCK_GETTIME, id, ts.as_mut_ptr().expose_provenance());
 +    }
 +    Duration::new(ts[0] as u64, ts[1] as u32)
 +}
@@ -6876,7 +6875,7 @@ index 000000000..8e4c583c5
 +}
 diff --git a/library/std/src/sys/pal/fullrust/tls.rs b/library/std/src/sys/pal/fullrust/tls.rs
 new file mode 100644
-index 000000000..66486ebda
+index 000000000..651ca06a1
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/tls.rs
 @@ -0,0 +1,267 @@
@@ -7013,7 +7012,7 @@ index 000000000..66486ebda
 +#[inline]
 +unsafe fn set_fs(tp: *mut Tcb) {
 +    unsafe {
-+        sysc::syscall2(ARCH_PRCTL, ARCH_SET_FS, tp as usize);
++        sysc::syscall2(ARCH_PRCTL, ARCH_SET_FS, tp.expose_provenance());
 +    }
 +}
 +
@@ -7245,7 +7244,7 @@ index 85228963b..2511a81da 100644
          pub use unix::{Pipe, pipe};
 diff --git a/library/std/src/sys/process/fullrust.rs b/library/std/src/sys/process/fullrust.rs
 new file mode 100644
-index 000000000..017b7437f
+index 000000000..61dbb3d62
 --- /dev/null
 +++ b/library/std/src/sys/process/fullrust.rs
 @@ -0,0 +1,826 @@
@@ -7464,7 +7463,7 @@ index 000000000..017b7437f
 +                sysc::syscall3(
 +                    sysc::WRITE,
 +                    err_write.as_raw_fd() as usize,
-+                    msg.as_ptr() as usize,
++                    msg.as_ptr().expose_provenance(),
 +                    msg.len(),
 +                );
 +                sysc::syscall1(sysc::EXIT_GROUP, 127);
@@ -7610,7 +7609,7 @@ index 000000000..017b7437f
 +                t!(sysc::syscall1(SETUID, uid as usize));
 +            }
 +            if let Some(cwd) = &p.cwd {
-+                t!(sysc::syscall1(sysc::CHDIR, cwd.as_ptr() as usize));
++                t!(sysc::syscall1(sysc::CHDIR, cwd.as_ptr().expose_provenance()));
 +            }
 +            if let Some(pgroup) = self.pgroup {
 +                t!(sysc::syscall2(SETPGID, 0, pgroup as usize));
@@ -7620,7 +7619,7 @@ index 000000000..017b7437f
 +                // at our own startup, so the exec'd program sees normal Unix behavior.
 +                // `rt_sigaction(SIGPIPE, SIG_DFL, NULL, sigsetsize=8)`.
 +                let act: [usize; 4] = [0 /* SIG_DFL */, 0, 0, 0];
-+                sysc::syscall4(sysc::RT_SIGACTION, 13 /* SIGPIPE */, act.as_ptr() as usize, 0, 8);
++                sysc::syscall4(sysc::RT_SIGACTION, 13 /* SIGPIPE */, act.as_ptr().expose_provenance(), 0, 8);
 +            }
 +            for closure in self.closures.iter_mut() {
 +                if let Err(e) = closure() {
@@ -7634,9 +7633,9 @@ index 000000000..017b7437f
 +            for cand in &p.candidates {
 +                let r = sysc::syscall3(
 +                    sysc::EXECVE,
-+                    cand.as_ptr() as usize,
-+                    p.argv_ptrs.as_ptr() as usize,
-+                    p.envp_ptrs.as_ptr() as usize,
++                    cand.as_ptr().expose_provenance(),
++                    p.argv_ptrs.as_ptr().expose_provenance(),
++                    p.envp_ptrs.as_ptr().expose_provenance(),
 +                );
 +                // execve returned, so this candidate failed; try the next one.
 +                if let Err(e) = sysc::ret(r) {
@@ -7710,7 +7709,7 @@ index 000000000..017b7437f
 +fn open_devnull(readable: bool) -> io::Result<AnonPipe> {
 +    let flags = (if readable { O_RDONLY } else { O_WRONLY }) | O_CLOEXEC;
 +    let fd = sysc::ret(unsafe {
-+        sysc::syscall4(sysc::OPENAT, AT_FDCWD, c"/dev/null".as_ptr() as usize, flags as usize, 0)
++        sysc::syscall4(sysc::OPENAT, AT_FDCWD, c"/dev/null".as_ptr().expose_provenance(), flags as usize, 0)
 +    })
 +    .map_err(io::Error::from_raw_os_error)?;
 +    Ok(AnonPipe::from_fd(fd as i32))
@@ -7903,7 +7902,7 @@ index 000000000..017b7437f
 +                sysc::syscall4(
 +                    sysc::WAIT4,
 +                    self.pid as usize,
-+                    &mut status as *mut i32 as usize,
++                    (&mut status as *mut i32).expose_provenance(),
 +                    0,
 +                    0,
 +                )
@@ -7927,7 +7926,7 @@ index 000000000..017b7437f
 +            sysc::syscall4(
 +                sysc::WAIT4,
 +                self.pid as usize,
-+                &mut status as *mut i32 as usize,
++                (&mut status as *mut i32).expose_provenance(),
 +                WNOHANG,
 +                0,
 +            )
@@ -8092,7 +8091,7 @@ index ee61175a2..522c833ca 100644
          use unsupported as imp;
 diff --git a/library/std/src/sys/random/fullrust.rs b/library/std/src/sys/random/fullrust.rs
 new file mode 100644
-index 000000000..8a52e503c
+index 000000000..57172f671
 --- /dev/null
 +++ b/library/std/src/sys/random/fullrust.rs
 @@ -0,0 +1,19 @@
@@ -8105,7 +8104,7 @@ index 000000000..8a52e503c
 +pub fn fill_bytes(mut bytes: &mut [u8]) {
 +    while !bytes.is_empty() {
 +        let r = unsafe {
-+            sysc::syscall3(sysc::GETRANDOM, bytes.as_mut_ptr() as usize, bytes.len(), 0)
++            sysc::syscall3(sysc::GETRANDOM, bytes.as_mut_ptr().expose_provenance(), bytes.len(), 0)
 +        };
 +        match sysc::ret(r) {
 +            Ok(0) => break,
@@ -8131,7 +8130,7 @@ index e5a66dc46..56fa2ba43 100644
          pub use linux::{fill_bytes, hashmap_random_keys};
 diff --git a/library/std/src/sys/stdio/fullrust.rs b/library/std/src/sys/stdio/fullrust.rs
 new file mode 100644
-index 000000000..be08f5a11
+index 000000000..17e1c2829
 --- /dev/null
 +++ b/library/std/src/sys/stdio/fullrust.rs
 @@ -0,0 +1,63 @@
@@ -8150,7 +8149,7 @@ index 000000000..be08f5a11
 +
 +impl io::Read for Stdin {
 +    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-+        let r = unsafe { sysc::syscall3(sysc::READ, 0, buf.as_mut_ptr() as usize, buf.len()) };
++        let r = unsafe { sysc::syscall3(sysc::READ, 0, buf.as_mut_ptr().expose_provenance(), buf.len()) };
 +        sysc::ret(r).map_err(io::Error::from_raw_os_error)
 +    }
 +}
@@ -8163,7 +8162,7 @@ index 000000000..be08f5a11
 +
 +impl io::Write for Stdout {
 +    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-+        let r = unsafe { sysc::syscall3(sysc::WRITE, 1, buf.as_ptr() as usize, buf.len()) };
++        let r = unsafe { sysc::syscall3(sysc::WRITE, 1, buf.as_ptr().expose_provenance(), buf.len()) };
 +        sysc::ret(r).map_err(io::Error::from_raw_os_error)
 +    }
 +
@@ -8180,7 +8179,7 @@ index 000000000..be08f5a11
 +
 +impl io::Write for Stderr {
 +    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-+        let r = unsafe { sysc::syscall3(sysc::WRITE, 2, buf.as_ptr() as usize, buf.len()) };
++        let r = unsafe { sysc::syscall3(sysc::WRITE, 2, buf.as_ptr().expose_provenance(), buf.len()) };
 +        sysc::ret(r).map_err(io::Error::from_raw_os_error)
 +    }
 +
@@ -8275,7 +8274,7 @@ index 9d5a0a996..b6749062b 100644
          all(target_family = "wasm", target_feature = "atomics"),
 diff --git a/library/std/src/sys/thread/fullrust.rs b/library/std/src/sys/thread/fullrust.rs
 new file mode 100644
-index 000000000..4a5091245
+index 000000000..8bebc6007
 --- /dev/null
 +++ b/library/std/src/sys/thread/fullrust.rs
 @@ -0,0 +1,277 @@
@@ -8455,7 +8454,7 @@ index 000000000..4a5091245
 +        if tp.is_null() {
 +            drop(unsafe { Box::from_raw(arg as *mut Payload) });
 +            unsafe {
-+                munmap(base as usize, size);
++                munmap(base.expose_provenance(), size);
 +            }
 +            return Err(io::Error::from_raw_os_error(12)); // ENOMEM
 +        }
@@ -8474,9 +8473,9 @@ index 000000000..4a5091245
 +        if r <= 0 {
 +            drop(unsafe { Box::from_raw(arg as *mut Payload) });
 +            unsafe {
-+                munmap(base as usize, size);
++                munmap(base.expose_provenance(), size);
 +                if !tls_base.is_null() {
-+                    munmap(tls_base as usize, tls_size);
++                    munmap(tls_base.expose_provenance(), tls_size);
 +                }
 +            }
 +            return Err(io::Error::from_raw_os_error(if r < 0 { -r as i32 } else { 11 }));
@@ -8491,7 +8490,7 @@ index 000000000..4a5091245
 +        // must wait with a non-private FUTEX_WAIT (not the private one used by
 +        // the sync primitives) or the wake lands in a different hash bucket.
 +        const FUTEX_WAIT: usize = 0; // shared (no FUTEX_PRIVATE_FLAG)
-+        let ptr = self.inner.ctid.as_ptr() as usize;
++        let ptr = self.inner.ctid.as_ptr().expose_provenance();
 +        loop {
 +            let v = self.inner.ctid.load(Ordering::Acquire);
 +            if v == 0 {
@@ -8506,9 +8505,9 @@ index 000000000..4a5091245
 +        // kernel has finished writing the TLS exit handshake, so its `%fs` block
 +        // is dead too. Free both.
 +        unsafe {
-+            munmap(self.stack_base as usize, self.stack_size);
++            munmap(self.stack_base.expose_provenance(), self.stack_size);
 +            if !self.tls_base.is_null() {
-+                munmap(self.tls_base as usize, self.tls_size);
++                munmap(self.tls_base.expose_provenance(), self.tls_size);
 +            }
 +        }
 +    }
@@ -8525,14 +8524,14 @@ index 000000000..4a5091245
 +    // into the thread's `comm`, so an over-long name is simply truncated.
 +    const PR_SET_NAME: usize = 15;
 +    unsafe {
-+        sysc::syscall2(sysc::PRCTL, PR_SET_NAME, name.as_ptr() as usize);
++        sysc::syscall2(sysc::PRCTL, PR_SET_NAME, name.as_ptr().expose_provenance());
 +    }
 +}
 +
 +pub fn sleep(dur: Duration) {
 +    let ts = [dur.as_secs() as i64, dur.subsec_nanos() as i64];
 +    unsafe {
-+        sysc::syscall2(sysc::NANOSLEEP, ts.as_ptr() as usize, 0);
++        sysc::syscall2(sysc::NANOSLEEP, ts.as_ptr().expose_provenance(), 0);
 +    }
 +}
 +
@@ -8547,7 +8546,7 @@ index 000000000..4a5091245
 +    // sched_getaffinity(0, sizeof(set), &set) then count the set CPU bits.
 +    let mut set = [0u64; 16]; // up to 1024 CPUs
 +    let r =
-+        unsafe { sysc::syscall3(204, 0, core::mem::size_of_val(&set), set.as_mut_ptr() as usize) };
++        unsafe { sysc::syscall3(204, 0, core::mem::size_of_val(&set), set.as_mut_ptr().expose_provenance()) };
 +    match sysc::ret(r) {
 +        Ok(_) => {
 +            let n: u32 = set.iter().map(|w| w.count_ones()).sum();
