@@ -14,6 +14,11 @@ on:
         required: true
         default: "1.88"
         type: string
+      publish:
+        description: "Publish the toolchain release asset (untick to only build + test)"
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: write        # create/update the toolchain release + upload the asset
@@ -43,8 +48,12 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             python3 cmake ninja-build clang git build-essential
 
-      - name: Cache toolchain build
-        uses: actions/cache@v4
+      # Restore/save split (not `actions/cache`) so the build is cached as soon
+      # as it succeeds — even if the test step below then fails, a re-run after
+      # a std-only fix rebuilds incrementally instead of from scratch.
+      - name: Restore toolchain build cache
+        id: cache
+        uses: actions/cache/restore@v4
         with:
           path: toolchain/rust-${{ inputs.minor }}/build
           key: fullrust-build-${{ inputs.minor }}-${{ hashFiles(format('toolchain/patches/fullrust-{0}.patch', inputs.minor), format('toolchain/bootstrap-{0}.toml', inputs.minor)) }}
@@ -54,11 +63,26 @@ jobs:
         working-directory: toolchain
         run: ./build-fork.sh "${{ inputs.minor }}.0"
 
+      - name: Save toolchain build cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: toolchain/rust-${{ inputs.minor }}/build
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+      # Gate publishing on the built toolchain actually producing working
+      # binaries: build + run the core test crates on this (Linux) runner.
+      - name: Run test crates
+        working-directory: toolchain
+        run: ./run-tests.sh "${{ inputs.minor }}"
+
       - name: Package stage1 + cargo
+        if: inputs.publish
         working-directory: toolchain
         run: ./docker/package-toolchain.sh "${{ inputs.minor }}" "$GITHUB_WORKSPACE/fullrust-toolchain-${{ inputs.minor }}-x86_64.tar.gz"
 
       - name: Publish toolchain release asset
+        if: inputs.publish
         uses: softprops/action-gh-release@v2
         with:
           tag_name: toolchain-${{ inputs.minor }}
