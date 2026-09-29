@@ -32,8 +32,8 @@ a `[patch.crates-io]`.
 | `getrandom` 0.2.17 | `crates/getrandom` | small `fullrust.rs` backend: the raw `getrandom(2)` syscall |
 | `getrandom` 0.4.3 | `crates/getrandom-0.4` | two one-line broadenings so the built-in `linux_raw` backend auto-selects |
 | `rustix` 1.1.5 | `crates/rustix` | fullrust treated as linux in `build.rs`/`Cargo.toml`, plus cfg broadening → its own libc-free `linux_raw` backend |
-| `mio` 1.2.3 | `crates/mio` | cfg broadening → mio's own Linux epoll/eventfd backend, plus a private 316-line raw-syscall `libc` shim |
-| `tokio` 1.53.1 | `crates/tokio` | 59 changed lines, cfg/imports only; needed only for the `net` feature |
+| `mio` 1.2.3 | `crates/mio` | cfg broadening → mio's own Linux epoll/eventfd/UDS backend, plus a private 324-line raw-syscall `libc` shim |
+| `tokio` 1.53.1 | `crates/tokio` | `fullrust-cfg.py` cfg broadening + a private 364-line `libc`/signal-registration shim; `features = ["full"]` |
 | `socket2` 0.6.5 | `crates/socket2-0.6` | upstream's own `sys/unix.rs` Linux paths on a private 578-line `libc` shim, plus `Socket::peer_cred` |
 | `socket2` 0.5.10 | `crates/socket2` | same design as 0.6 (the shim file is byte-identical) |
 
@@ -71,28 +71,49 @@ crates that are still on 0.38.
 
 mio sends an unknown OS to its non-functional `shell` stub, and no cfg selects
 another backend. The fork routes fullrust through mio's own Linux code:
-an edge-triggered epoll selector, an eventfd waker, TCP/UDP, `pipe` and
-`SourceFd`. The ~15 syscalls, structs and constants those paths use come from
-a private shim (`src/sys/unix/libc.rs`). There is no libc crate in the build
-graph.
-
-**Not yet:** `mio::net::{UnixStream, UnixListener, UnixDatagram}` and
-`From<ChildStd*>` for pipe ends. They are still gated out, and they can now be
-enabled on top of fullrust's `std::os::unix`.
+an edge-triggered epoll selector, an eventfd waker, TCP/UDP,
+`net::{UnixStream, UnixListener, UnixDatagram}` (pathname, abstract and
+unnamed addresses, `pair`), `pipe` including `From<ChildStdin/Stdout/Stderr>`,
+and `SourceFd`. The ~15 syscalls, structs and constants those paths use come
+from a private shim (`src/sys/unix/libc.rs`); the Unix-domain and child-pipe
+parts sit on fullrust std's `std::os::unix`/`std::os::linux`, which match
+Linux. There is no libc crate in the build graph. Diff: 495 changed lines, of
+which 324 are the shim.
 
 ### tokio 1.53.1
 
-Stock tokio already builds and runs on fullrust without `net`: `rt`,
-`rt-multi-thread`, `time`, `sync`, `macros`, `io-util`, `io-std`, `fs` and
-`parking_lot` all work unmodified. `net` does not build, because its fd impls
-and `into_std` are `cfg(unix)` and `TcpSocket` uses `libc::EINPROGRESS`. The
-fork is cfg and imports only (59 changed lines). It enables
-`TcpListener`/`TcpStream`/`TcpSocket`/`UdpSocket` and `tokio::io::unix::AsyncFd`
-through the fd paths tokio already has. It needs the bundled mio and
+Stock tokio builds on fullrust without `net`/`process`/`signal`, but all its
+Unix code (fd impls, `net::unix`, the process reapers, the signal driver, fs
+Unix extensions) is `cfg(unix)`/`target_os = "linux"`, and those paths call
+`libc` and `signal-hook-registry`. The fork runs `patches/fullrust-cfg.py
+--keep tokio_unstable` over `src/`, so fullrust compiles tokio's Linux code;
+the unstable-only `io-uring`/`taskdump` (Linux-only dependencies) stay off.
+The ~20 `libc` items those paths use (fcntl, fstat, getsockopt/`SO_PEERCRED`,
+`pidfd_open`, signal numbers, …) come from a private shim
+(`src/fullrust_libc.rs`), which also stands in for the two
+`signal-hook-registry` items tokio uses: `register` installs one
+`SA_RESTART | SA_SIGINFO` handler per signal with raw `rt_sigaction` (with an
+`sa_restorer` trampoline), runs the registered actions in order and chains to a
+previously installed handler, and `FORBIDDEN` is the same list. The shim has no
+C `errno`, so tokio's 9 `io::Error::last_os_error()` sites after a libc call
+become a `last_os_error!()` macro (unchanged elsewhere). Diff: 695 changed
+lines, of which 364 are the shim; the rest is ~130 mechanical cfg lines and
+~30 hand-edited lines.
+
+**All of `features = ["full"]` works:** TCP/UDP/`AsyncFd`, `net::unix`
+(`UnixStream`/`UnixListener`/`UnixDatagram`, abstract names via a leading NUL,
+`peer_cred`, `unix::pipe`), `process` (piped stdin/stdout/stderr, `wait`/
+`try_wait`/`kill`/`kill_on_drop`, the Linux pidfd reaper and the SIGCHLD
+reaper/orphan queue), `signal` (`unix::signal(SignalKind)`, `ctrl_c`), the fs
+Unix extensions (`mode`, `custom_flags`, `DirEntry::ino`, `symlink`, …), on
+both multi-thread and current-thread runtimes. It needs the bundled mio and
 socket2-0.6.
 
-**Not yet:** `process`, `signal` (these need libc/`signal-hook-registry`), and
-`net::unix`.
+**Why no signal-hook-registry fork:** it is a `cfg(unix)` dependency of tokio
+(so absent on fullrust), and it calls `libc::sigaction` itself, so using it
+would mean vendoring and shimming a second crate. The ~130 lines in tokio's
+shim cover what tokio needs. Crates that use `signal-hook`/`signal-hook-registry`
+directly are therefore not supported.
 
 ### socket2 0.6.5 and 0.5.10
 
@@ -107,13 +128,13 @@ size/alignment checks, constants generated from the real `libc` crate, and inlin
 replaces the earlier hand-written ~1000-line `sys/fullrust.rs` backend of the
 0.5 fork.)
 
-The result is **the Linux `feature = "all"` API**: all 242 (0.6) / 228 (0.5)
-public methods, including `mss`, `mark`, `cork`, `quickack`, `bind_device`,
-TCP congestion, `reuse_port`, `freebind`, `original_dst`, BPF `attach_filter`,
-DCCP, vsock, multicast, `sendfile`, `Socket::pair` and keepalive. The
-exceptions are the 7 `std::os::unix::net` conversions (`From<UnixStream>` etc.)
-and `SockAddr::as_unix`, which are still unix-only. Unix-domain sockets
-themselves (pathname, abstract, socketpair) work through `Socket`. 0.5 also
+The result is **the whole Linux `feature = "all"` API**, including `mss`,
+`mark`, `cork`, `quickack`, `bind_device`, TCP congestion, `reuse_port`,
+`freebind`, `original_dst`, BPF `attach_filter`, DCCP, vsock, multicast,
+`sendfile`, `Socket::pair`, keepalive, Unix-domain sockets (pathname, abstract,
+socketpair), `SockAddr::as_unix` and the six `From` conversions to and from
+`std::os::unix::net::{UnixStream, UnixListener, UnixDatagram}` (these use
+fullrust std's `std::os::unix`, so they are upstream code too). 0.5 also
 re-exports `socket2::{sock_filter, sockaddr_storage}`, because its API names
 libc types.
 
@@ -154,6 +175,8 @@ If cargo ignores a patch because the lockfile pins another version, run
 
 ## Known limits
 
+- `signal-hook`/`signal-hook-registry` are not bundled (see tokio above), so
+  crates that use them directly don't build. tokio's own `signal` works.
 - The bundle helps only crates that go *through* these gateways. Crates that
   gate their **own** OS code on `cfg(unix)` stay unsupported until they get
   their own cfg broadening. This happens even when they depend on rustix.
@@ -175,12 +198,25 @@ Each fork is exercised by a static, libc-free probe (no `PT_INTERP`, no
   clock, timerfd, uname, getrandom, auxv, socketpair, pty, shm,
   `io_uring_setup`, mount.
 - **mio** (1.88/1.90/1.94/1.95): TCP accept/read/write/refused through `Poll`,
-  UDP (v4/v6), cross-thread `Waker`, pipe + `SourceFd`, poll timeouts.
+  UDP (v4/v6), cross-thread `Waker`, pipe + `SourceFd`, poll timeouts. (1.88,
+  1.98): Unix stream echo over a pathname and an abstract address, `pair`,
+  datagrams (bound/unbound/pair), `From<ChildStdin/Stdout>` pipes to `cat`.
 - **tokio** (1.90/1.94/1.95): multi-thread runtime, an 8-client TCP echo
   server over `JoinSet`, `TcpSocket` options, UDP, timers, mpsc/oneshot/
-  `select!`, `spawn_blocking`, `AsyncFd`, fs, stdout.
+  `select!`, `spawn_blocking`, `AsyncFd`, fs, stdout. (1.88, 1.98, `full`):
+  `sh -c 'echo hi; exit 3'` with piped stdout (exit code 3), stdin → `cat` →
+  stdout, stderr, `kill` + `wait` (SIGKILL), concurrent waits, a `kill_on_drop`
+  child reaped by the orphan queue, all both with the pidfd reaper and with it
+  forced off (SIGCHLD reaper); self-sent SIGUSR1 on two streams, SIGHUP, SIGUSR2
+  on a current-thread runtime and `ctrl_c` via self-SIGINT; Unix stream/datagram
+  echo over pathnames and abstract names, `peer_cred`, `unix::pipe`,
+  `DirEntry::ino`. `features = ["full"]` and 11 smaller feature sets build.
 - **socket2 0.6/0.5** (1.88, 1.94/1.95): TCP, UDP, Unix
   pathname/abstract/socketpair, `peer_cred` matching getpid/getuid/getgid, ~70
   Linux socket options, sendfile, BPF, and loopback multicast. The output is
   identical to the same probe on `x86_64-unknown-linux-gnu` with pristine
-  socket2.
+  socket2. (1.88, 1.98): the `std::os::unix::net` ⇄ `Socket` conversions both
+  ways and `SockAddr::as_unix`.
+- CI (`toolchain/test-ecosystem`, through the action on the 1.88 and 1.98
+  images): tokio TCP echo, process, signal and Unix sockets, rustix, socket2
+  and std `peer_cred`.

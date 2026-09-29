@@ -175,8 +175,9 @@ rewritten on raw syscalls:
 - **Dependencies** — pure-Rust crates work as-is (e.g. `serde`/`serde_json`). The
   image auto-injects a `[patch.crates-io]` so the common not-quite-pure gateways
   build libc-free too: `getrandom` 0.2/0.4 (and thus `rand`, `uuid`), `rustix`
-  1.x, `mio`, `tokio` (incl. `net`), and `socket2` 0.5/0.6 (the full Linux API,
-  plus `Socket::peer_cred`). Opt out with `no-ecosystem: true`. See the
+  1.x, `mio` (incl. Unix-domain sockets), `tokio` (`features = ["full"]`:
+  `net` incl. `net::unix`, `process`, `signal`, `fs`, …), and `socket2` 0.5/0.6
+  (the full Linux API, plus `Socket::peer_cred`). Opt out with `no-ecosystem: true`. See the
   [ecosystem README](toolchain/fullrust-ecosystem/README.md).
 
 ### Raw syscalls and `exec`
@@ -220,8 +221,9 @@ let err = Command::new("/bin/sh").arg0("sh").args(["-c", "echo hi"]).exec();
   rustix: e.g. `tempfile`'s `tempfile()`/`NamedTempFile`, `memmap2`,
   `polling`/`async-io`, `cap-std`, `procfs`. Most pure-Rust crates need
   nothing.
-- **Ecosystem gaps:** tokio `process`/`signal`/`net::unix` and mio's Unix-domain
-  sockets are not yet available. `parking_lot` uses a spinning thread parker.
+- **Ecosystem gaps:** crates that use `signal-hook`/`signal-hook-registry`
+  directly (rather than through tokio) don't build, and tokio's unstable
+  `io-uring`/`taskdump` stay off. `parking_lot` uses a spinning thread parker.
 - **Small std differences:** `JoinHandleExt::as_pthread_t` returns the kernel
   tid (there is no libpthread), and `io::copy` doesn't use the
   `copy_file_range`/`sendfile` fast path. APIs that are unstable upstream too
