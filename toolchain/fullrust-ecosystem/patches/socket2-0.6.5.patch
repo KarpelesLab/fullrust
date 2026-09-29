@@ -512,7 +512,7 @@
 +//!
 +//! Plus one fullrust-only extension (not in upstream socket2):
 +//! `Socket::peer_cred` (`SO_PEERCRED`).
-+#![allow(dead_code, non_camel_case_types, clippy::missing_safety_doc)]
++#![allow(dead_code, missing_docs, non_camel_case_types, clippy::missing_safety_doc)]
 +
 +use std::mem::{align_of, size_of};
 +
@@ -541,28 +541,28 @@
 +// ---------------------------------------------------------------------------
 +
 +#[repr(C)]
-+#[derive(Copy, Clone)]
-+pub(crate) struct in_addr {
++#[derive(Copy, Clone, Debug)]
++pub struct in_addr {
 +    pub s_addr: in_addr_t,
 +}
 +
 +#[repr(C)]
 +#[repr(align(4))]
-+#[derive(Copy, Clone)]
-+pub(crate) struct in6_addr {
++#[derive(Copy, Clone, Debug)]
++pub struct in6_addr {
 +    pub s6_addr: [u8; 16],
 +}
 +
 +#[repr(C)]
-+#[derive(Copy, Clone)]
-+pub(crate) struct sockaddr {
++#[derive(Copy, Clone, Debug)]
++pub struct sockaddr {
 +    pub sa_family: sa_family_t,
 +    pub sa_data: [c_char; 14],
 +}
 +
 +#[repr(C)]
-+#[derive(Copy, Clone)]
-+pub(crate) struct sockaddr_in {
++#[derive(Copy, Clone, Debug)]
++pub struct sockaddr_in {
 +    pub sin_family: sa_family_t,
 +    pub sin_port: in_port_t,
 +    pub sin_addr: in_addr,
@@ -570,8 +570,8 @@
 +}
 +
 +#[repr(C)]
-+#[derive(Copy, Clone)]
-+pub(crate) struct sockaddr_in6 {
++#[derive(Copy, Clone, Debug)]
++pub struct sockaddr_in6 {
 +    pub sin6_family: sa_family_t,
 +    pub sin6_port: in_port_t,
 +    pub sin6_flowinfo: u32,
@@ -580,23 +580,23 @@
 +}
 +
 +#[repr(C)]
-+#[derive(Copy, Clone)]
-+pub(crate) struct sockaddr_un {
++#[derive(Copy, Clone, Debug)]
++pub struct sockaddr_un {
 +    pub sun_family: sa_family_t,
 +    pub sun_path: [c_char; 108],
 +}
 +
 +#[repr(C)]
-+#[derive(Copy, Clone)]
-+pub(crate) struct sockaddr_storage {
++#[derive(Copy, Clone, Debug)]
++pub struct sockaddr_storage {
 +    pub ss_family: sa_family_t,
 +    __ss_pad2: [u8; 128 - 2 - 8],
 +    __ss_align: size_t,
 +}
 +
 +#[repr(C)]
-+#[derive(Copy, Clone)]
-+pub(crate) struct sockaddr_vm {
++#[derive(Copy, Clone, Debug)]
++pub struct sockaddr_vm {
 +    pub svm_family: sa_family_t,
 +    pub svm_reserved1: c_ushort,
 +    pub svm_port: c_uint,
@@ -605,15 +605,15 @@
 +}
 +
 +#[repr(C)]
-+#[derive(Copy, Clone)]
-+pub(crate) struct iovec {
++#[derive(Copy, Clone, Debug)]
++pub struct iovec {
 +    pub iov_base: *mut c_void,
 +    pub iov_len: size_t,
 +}
 +
 +#[repr(C)]
-+#[derive(Copy, Clone)]
-+pub(crate) struct msghdr {
++#[derive(Copy, Clone, Debug)]
++pub struct msghdr {
 +    pub msg_name: *mut c_void,
 +    pub msg_namelen: socklen_t,
 +    pub msg_iov: *mut iovec,
@@ -624,68 +624,68 @@
 +}
 +
 +#[repr(C)]
-+#[derive(Copy, Clone)]
-+pub(crate) struct cmsghdr {
++#[derive(Copy, Clone, Debug)]
++pub struct cmsghdr {
 +    pub cmsg_len: size_t,
 +    pub cmsg_level: c_int,
 +    pub cmsg_type: c_int,
 +}
 +
 +#[repr(C)]
-+#[derive(Copy, Clone)]
-+pub(crate) struct linger {
++#[derive(Copy, Clone, Debug)]
++pub struct linger {
 +    pub l_onoff: c_int,
 +    pub l_linger: c_int,
 +}
 +
 +#[repr(C)]
-+#[derive(Copy, Clone)]
-+pub(crate) struct timeval {
++#[derive(Copy, Clone, Debug)]
++pub struct timeval {
 +    pub tv_sec: time_t,
 +    pub tv_usec: suseconds_t,
 +}
 +
 +#[repr(C)]
-+#[derive(Copy, Clone)]
-+pub(crate) struct pollfd {
++#[derive(Copy, Clone, Debug)]
++pub struct pollfd {
 +    pub fd: c_int,
 +    pub events: c_short,
 +    pub revents: c_short,
 +}
 +
 +#[repr(C)]
-+#[derive(Copy, Clone)]
-+pub(crate) struct ip_mreq {
++#[derive(Copy, Clone, Debug)]
++pub struct ip_mreq {
 +    pub imr_multiaddr: in_addr,
 +    pub imr_interface: in_addr,
 +}
 +
 +#[repr(C)]
-+#[derive(Copy, Clone)]
-+pub(crate) struct ip_mreqn {
++#[derive(Copy, Clone, Debug)]
++pub struct ip_mreqn {
 +    pub imr_multiaddr: in_addr,
 +    pub imr_address: in_addr,
 +    pub imr_ifindex: c_int,
 +}
 +
 +#[repr(C)]
-+#[derive(Copy, Clone)]
-+pub(crate) struct ip_mreq_source {
++#[derive(Copy, Clone, Debug)]
++pub struct ip_mreq_source {
 +    pub imr_multiaddr: in_addr,
 +    pub imr_interface: in_addr,
 +    pub imr_sourceaddr: in_addr,
 +}
 +
 +#[repr(C)]
-+#[derive(Copy, Clone)]
-+pub(crate) struct ipv6_mreq {
++#[derive(Copy, Clone, Debug)]
++pub struct ipv6_mreq {
 +    pub ipv6mr_multiaddr: in6_addr,
 +    pub ipv6mr_interface: c_uint,
 +}
 +
 +#[repr(C)]
-+#[derive(Copy, Clone)]
-+pub(crate) struct sock_filter {
++#[derive(Copy, Clone, Debug)]
++pub struct sock_filter {
 +    pub code: u16,
 +    pub jt: u8,
 +    pub jf: u8,
@@ -693,15 +693,15 @@
 +}
 +
 +#[repr(C)]
-+#[derive(Copy, Clone)]
-+pub(crate) struct sock_fprog {
++#[derive(Copy, Clone, Debug)]
++pub struct sock_fprog {
 +    pub len: c_ushort,
 +    pub filter: *mut sock_filter,
 +}
 +
 +#[repr(C)]
-+#[derive(Copy, Clone)]
-+pub(crate) struct ucred {
++#[derive(Copy, Clone, Debug)]
++pub struct ucred {
 +    pub pid: pid_t,
 +    pub uid: uid_t,
 +    pub gid: gid_t,

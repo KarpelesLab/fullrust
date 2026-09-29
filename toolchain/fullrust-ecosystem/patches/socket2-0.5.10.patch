@@ -1,9 +1,41 @@
-# fullrust backend for socket2 0.5.10 — raw Linux x86_64 syscalls, no libc.
-# New file src/sys/fullrust.rs + minimal shared-file gate broadenings.
-# Applied on top of crates.io socket2 0.5.10 (vendored in crates/socket2/).
+# fullrust support for socket2 0.5.10 — upstream's own Linux backend
+# (src/sys/unix.rs), run on a libc-free raw-syscall shim.
+# Applied on top of crates.io socket2 0.5.10 (vendored in crates/socket2/;
+# 0.5.10 is the latest 0.5.x).
+#
+# * New file src/sys/fullrust_libc.rs (identical to socket2-0.6's): a private
+#   `mod libc` stand-in (Linux x86-64 types with compile-time size/align
+#   checks, constants generated from libc 0.2.189 on x86_64-unknown-linux-gnu,
+#   raw `syscall` functions), plus the fullrust-only extension
+#   `Socket::peer_cred` -> `UCred`.
+# * Every cfg predicate rewritten by ../patches/fullrust-cfg.py:
+#     unix               -> any(unix, target_os = "fullrust")
+#     target_os="linux"  -> any(target_os = "linux", target_os = "fullrust")
+#     target_env="gnu"   -> any(target_env = "gnu", target_os = "fullrust")
+#   so fullrust compiles exactly the x86_64-linux-gnu code paths.
+# * Hand edits: `use crate::libc` (unix.rs, socket.rs), `mod libc` +
+#   `pub use UCred` (lib.rs), a fullrust `syscall!` arm (raw -errno results;
+#   2-arg fcntl), std::os::fd / std::os::fullrust::ffi instead of
+#   std::os::unix::{io, ffi} (kept for unix: MSRV 1.63 predates std::os::fd),
+#   keeping the std::os::unix::net conversions / SockAddr::as_unix unix-only
+#   (those std types do not exist on fullrust), and re-exporting
+#   `sock_filter`/`sockaddr_storage` (0.5's API names these libc types).
+# * Cargo.toml: check-cfg for target_os = "fullrust".
 
---- a/src/lib.rs	2026-07-25 13:55:00.781022094 +0900
-+++ b/src/lib.rs	2026-07-25 13:51:25.498049525 +0900
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -95,3 +95,9 @@
+     "Win32_System_Threading",
+     "Win32_System_WindowsProgramming",
+ ]
++
++# fullrust: target_os = "fullrust" is known to the fullrust toolchain but not
++# to stock rustc's check-cfg list.
++[lints.rust.unexpected_cfgs]
++level = "warn"
++check-cfg = ['cfg(target_os, values("fullrust"))']
+--- a/src/lib.rs
++++ b/src/lib.rs
 @@ -107,7 +107,7 @@
      ($from: ty, $for: ty) => {
          impl From<$from> for $for {
@@ -13,59 +45,95 @@
                  unsafe {
                      <$for>::from_raw_fd(socket.into_raw_fd())
                  }
-@@ -175,10 +175,11 @@
+@@ -170,15 +170,27 @@
+     };
+ }
+ 
++// fullrust: libc-free target; socket2's Linux code runs on this private
++// raw-syscall stand-in for the `libc` crate (Linux x86-64 layouts/values).
++#[cfg(target_os = "fullrust")]
++#[path = "sys/fullrust_libc.rs"]
++mod libc;
++#[cfg(all(feature = "all", target_os = "fullrust"))]
++pub use crate::libc::UCred;
++/// fullrust: 0.5's public API takes/returns these `libc` types (e.g.
++/// `SockAddr::new`/`as_storage`, `attach_filter`); with no `libc` crate here
++/// they are re-exported so callers can name them.
++#[cfg(target_os = "fullrust")]
++pub use crate::libc::{sock_filter, sockaddr_storage};
+ mod sockaddr;
+ mod socket;
  mod sockref;
  
- #[cfg_attr(unix, path = "sys/unix.rs")]
-+#[cfg_attr(target_os = "fullrust", path = "sys/fullrust.rs")]
+-#[cfg_attr(unix, path = "sys/unix.rs")]
++#[cfg_attr(any(unix, target_os = "fullrust"), path = "sys/unix.rs")]
  #[cfg_attr(windows, path = "sys/windows.rs")]
  mod sys;
  
 -#[cfg(not(any(windows, unix)))]
-+#[cfg(not(any(windows, unix, target_os = "fullrust")))]
++#[cfg(not(any(windows, any(unix, target_os = "fullrust"))))]
  compile_error!("Socket2 doesn't support the compile target");
  
  use sys::c_int;
---- a/src/socket.rs	2026-07-25 13:55:00.781022094 +0900
-+++ b/src/socket.rs	2026-07-25 14:07:31.021408188 +0900
-@@ -16,6 +16,8 @@
- use std::net::{self, Ipv4Addr, Shutdown};
- #[cfg(unix)]
- use std::os::unix::io::{FromRawFd, IntoRawFd};
-+#[cfg(target_os = "fullrust")]
-+use std::os::fd::{FromRawFd, IntoRawFd};
- #[cfg(windows)]
- use std::os::windows::io::{FromRawSocket, IntoRawSocket};
- use std::time::Duration;
-@@ -149,7 +151,7 @@
-     /// This function sets the same flags as in done for [`Socket::new`],
-     /// [`Socket::pair_raw`] can be used if you don't want to set those flags.
-     #[doc = man_links!(unix: socketpair(2))]
--    #[cfg(all(feature = "all", unix))]
-+    #[cfg(all(feature = "all", any(unix, target_os = "fullrust")))]
-     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", unix))))]
-     pub fn pair(
-         domain: Domain,
-@@ -166,7 +168,7 @@
-     /// Creates a pair of sockets which are connected to each other.
+@@ -265,7 +277,7 @@
+     /// Type corresponding to `SOCK_DCCP`.
      ///
-     /// This function corresponds to `socketpair(2)`.
--    #[cfg(all(feature = "all", unix))]
-+    #[cfg(all(feature = "all", any(unix, target_os = "fullrust")))]
-     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", unix))))]
-     pub fn pair_raw(
-         domain: Domain,
-@@ -382,7 +384,7 @@
-     /// `O_NONBLOCK`.
-     ///
-     /// On Windows it is not possible retrieve the nonblocking mode status.
--    #[cfg(all(feature = "all", unix))]
-+    #[cfg(all(feature = "all", any(unix, target_os = "fullrust")))]
-     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", unix))))]
-     pub fn nonblocking(&self) -> io::Result<bool> {
-         sys::nonblocking(self.as_raw())
---- a/src/sockaddr.rs	2026-07-25 13:55:00.781022094 +0900
-+++ b/src/sockaddr.rs	2026-07-25 13:51:30.388117005 +0900
+     /// Used for the DCCP protocol.
+-    #[cfg(all(feature = "all", target_os = "linux"))]
++    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
+     pub const DCCP: Type = Type(sys::SOCK_DCCP);
+ 
+@@ -318,17 +330,17 @@
+     /// Protocol corresponding to `UDP`.
+     pub const UDP: Protocol = Protocol(sys::IPPROTO_UDP);
+ 
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "fullrust"))]
+     /// Protocol corresponding to `MPTCP`.
+     pub const MPTCP: Protocol = Protocol(sys::IPPROTO_MPTCP);
+ 
+     /// Protocol corresponding to `DCCP`.
+-    #[cfg(all(feature = "all", target_os = "linux"))]
++    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
+     pub const DCCP: Protocol = Protocol(sys::IPPROTO_DCCP);
+ 
+     /// Protocol corresponding to `SCTP`.
+-    #[cfg(all(feature = "all", any(target_os = "freebsd", target_os = "linux")))]
++    #[cfg(all(feature = "all", any(target_os = "freebsd", any(target_os = "linux", target_os = "fullrust"))))]
+     pub const SCTP: Protocol = Protocol(sys::IPPROTO_SCTP);
+ 
+     /// Protocol corresponding to `UDPLITE`.
+@@ -338,7 +350,7 @@
+             target_os = "android",
+             target_os = "freebsd",
+             target_os = "fuchsia",
+-            target_os = "linux",
++            any(target_os = "linux", target_os = "fullrust"),
+         )
+     ))]
+     pub const UDPLITE: Protocol = Protocol(sys::IPPROTO_UDPLITE);
+@@ -516,7 +528,7 @@
+         target_os = "illumos",
+         target_os = "ios",
+         target_os = "visionos",
+-        target_os = "linux",
++        any(target_os = "linux", target_os = "fullrust"),
+         target_os = "macos",
+         target_os = "netbsd",
+         target_os = "tvos",
+@@ -563,7 +575,7 @@
+             target_os = "illumos",
+             target_os = "ios",
+             target_os = "visionos",
+-            target_os = "linux",
++            any(target_os = "linux", target_os = "fullrust"),
+             target_os = "macos",
+             target_os = "netbsd",
+             target_os = "tvos",
+--- a/src/sockaddr.rs
++++ b/src/sockaddr.rs
 @@ -225,7 +225,7 @@
                  ip,
                  port,
@@ -75,983 +143,1732 @@
                  addr.sin6_scope_id,
                  #[cfg(windows)]
                  unsafe {
---- /dev/null	2026-07-15 01:33:44.209999340 +0900
-+++ b/src/sys/fullrust.rs	2026-07-25 15:09:33.622295807 +0900
-@@ -0,0 +1,977 @@
-+//! socket2 backend for the `fullrust` target: raw Linux x86_64 syscalls, no
-+//! libc. The kernel ABI is identical to `x86_64-unknown-linux-gnu`, so this is
-+//! a straight port of the `unix.rs` logic with libc's thin syscall/type layer
-+//! replaced by inline `syscall` instructions and in-crate `repr(C)` structs.
-+//! It mirrors what `std::sys::net` already does on this target.
-+#![allow(dead_code, non_camel_case_types)]
+@@ -317,7 +317,7 @@
+             storage.sin6_port = addr.port().to_be();
+             storage.sin6_addr = crate::sys::to_in6_addr(addr.ip());
+             storage.sin6_flowinfo = addr.flowinfo();
+-            #[cfg(unix)]
++            #[cfg(any(unix, target_os = "fullrust"))]
+             {
+                 storage.sin6_scope_id = addr.scope_id();
+             }
+@@ -415,7 +415,7 @@
+         assert_eq!(addr.as_socket(), Some(SocketAddr::V4(std)));
+         assert_eq!(addr.as_socket_ipv4(), Some(std));
+         assert!(addr.as_socket_ipv6().is_none());
+-        #[cfg(unix)]
++        #[cfg(any(unix, target_os = "fullrust"))]
+         {
+             assert!(addr.as_pathname().is_none());
+             assert!(addr.as_abstract_namespace().is_none());
+@@ -443,7 +443,7 @@
+         assert_eq!(addr.as_socket(), Some(SocketAddr::V6(std)));
+         assert!(addr.as_socket_ipv4().is_none());
+         assert_eq!(addr.as_socket_ipv6(), Some(std));
+-        #[cfg(unix)]
++        #[cfg(any(unix, target_os = "fullrust"))]
+         {
+             assert!(addr.as_pathname().is_none());
+             assert!(addr.as_abstract_namespace().is_none());
+--- a/src/socket.rs
++++ b/src/socket.rs
+@@ -16,14 +16,18 @@
+ use std::net::{self, Ipv4Addr, Shutdown};
+ #[cfg(unix)]
+ use std::os::unix::io::{FromRawFd, IntoRawFd};
++#[cfg(target_os = "fullrust")]
++use std::os::fd::{FromRawFd, IntoRawFd};
+ #[cfg(windows)]
+ use std::os::windows::io::{FromRawSocket, IntoRawSocket};
+ use std::time::Duration;
+ 
+ use crate::sys::{self, c_int, getsockopt, setsockopt, Bool};
+-#[cfg(all(unix, not(target_os = "redox")))]
++#[cfg(all(any(unix, target_os = "fullrust"), not(target_os = "redox")))]
+ use crate::MsgHdrMut;
+ use crate::{Domain, Protocol, SockAddr, TcpKeepalive, Type};
++#[cfg(target_os = "fullrust")]
++use crate::libc;
+ #[cfg(not(target_os = "redox"))]
+ use crate::{MaybeUninitSlice, MsgHdr, RecvFlags};
+ 
+@@ -102,7 +106,7 @@
+                 // Violating this assumption (fd never negative) causes UB,
+                 // something we don't want. So check for that we have this
+                 // `assert!`.
+-                #[cfg(unix)]
++                #[cfg(any(unix, target_os = "fullrust"))]
+                 assert!(raw >= 0, "tried to create a `Socket` with an invalid fd");
+                 sys::socket_from_raw(raw)
+             },
+@@ -149,7 +153,7 @@
+     /// This function sets the same flags as in done for [`Socket::new`],
+     /// [`Socket::pair_raw`] can be used if you don't want to set those flags.
+     #[doc = man_links!(unix: socketpair(2))]
+-    #[cfg(all(feature = "all", unix))]
++    #[cfg(all(feature = "all", any(unix, target_os = "fullrust")))]
+     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", unix))))]
+     pub fn pair(
+         domain: Domain,
+@@ -166,7 +170,7 @@
+     /// Creates a pair of sockets which are connected to each other.
+     ///
+     /// This function corresponds to `socketpair(2)`.
+-    #[cfg(all(feature = "all", unix))]
++    #[cfg(all(feature = "all", any(unix, target_os = "fullrust")))]
+     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", unix))))]
+     pub fn pair_raw(
+         domain: Domain,
+@@ -238,7 +242,7 @@
+         match res {
+             Ok(()) => return Ok(()),
+             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+-            #[cfg(unix)]
++            #[cfg(any(unix, target_os = "fullrust"))]
+             Err(ref e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
+             Err(e) => return Err(e),
+         }
+@@ -282,7 +286,7 @@
+             target_os = "freebsd",
+             target_os = "fuchsia",
+             target_os = "illumos",
+-            target_os = "linux",
++            any(target_os = "linux", target_os = "fullrust"),
+             target_os = "netbsd",
+             target_os = "openbsd",
+             target_os = "cygwin",
+@@ -296,7 +300,7 @@
+             target_os = "freebsd",
+             target_os = "fuchsia",
+             target_os = "illumos",
+-            target_os = "linux",
++            any(target_os = "linux", target_os = "fullrust"),
+             target_os = "netbsd",
+             target_os = "openbsd",
+             target_os = "cygwin",
+@@ -382,7 +386,7 @@
+     /// `O_NONBLOCK`.
+     ///
+     /// On Windows it is not possible retrieve the nonblocking mode status.
+-    #[cfg(all(feature = "all", unix))]
++    #[cfg(all(feature = "all", any(unix, target_os = "fullrust")))]
+     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", unix))))]
+     pub fn nonblocking(&self) -> io::Result<bool> {
+         sys::nonblocking(self.as_raw())
+@@ -650,7 +654,7 @@
+     /// <https://github.com/microsoft/Windows-classic-samples/blob/7cbd99ac1d2b4a0beffbaba29ea63d024ceff700/Samples/Win7Samples/netds/winsock/recvmsg/rmmc.cpp>
+     /// for an example (in C++).
+     #[doc = man_links!(recvmsg(2))]
+-    #[cfg(all(unix, not(target_os = "redox")))]
++    #[cfg(all(any(unix, target_os = "fullrust"), not(target_os = "redox")))]
+     #[cfg_attr(docsrs, doc(cfg(all(unix, not(target_os = "redox")))))]
+     pub fn recvmsg(&self, msg: &mut MsgHdrMut<'_, '_, '_>, flags: sys::c_int) -> io::Result<usize> {
+         sys::recvmsg(self.as_raw(), msg, flags)
+@@ -776,7 +780,7 @@
+         target_os = "fuchsia",
+         target_os = "hurd",
+         target_os = "illumos",
+-        target_os = "linux",
++        any(target_os = "linux", target_os = "fullrust"),
+         target_os = "netbsd",
+         target_os = "openbsd",
+         target_os = "cygwin",
+@@ -796,7 +800,7 @@
+ fn set_common_flags(socket: Socket) -> io::Result<Socket> {
+     // On platforms that don't have `SOCK_CLOEXEC` use `FD_CLOEXEC`.
+     #[cfg(all(
+-        unix,
++        any(unix, target_os = "fullrust"),
+         not(any(
+             target_os = "android",
+             target_os = "dragonfly",
+@@ -804,7 +808,7 @@
+             target_os = "fuchsia",
+             target_os = "hurd",
+             target_os = "illumos",
+-            target_os = "linux",
++            any(target_os = "linux", target_os = "fullrust"),
+             target_os = "netbsd",
+             target_os = "openbsd",
+             target_os = "espidf",
+@@ -987,7 +991,7 @@
+     /// For more information about this option, see [`set_passcred`].
+     ///
+     /// [`set_passcred`]: Socket::set_passcred
+-    #[cfg(any(target_os = "linux", target_os = "cygwin"))]
++    #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "cygwin"))]
+     #[cfg_attr(docsrs, doc(cfg(any(target_os = "linux", target_os = "cygwin"))))]
+     pub fn passcred(&self) -> io::Result<bool> {
+         unsafe {
+@@ -1000,7 +1004,7 @@
+     ///
+     /// If this option is enabled, enables the receiving of the `SCM_CREDENTIALS`
+     /// control messages.
+-    #[cfg(any(target_os = "linux", target_os = "cygwin"))]
++    #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "cygwin"))]
+     #[cfg_attr(docsrs, doc(cfg(any(target_os = "linux", target_os = "cygwin"))))]
+     pub fn set_passcred(&self, passcred: bool) -> io::Result<()> {
+         unsafe {
+@@ -1233,7 +1237,7 @@
+     /// For more information about this option, see [`set_ip_transparent`].
+     ///
+     /// [`set_ip_transparent`]: Socket::set_ip_transparent
+-    #[cfg(all(feature = "all", target_os = "linux"))]
++    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
+     pub fn ip_transparent(&self) -> io::Result<bool> {
+         unsafe {
+@@ -1257,7 +1261,7 @@
+     ///
+     /// TProxy redirection with the iptables TPROXY target also
+     /// requires that this option be set on the redirected socket.
+-    #[cfg(all(feature = "all", target_os = "linux"))]
++    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
+     pub fn set_ip_transparent(&self, transparent: bool) -> io::Result<()> {
+         unsafe {
+@@ -1457,7 +1461,7 @@
+     /// For more information about this option, see [`set_multicast_all_v4`].
+     ///
+     /// [`set_multicast_all_v4`]: Socket::set_multicast_all_v4
+-    #[cfg(all(feature = "all", target_os = "linux"))]
++    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
+     pub fn multicast_all_v4(&self) -> io::Result<bool> {
+         unsafe {
+@@ -1476,7 +1480,7 @@
+     /// messages only from the groups that have been explicitly
+     /// joined (for example via the `IP_ADD_MEMBERSHIP` option) on
+     /// this particular socket.
+-    #[cfg(all(feature = "all", target_os = "linux"))]
++    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
+     pub fn set_multicast_all_v4(&self, all: bool) -> io::Result<()> {
+         unsafe {
+@@ -1843,7 +1847,7 @@
+     /// For more information about this option, see [`set_multicast_all_v6`].
+     ///
+     /// [`set_multicast_all_v6`]: Socket::set_multicast_all_v6
+-    #[cfg(all(feature = "all", target_os = "linux"))]
++    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
+     pub fn multicast_all_v6(&self) -> io::Result<bool> {
+         unsafe {
+@@ -1862,7 +1866,7 @@
+     /// messages only from the groups that have been explicitly
+     /// joined (for example via the `IPV6_ADD_MEMBERSHIP` option) on
+     /// this particular socket.
+-    #[cfg(all(feature = "all", target_os = "linux"))]
++    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
+     pub fn set_multicast_all_v6(&self, all: bool) -> io::Result<()> {
+         unsafe {
+@@ -2153,7 +2157,7 @@
+             target_os = "illumos",
+             target_os = "ios",
+             target_os = "visionos",
+-            target_os = "linux",
++            any(target_os = "linux", target_os = "fullrust"),
+             target_os = "macos",
+             target_os = "netbsd",
+             target_os = "tvos",
+@@ -2203,7 +2207,7 @@
+             target_os = "illumos",
+             target_os = "ios",
+             target_os = "visionos",
+-            target_os = "linux",
++            any(target_os = "linux", target_os = "fullrust"),
+             target_os = "macos",
+             target_os = "netbsd",
+             target_os = "tvos",
+@@ -2317,7 +2321,7 @@
+         any(
+             target_os = "android",
+             target_os = "fuchsia",
+-            target_os = "linux",
++            any(target_os = "linux", target_os = "fullrust"),
+             target_os = "windows",
+         )
+     ))]
+@@ -2340,7 +2344,7 @@
+     /// Get the value for the `IP6T_SO_ORIGINAL_DST` option on this socket.
+     #[cfg(all(
+         feature = "all",
+-        any(target_os = "android", target_os = "linux", target_os = "windows")
++        any(target_os = "android", any(target_os = "linux", target_os = "fullrust"), target_os = "windows")
+     ))]
+     #[cfg_attr(
+         docsrs,
+--- a/src/sockref.rs
++++ b/src/sockref.rs
+@@ -4,6 +4,8 @@
+ use std::ops::Deref;
+ #[cfg(unix)]
+ use std::os::unix::io::{AsFd, AsRawFd, FromRawFd};
++#[cfg(target_os = "fullrust")]
++use std::os::fd::{AsFd, AsRawFd, FromRawFd};
+ #[cfg(windows)]
+ use std::os::windows::io::{AsRawSocket, AsSocket, FromRawSocket};
+ 
+@@ -77,7 +79,7 @@
+ }
+ 
+ /// On Windows, a corresponding `From<&impl AsSocket>` implementation exists.
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "fullrust"))]
+ #[cfg_attr(docsrs, doc(cfg(unix)))]
+ impl<'s, S> From<&'s S> for SockRef<'s>
+ where
+--- /dev/null
++++ b/src/sys/fullrust_libc.rs
+@@ -0,0 +1,578 @@
++//! `target_os = "fullrust"`: a private, libc-free stand-in for the `libc`
++//! crate, covering exactly what socket2's `sys/unix.rs` uses on Linux.
++//!
++//! fullrust is ABI-identical to `x86_64-unknown-linux-gnu` but links no libc,
++//! so instead of forking socket2's backend we let upstream's own Linux code
++//! (every `target_os = "linux"` branch) run on top of this module:
++//!
++//! * types are the Linux x86-64 (glibc) layouts, checked at compile time
++//!   against sizes/alignments taken from the real `libc` crate;
++//! * constants were generated from `libc` 0.2.189 on x86_64-unknown-linux-gnu;
++//! * functions are raw `syscall` instructions. They return the kernel's
++//!   `-errno` directly (there is no errno variable); the fullrust arm of
++//!   socket2's `syscall!` macro turns a negative result into
++//!   `io::Error::from_raw_os_error`. They are only ever called through that
++//!   macro.
++//!
++//! Plus one fullrust-only extension (not in upstream socket2):
++//! `Socket::peer_cred` (`SO_PEERCRED`).
++#![allow(dead_code, missing_docs, non_camel_case_types, clippy::missing_safety_doc)]
 +
-+use std::cmp::min;
-+use std::io::{self, IoSlice};
-+use std::marker::PhantomData;
-+use std::mem::{self, size_of, MaybeUninit};
-+use std::net::{Ipv4Addr, Ipv6Addr, Shutdown};
-+use std::num::NonZeroUsize;
-+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
-+use std::os::fullrust::ffi::OsStrExt;
-+use std::path::Path;
-+use std::time::{Duration, Instant};
-+use std::{ptr, slice};
-+
-+use crate::{MsgHdr, MsgHdrMut, RecvFlags, SockAddr, TcpKeepalive};
++use std::mem::{align_of, size_of};
 +
 +// ---------------------------------------------------------------------------
-+// Raw syscalls
++// Primitive types (x86-64 Linux).
 +// ---------------------------------------------------------------------------
 +
-+// x86_64 Linux socket-related syscall numbers.
-+const NR_SENDFILE: usize = 40;
-+const NR_POLL: usize = 7;
-+const NR_SOCKET: usize = 41;
-+const NR_CONNECT: usize = 42;
-+const NR_SENDTO: usize = 44;
-+const NR_RECVFROM: usize = 45;
-+const NR_SENDMSG: usize = 46;
-+const NR_RECVMSG: usize = 47;
-+const NR_SHUTDOWN: usize = 48;
-+const NR_BIND: usize = 49;
-+const NR_LISTEN: usize = 50;
-+const NR_GETSOCKNAME: usize = 51;
-+const NR_GETPEERNAME: usize = 52;
-+const NR_SOCKETPAIR: usize = 53;
-+const NR_SETSOCKOPT: usize = 54;
-+const NR_GETSOCKOPT: usize = 55;
-+const NR_FCNTL: usize = 72;
-+const NR_ACCEPT4: usize = 288;
-+
-+#[inline]
-+unsafe fn sys2(n: usize, a: usize, b: usize) -> isize {
-+    let r: isize;
-+    unsafe {
-+        core::arch::asm!("syscall", inlateout("rax") n as isize => r,
-+            in("rdi") a, in("rsi") b,
-+            lateout("rcx") _, lateout("r11") _, options(nostack, preserves_flags));
-+    }
-+    r
-+}
-+#[inline]
-+unsafe fn sys3(n: usize, a: usize, b: usize, c: usize) -> isize {
-+    let r: isize;
-+    unsafe {
-+        core::arch::asm!("syscall", inlateout("rax") n as isize => r,
-+            in("rdi") a, in("rsi") b, in("rdx") c,
-+            lateout("rcx") _, lateout("r11") _, options(nostack, preserves_flags));
-+    }
-+    r
-+}
-+#[inline]
-+unsafe fn sys4(n: usize, a: usize, b: usize, c: usize, d: usize) -> isize {
-+    let r: isize;
-+    unsafe {
-+        core::arch::asm!("syscall", inlateout("rax") n as isize => r,
-+            in("rdi") a, in("rsi") b, in("rdx") c, in("r10") d,
-+            lateout("rcx") _, lateout("r11") _, options(nostack, preserves_flags));
-+    }
-+    r
-+}
-+#[inline]
-+unsafe fn sys5(n: usize, a: usize, b: usize, c: usize, d: usize, e: usize) -> isize {
-+    let r: isize;
-+    unsafe {
-+        core::arch::asm!("syscall", inlateout("rax") n as isize => r,
-+            in("rdi") a, in("rsi") b, in("rdx") c, in("r10") d, in("r8") e,
-+            lateout("rcx") _, lateout("r11") _, options(nostack, preserves_flags));
-+    }
-+    r
-+}
-+#[inline]
-+unsafe fn sys6(n: usize, a: usize, b: usize, c: usize, d: usize, e: usize, f: usize) -> isize {
-+    let r: isize;
-+    unsafe {
-+        core::arch::asm!("syscall", inlateout("rax") n as isize => r,
-+            in("rdi") a, in("rsi") b, in("rdx") c, in("r10") d, in("r8") e, in("r9") f,
-+            lateout("rcx") _, lateout("r11") _, options(nostack, preserves_flags));
-+    }
-+    r
-+}
-+
-+/// Turn a raw syscall return into `io::Result`: a negative value is `-errno`.
-+#[inline]
-+fn cvt(r: isize) -> io::Result<isize> {
-+    if r < 0 { Err(io::Error::from_raw_os_error(-r as i32)) } else { Ok(r) }
-+}
-+
-+// ---------------------------------------------------------------------------
-+// Primitive types
-+// ---------------------------------------------------------------------------
-+
-+pub(crate) type c_int = core::ffi::c_int; // i32
-+pub(crate) type Bool = c_int;
-+pub(crate) type Socket = c_int;
-+pub(crate) type sa_family_t = u16;
++pub(crate) use std::ffi::{c_char, c_int, c_short, c_uint, c_ulong, c_ushort, c_void};
++pub(crate) type c_ulonglong = u64;
++pub(crate) type size_t = usize;
++pub(crate) type ssize_t = isize;
 +pub(crate) type socklen_t = u32;
-+type c_void = core::ffi::c_void;
-+type time_t = i64;
-+type suseconds_t = i64;
-+type c_char = i8;
-+type IovLen = usize;
-+
-+const MAX_BUF_LEN: usize = isize::MAX as usize;
++pub(crate) type sa_family_t = u16;
++pub(crate) type in_addr_t = u32;
++pub(crate) type in_port_t = u16;
++pub(crate) type off_t = i64;
++pub(crate) type time_t = i64;
++pub(crate) type suseconds_t = i64;
++pub(crate) type nfds_t = c_ulong;
++pub(crate) type pid_t = i32;
++pub(crate) type uid_t = u32;
++pub(crate) type gid_t = u32;
 +
 +// ---------------------------------------------------------------------------
-+// repr(C) structs — Linux x86_64 layouts. Field names are load-bearing: the
-+// shared `sockaddr.rs`/`socket.rs` code writes/reads them by name.
++// Structs: Linux x86-64 layouts, field names as in the `libc` crate.
 +// ---------------------------------------------------------------------------
 +
 +#[repr(C)]
-+#[derive(Clone, Copy)]
-+pub(crate) struct in_addr {
-+    pub s_addr: u32,
++#[derive(Copy, Clone, Debug)]
++pub struct in_addr {
++    pub s_addr: in_addr_t,
 +}
++
 +#[repr(C)]
-+#[derive(Clone, Copy)]
-+pub(crate) struct in6_addr {
++#[repr(align(4))]
++#[derive(Copy, Clone, Debug)]
++pub struct in6_addr {
 +    pub s6_addr: [u8; 16],
 +}
++
 +#[repr(C)]
-+#[derive(Clone, Copy)]
-+pub(crate) struct sockaddr {
++#[derive(Copy, Clone, Debug)]
++pub struct sockaddr {
 +    pub sa_family: sa_family_t,
 +    pub sa_data: [c_char; 14],
 +}
++
 +#[repr(C)]
-+#[derive(Clone, Copy)]
-+pub(crate) struct sockaddr_in {
++#[derive(Copy, Clone, Debug)]
++pub struct sockaddr_in {
 +    pub sin_family: sa_family_t,
-+    pub sin_port: u16,
++    pub sin_port: in_port_t,
 +    pub sin_addr: in_addr,
 +    pub sin_zero: [u8; 8],
 +}
++
 +#[repr(C)]
-+#[derive(Clone, Copy)]
-+pub(crate) struct sockaddr_in6 {
++#[derive(Copy, Clone, Debug)]
++pub struct sockaddr_in6 {
 +    pub sin6_family: sa_family_t,
-+    pub sin6_port: u16,
++    pub sin6_port: in_port_t,
 +    pub sin6_flowinfo: u32,
 +    pub sin6_addr: in6_addr,
 +    pub sin6_scope_id: u32,
 +}
++
 +#[repr(C)]
-+#[derive(Clone, Copy)]
-+pub(crate) struct sockaddr_un {
++#[derive(Copy, Clone, Debug)]
++pub struct sockaddr_un {
 +    pub sun_family: sa_family_t,
 +    pub sun_path: [c_char; 108],
 +}
++
 +#[repr(C)]
-+#[derive(Clone, Copy)]
-+pub(crate) struct sockaddr_storage {
++#[derive(Copy, Clone, Debug)]
++pub struct sockaddr_storage {
 +    pub ss_family: sa_family_t,
-+    __ss_align: u64,
-+    __ss_pad: [u8; 128 - 16],
++    __ss_pad2: [u8; 128 - 2 - 8],
++    __ss_align: size_t,
 +}
 +
 +#[repr(C)]
-+#[derive(Clone, Copy)]
-+pub(crate) struct iovec {
-+    pub iov_base: *mut c_void,
-+    pub iov_len: usize,
++#[derive(Copy, Clone, Debug)]
++pub struct sockaddr_vm {
++    pub svm_family: sa_family_t,
++    pub svm_reserved1: c_ushort,
++    pub svm_port: c_uint,
++    pub svm_cid: c_uint,
++    pub svm_zero: [u8; 4],
 +}
++
 +#[repr(C)]
-+#[derive(Clone, Copy)]
-+pub(crate) struct msghdr {
++#[derive(Copy, Clone, Debug)]
++pub struct iovec {
++    pub iov_base: *mut c_void,
++    pub iov_len: size_t,
++}
++
++#[repr(C)]
++#[derive(Copy, Clone, Debug)]
++pub struct msghdr {
 +    pub msg_name: *mut c_void,
 +    pub msg_namelen: socklen_t,
 +    pub msg_iov: *mut iovec,
-+    pub msg_iovlen: usize,
++    pub msg_iovlen: size_t,
 +    pub msg_control: *mut c_void,
-+    pub msg_controllen: usize,
++    pub msg_controllen: size_t,
 +    pub msg_flags: c_int,
 +}
++
 +#[repr(C)]
-+#[derive(Clone, Copy)]
-+pub(crate) struct linger {
++#[derive(Copy, Clone, Debug)]
++pub struct cmsghdr {
++    pub cmsg_len: size_t,
++    pub cmsg_level: c_int,
++    pub cmsg_type: c_int,
++}
++
++#[repr(C)]
++#[derive(Copy, Clone, Debug)]
++pub struct linger {
 +    pub l_onoff: c_int,
 +    pub l_linger: c_int,
 +}
++
 +#[repr(C)]
-+#[derive(Clone, Copy)]
-+pub(crate) struct ip_mreq {
++#[derive(Copy, Clone, Debug)]
++pub struct timeval {
++    pub tv_sec: time_t,
++    pub tv_usec: suseconds_t,
++}
++
++#[repr(C)]
++#[derive(Copy, Clone, Debug)]
++pub struct pollfd {
++    pub fd: c_int,
++    pub events: c_short,
++    pub revents: c_short,
++}
++
++#[repr(C)]
++#[derive(Copy, Clone, Debug)]
++pub struct ip_mreq {
 +    pub imr_multiaddr: in_addr,
 +    pub imr_interface: in_addr,
 +}
++
 +#[repr(C)]
-+#[derive(Clone, Copy)]
-+pub(crate) struct ip_mreqn {
++#[derive(Copy, Clone, Debug)]
++pub struct ip_mreqn {
 +    pub imr_multiaddr: in_addr,
 +    pub imr_address: in_addr,
 +    pub imr_ifindex: c_int,
 +}
++
 +#[repr(C)]
-+#[derive(Clone, Copy)]
-+pub(crate) struct ip_mreq_source {
++#[derive(Copy, Clone, Debug)]
++pub struct ip_mreq_source {
 +    pub imr_multiaddr: in_addr,
 +    pub imr_interface: in_addr,
 +    pub imr_sourceaddr: in_addr,
 +}
++
 +#[repr(C)]
-+#[derive(Clone, Copy)]
-+pub(crate) struct ipv6_mreq {
++#[derive(Copy, Clone, Debug)]
++pub struct ipv6_mreq {
 +    pub ipv6mr_multiaddr: in6_addr,
-+    pub ipv6mr_interface: u32,
++    pub ipv6mr_interface: c_uint,
 +}
++
 +#[repr(C)]
-+#[derive(Clone, Copy)]
-+struct timeval {
-+    tv_sec: time_t,
-+    tv_usec: suseconds_t,
++#[derive(Copy, Clone, Debug)]
++pub struct sock_filter {
++    pub code: u16,
++    pub jt: u8,
++    pub jf: u8,
++    pub k: u32,
 +}
++
 +#[repr(C)]
-+#[derive(Clone, Copy)]
-+struct pollfd {
++#[derive(Copy, Clone, Debug)]
++pub struct sock_fprog {
++    pub len: c_ushort,
++    pub filter: *mut sock_filter,
++}
++
++#[repr(C)]
++#[derive(Copy, Clone, Debug)]
++pub struct ucred {
++    pub pid: pid_t,
++    pub uid: uid_t,
++    pub gid: gid_t,
++}
++
++// ---------------------------------------------------------------------------
++// Syscalls. Each returns the raw kernel result (`-errno` on failure).
++// ---------------------------------------------------------------------------
++
++mod nr {
++    pub const POLL: usize = 7;
++    pub const SENDFILE: usize = 40;
++    pub const SOCKET: usize = 41;
++    pub const CONNECT: usize = 42;
++    pub const ACCEPT: usize = 43;
++    pub const SENDTO: usize = 44;
++    pub const RECVFROM: usize = 45;
++    pub const SENDMSG: usize = 46;
++    pub const RECVMSG: usize = 47;
++    pub const SHUTDOWN: usize = 48;
++    pub const BIND: usize = 49;
++    pub const LISTEN: usize = 50;
++    pub const GETSOCKNAME: usize = 51;
++    pub const GETPEERNAME: usize = 52;
++    pub const SOCKETPAIR: usize = 53;
++    pub const SETSOCKOPT: usize = 54;
++    pub const GETSOCKOPT: usize = 55;
++    pub const FCNTL: usize = 72;
++    pub const ACCEPT4: usize = 288;
++}
++
++#[inline]
++unsafe fn sc(n: usize, a: usize, b: usize, c: usize, d: usize, e: usize, f: usize) -> isize {
++    let r: isize;
++    // SAFETY: the caller upholds the syscall's own contract.
++    unsafe {
++        core::arch::asm!(
++            "syscall",
++            inlateout("rax") n as isize => r,
++            in("rdi") a, in("rsi") b, in("rdx") c,
++            in("r10") d, in("r8") e, in("r9") f,
++            lateout("rcx") _, lateout("r11") _,
++            options(nostack, preserves_flags)
++        );
++    }
++    r
++}
++
++pub(crate) unsafe fn socket(domain: c_int, ty: c_int, protocol: c_int) -> c_int {
++    unsafe { sc(nr::SOCKET, domain as usize, ty as usize, protocol as usize, 0, 0, 0) as c_int }
++}
++pub(crate) unsafe fn socketpair(domain: c_int, ty: c_int, protocol: c_int, sv: *mut c_int) -> c_int {
++    unsafe {
++        sc(nr::SOCKETPAIR, domain as usize, ty as usize, protocol as usize, sv as usize, 0, 0)
++            as c_int
++    }
++}
++pub(crate) unsafe fn bind(fd: c_int, addr: *const sockaddr, len: socklen_t) -> c_int {
++    unsafe { sc(nr::BIND, fd as usize, addr as usize, len as usize, 0, 0, 0) as c_int }
++}
++pub(crate) unsafe fn connect(fd: c_int, addr: *const sockaddr, len: socklen_t) -> c_int {
++    unsafe { sc(nr::CONNECT, fd as usize, addr as usize, len as usize, 0, 0, 0) as c_int }
++}
++pub(crate) unsafe fn listen(fd: c_int, backlog: c_int) -> c_int {
++    unsafe { sc(nr::LISTEN, fd as usize, backlog as usize, 0, 0, 0, 0) as c_int }
++}
++pub(crate) unsafe fn accept(fd: c_int, addr: *mut sockaddr, len: *mut socklen_t) -> c_int {
++    unsafe { sc(nr::ACCEPT, fd as usize, addr as usize, len as usize, 0, 0, 0) as c_int }
++}
++pub(crate) unsafe fn accept4(
 +    fd: c_int,
-+    events: i16,
-+    revents: i16,
-+}
-+
-+// socket2 re-exports these libc names; give them the crate-local spellings.
-+pub(crate) use ip_mreq as IpMreq;
-+pub(crate) use ip_mreq_source as IpMreqSource;
-+pub(crate) use ipv6_mreq as Ipv6Mreq;
-+
-+// ---------------------------------------------------------------------------
-+// Constants (Linux x86_64). Only the non-`feature = "all"` surface.
-+// ---------------------------------------------------------------------------
-+
-+pub(crate) const AF_UNSPEC: c_int = 0;
-+pub(crate) const AF_UNIX: c_int = 1;
-+pub(crate) const AF_INET: c_int = 2;
-+pub(crate) const AF_INET6: c_int = 10;
-+
-+pub(crate) const SOCK_STREAM: c_int = 1;
-+pub(crate) const SOCK_DGRAM: c_int = 2;
-+pub(crate) const SOCK_RAW: c_int = 3;
-+pub(crate) const SOCK_SEQPACKET: c_int = 5;
-+const SOCK_CLOEXEC: c_int = 0o2000000;
-+const SOCK_NONBLOCK: c_int = 0o4000;
-+
-+pub(crate) const IPPROTO_IP: c_int = 0;
-+pub(crate) const IPPROTO_ICMP: c_int = 1;
-+pub(crate) const IPPROTO_TCP: c_int = 6;
-+pub(crate) const IPPROTO_UDP: c_int = 17;
-+pub(crate) const IPPROTO_IPV6: c_int = 41;
-+pub(crate) const IPPROTO_ICMPV6: c_int = 58;
-+pub(crate) const IPPROTO_MPTCP: c_int = 262;
-+
-+pub(crate) const SOL_SOCKET: c_int = 1;
-+const SOL_IP: c_int = 0;
-+const SOL_IPV6: c_int = 41;
-+
-+pub(crate) const SO_REUSEADDR: c_int = 2;
-+pub(crate) const SO_TYPE: c_int = 3;
-+pub(crate) const SO_ERROR: c_int = 4;
-+pub(crate) const SO_BROADCAST: c_int = 6;
-+pub(crate) const SO_SNDBUF: c_int = 7;
-+pub(crate) const SO_RCVBUF: c_int = 8;
-+pub(crate) const SO_KEEPALIVE: c_int = 9;
-+pub(crate) const SO_OOBINLINE: c_int = 10;
-+pub(crate) const SO_LINGER: c_int = 13;
-+pub(crate) const SO_RCVTIMEO: c_int = 20;
-+pub(crate) const SO_SNDTIMEO: c_int = 21;
-+
-+pub(crate) const IP_TOS: c_int = 1;
-+pub(crate) const IP_TTL: c_int = 2;
-+pub(crate) const IP_HDRINCL: c_int = 3;
-+pub(crate) const IP_RECVTOS: c_int = 13;
-+pub(crate) const IP_MULTICAST_IF: c_int = 32;
-+pub(crate) const IP_MULTICAST_TTL: c_int = 33;
-+pub(crate) const IP_MULTICAST_LOOP: c_int = 34;
-+pub(crate) const IP_ADD_MEMBERSHIP: c_int = 35;
-+pub(crate) const IP_DROP_MEMBERSHIP: c_int = 36;
-+pub(crate) const IP_ADD_SOURCE_MEMBERSHIP: c_int = 39;
-+pub(crate) const IP_DROP_SOURCE_MEMBERSHIP: c_int = 40;
-+
-+pub(crate) const IPV6_UNICAST_HOPS: c_int = 16;
-+pub(crate) const IPV6_MULTICAST_IF: c_int = 17;
-+pub(crate) const IPV6_MULTICAST_HOPS: c_int = 18;
-+pub(crate) const IPV6_MULTICAST_LOOP: c_int = 19;
-+pub(crate) const IPV6_ADD_MEMBERSHIP: c_int = 20;
-+pub(crate) const IPV6_DROP_MEMBERSHIP: c_int = 21;
-+pub(crate) const IPV6_V6ONLY: c_int = 26;
-+pub(crate) const IPV6_RECVHOPLIMIT: c_int = 51;
-+pub(crate) const IPV6_RECVTCLASS: c_int = 66;
-+pub(crate) const IPV6_TCLASS: c_int = 67;
-+
-+pub(crate) const TCP_NODELAY: c_int = 1;
-+pub(crate) const TCP_MAXSEG: c_int = 2;
-+const KEEPALIVE_TIME: c_int = 4; // TCP_KEEPIDLE
-+pub(crate) const TCP_KEEPINTVL: c_int = 5;
-+pub(crate) const TCP_KEEPCNT: c_int = 6;
-+pub(crate) const TCP_USER_TIMEOUT: c_int = 18;
-+
-+pub(crate) const MSG_OOB: c_int = 1;
-+pub(crate) const MSG_PEEK: c_int = 2;
-+pub(crate) const MSG_TRUNC: c_int = 0x20;
-+pub(crate) const MSG_EOR: c_int = 0x80;
-+pub(crate) const MSG_CONFIRM: c_int = 0x800;
-+pub(crate) const MSG_DONTROUTE: c_int = 4;
-+
-+const F_GETFL: c_int = 3;
-+const F_SETFL: c_int = 4;
-+const F_DUPFD_CLOEXEC: c_int = 1030;
-+const O_NONBLOCK: c_int = 0o4000;
-+
-+const POLLIN: i16 = 0x001;
-+const POLLOUT: i16 = 0x004;
-+const POLLERR: i16 = 0x008;
-+const POLLHUP: i16 = 0x010;
-+
-+const SHUT_RD: c_int = 0;
-+const SHUT_WR: c_int = 1;
-+const SHUT_RDWR: c_int = 2;
-+
-+// ---------------------------------------------------------------------------
-+// RecvFlags + MaybeUninitSlice
-+// ---------------------------------------------------------------------------
-+
-+impl RecvFlags {
-+    /// Check if the message terminates a record (`MSG_EOR`).
-+    pub const fn is_end_of_record(self) -> bool {
-+        self.0 & MSG_EOR != 0
-+    }
-+    /// Check if the message contains out-of-band data (`MSG_OOB`).
-+    pub const fn is_out_of_band(self) -> bool {
-+        self.0 & MSG_OOB != 0
-+    }
-+}
-+
-+// `Debug` for `Domain`/`Type`/`Protocol` is normally generated by the
-+// `impl_debug!` macro in the (libc-based) unix backend; provide equivalents
-+// naming the common Linux constants.
-+impl std::fmt::Debug for crate::Domain {
-+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-+        let s = match self.0 {
-+            AF_INET => "AF_INET",
-+            AF_INET6 => "AF_INET6",
-+            AF_UNIX => "AF_UNIX",
-+            AF_UNSPEC => "AF_UNSPEC",
-+            n => return write!(f, "{n}"),
-+        };
-+        f.write_str(s)
-+    }
-+}
-+impl std::fmt::Debug for crate::Type {
-+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-+        let s = match self.0 {
-+            SOCK_STREAM => "SOCK_STREAM",
-+            SOCK_DGRAM => "SOCK_DGRAM",
-+            SOCK_RAW => "SOCK_RAW",
-+            SOCK_SEQPACKET => "SOCK_SEQPACKET",
-+            n => return write!(f, "{n}"),
-+        };
-+        f.write_str(s)
-+    }
-+}
-+impl std::fmt::Debug for crate::Protocol {
-+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-+        let s = match self.0 {
-+            IPPROTO_ICMP => "IPPROTO_ICMP",
-+            IPPROTO_ICMPV6 => "IPPROTO_ICMPV6",
-+            IPPROTO_TCP => "IPPROTO_TCP",
-+            IPPROTO_UDP => "IPPROTO_UDP",
-+            IPPROTO_MPTCP => "IPPROTO_MPTCP",
-+            n => return write!(f, "{n}"),
-+        };
-+        f.write_str(s)
-+    }
-+}
-+
-+impl std::fmt::Debug for RecvFlags {
-+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-+        f.debug_struct("RecvFlags")
-+            .field("is_end_of_record", &self.is_end_of_record())
-+            .field("is_out_of_band", &self.is_out_of_band())
-+            .field("is_truncated", &self.is_truncated())
-+            .finish()
-+    }
-+}
-+
-+#[repr(transparent)]
-+pub struct MaybeUninitSlice<'a> {
-+    vec: iovec,
-+    _lifetime: PhantomData<&'a mut [MaybeUninit<u8>]>,
-+}
-+
-+unsafe impl<'a> Send for MaybeUninitSlice<'a> {}
-+unsafe impl<'a> Sync for MaybeUninitSlice<'a> {}
-+
-+impl<'a> MaybeUninitSlice<'a> {
-+    pub(crate) fn new(buf: &'a mut [MaybeUninit<u8>]) -> MaybeUninitSlice<'a> {
-+        MaybeUninitSlice {
-+            vec: iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() },
-+            _lifetime: PhantomData,
-+        }
-+    }
-+    pub(crate) fn as_slice(&self) -> &[MaybeUninit<u8>] {
-+        unsafe { slice::from_raw_parts(self.vec.iov_base.cast(), self.vec.iov_len) }
-+    }
-+    pub(crate) fn as_mut_slice(&mut self) -> &mut [MaybeUninit<u8>] {
-+        unsafe { slice::from_raw_parts_mut(self.vec.iov_base.cast(), self.vec.iov_len) }
-+    }
-+}
-+
-+// ---------------------------------------------------------------------------
-+// msghdr helpers
-+// ---------------------------------------------------------------------------
-+
-+pub(crate) fn set_msghdr_name(msg: &mut msghdr, name: &SockAddr) {
-+    msg.msg_name = name.as_ptr() as *mut _;
-+    msg.msg_namelen = name.len();
-+}
-+pub(crate) fn set_msghdr_iov(msg: &mut msghdr, ptr: *mut iovec, len: usize) {
-+    msg.msg_iov = ptr;
-+    msg.msg_iovlen = min(len, IovLen::MAX) as IovLen;
-+}
-+pub(crate) fn set_msghdr_control(msg: &mut msghdr, ptr: *mut c_void, len: usize) {
-+    msg.msg_control = ptr;
-+    msg.msg_controllen = len as _;
-+}
-+pub(crate) fn set_msghdr_flags(msg: &mut msghdr, flags: c_int) {
-+    msg.msg_flags = flags;
-+}
-+pub(crate) fn msghdr_flags(msg: &msghdr) -> RecvFlags {
-+    RecvFlags(msg.msg_flags)
-+}
-+pub(crate) fn msghdr_control_len(msg: &msghdr) -> usize {
-+    msg.msg_controllen as _
-+}
-+
-+// ---------------------------------------------------------------------------
-+// fd ownership glue (Inner = std::net::TcpStream)
-+// ---------------------------------------------------------------------------
-+
-+pub(crate) unsafe fn socket_from_raw(socket: Socket) -> crate::socket::Inner {
-+    unsafe { crate::socket::Inner::from_raw_fd(socket) }
-+}
-+pub(crate) fn socket_as_raw(socket: &crate::socket::Inner) -> Socket {
-+    socket.as_raw_fd()
-+}
-+pub(crate) fn socket_into_raw(socket: crate::socket::Inner) -> Socket {
-+    socket.into_raw_fd()
-+}
-+
-+// ---------------------------------------------------------------------------
-+// Core operations
-+// ---------------------------------------------------------------------------
-+
-+pub(crate) fn socket(family: c_int, ty: c_int, protocol: c_int) -> io::Result<Socket> {
-+    let fd = cvt(unsafe { sys3(NR_SOCKET, family as usize, ty as usize, protocol as usize) })?;
-+    Ok(fd as Socket)
-+}
-+
-+pub(crate) fn bind(fd: Socket, addr: &SockAddr) -> io::Result<()> {
-+    cvt(unsafe { sys3(NR_BIND, fd as usize, addr.as_ptr() as usize, addr.len() as usize) })?;
-+    Ok(())
-+}
-+
-+pub(crate) fn connect(fd: Socket, addr: &SockAddr) -> io::Result<()> {
-+    cvt(unsafe { sys3(NR_CONNECT, fd as usize, addr.as_ptr() as usize, addr.len() as usize) })?;
-+    Ok(())
-+}
-+
-+pub(crate) fn poll_connect(socket: &crate::Socket, timeout: Duration) -> io::Result<()> {
-+    let start = Instant::now();
-+    let mut pollfd = pollfd { fd: socket.as_raw(), events: POLLIN | POLLOUT, revents: 0 };
-+    loop {
-+        let elapsed = start.elapsed();
-+        if elapsed >= timeout {
-+            return Err(io::ErrorKind::TimedOut.into());
-+        }
-+        let to = (timeout - elapsed).as_millis().clamp(1, c_int::MAX as u128) as c_int;
-+        match cvt(unsafe { sys3(NR_POLL, ptr::addr_of_mut!(pollfd) as usize, 1, to as usize) }) {
-+            Ok(0) => return Err(io::ErrorKind::TimedOut.into()),
-+            Ok(_) => {
-+                if (pollfd.revents & POLLHUP) != 0 || (pollfd.revents & POLLERR) != 0 {
-+                    match socket.take_error() {
-+                        Ok(Some(err)) | Err(err) => return Err(err),
-+                        Ok(None) => {
-+                            return Err(io::Error::new(
-+                                io::ErrorKind::Other,
-+                                "no error set after POLLHUP",
-+                            ))
-+                        }
-+                    }
-+                }
-+                return Ok(());
-+            }
-+            Err(ref err) if err.kind() == io::ErrorKind::Interrupted => continue,
-+            Err(err) => return Err(err),
-+        }
-+    }
-+}
-+
-+pub(crate) fn listen(fd: Socket, backlog: c_int) -> io::Result<()> {
-+    cvt(unsafe { sys2(NR_LISTEN, fd as usize, backlog as usize) })?;
-+    Ok(())
-+}
-+
-+pub(crate) fn accept(fd: Socket) -> io::Result<(Socket, SockAddr)> {
-+    // `accept4` with `SOCK_CLOEXEC` avoids leaking the fd across `exec`.
-+    unsafe {
-+        SockAddr::try_init(|storage, len| {
-+            let s = cvt(sys4(
-+                NR_ACCEPT4,
-+                fd as usize,
-+                storage as usize,
-+                len as usize,
-+                SOCK_CLOEXEC as usize,
-+            ))?;
-+            Ok(s as Socket)
-+        })
-+    }
-+}
-+
-+pub(crate) fn getsockname(fd: Socket) -> io::Result<SockAddr> {
-+    unsafe {
-+        SockAddr::try_init(|storage, len| {
-+            cvt(sys3(NR_GETSOCKNAME, fd as usize, storage as usize, len as usize)).map(|_| ())
-+        })
-+    }
-+    .map(|(_, addr)| addr)
-+}
-+
-+pub(crate) fn getpeername(fd: Socket) -> io::Result<SockAddr> {
-+    unsafe {
-+        SockAddr::try_init(|storage, len| {
-+            cvt(sys3(NR_GETPEERNAME, fd as usize, storage as usize, len as usize)).map(|_| ())
-+        })
-+    }
-+    .map(|(_, addr)| addr)
-+}
-+
-+pub(crate) fn try_clone(fd: Socket) -> io::Result<Socket> {
-+    let n = cvt(unsafe { sys3(NR_FCNTL, fd as usize, F_DUPFD_CLOEXEC as usize, 0) })?;
-+    Ok(n as Socket)
-+}
-+
-+pub(crate) fn set_nonblocking(fd: Socket, nonblocking: bool) -> io::Result<()> {
-+    let flags = cvt(unsafe { sys3(NR_FCNTL, fd as usize, F_GETFL as usize, 0) })? as c_int;
-+    let new = if nonblocking { flags | O_NONBLOCK } else { flags & !O_NONBLOCK };
-+    if new != flags {
-+        cvt(unsafe { sys3(NR_FCNTL, fd as usize, F_SETFL as usize, new as usize) })?;
-+    }
-+    Ok(())
-+}
-+
-+pub(crate) fn shutdown(fd: Socket, how: Shutdown) -> io::Result<()> {
-+    let how = match how {
-+        Shutdown::Write => SHUT_WR,
-+        Shutdown::Read => SHUT_RD,
-+        Shutdown::Both => SHUT_RDWR,
-+    };
-+    cvt(unsafe { sys2(NR_SHUTDOWN, fd as usize, how as usize) })?;
-+    Ok(())
-+}
-+
-+pub(crate) fn recv(fd: Socket, buf: &mut [MaybeUninit<u8>], flags: c_int) -> io::Result<usize> {
-+    // No `recv` syscall on x86_64 Linux; `recvfrom` with a null address is it.
-+    let n = cvt(unsafe {
-+        sys6(
-+            NR_RECVFROM,
-+            fd as usize,
-+            buf.as_mut_ptr() as usize,
-+            min(buf.len(), MAX_BUF_LEN),
-+            flags as usize,
-+            0,
-+            0,
-+        )
-+    })?;
-+    Ok(n as usize)
-+}
-+
-+pub(crate) fn recv_from(
-+    fd: Socket,
-+    buf: &mut [MaybeUninit<u8>],
++    addr: *mut sockaddr,
++    len: *mut socklen_t,
 +    flags: c_int,
-+) -> io::Result<(usize, SockAddr)> {
++) -> c_int {
 +    unsafe {
-+        SockAddr::try_init(|addr, addrlen| {
-+            let n = cvt(sys6(
-+                NR_RECVFROM,
-+                fd as usize,
-+                buf.as_mut_ptr() as usize,
-+                min(buf.len(), MAX_BUF_LEN),
-+                flags as usize,
-+                addr as usize,
-+                addrlen as usize,
-+            ))?;
-+            Ok(n as usize)
-+        })
++        sc(nr::ACCEPT4, fd as usize, addr as usize, len as usize, flags as usize, 0, 0) as c_int
 +    }
 +}
-+
-+pub(crate) fn peek_sender(fd: Socket) -> io::Result<SockAddr> {
-+    let (_, sender) = recv_from(fd, &mut [MaybeUninit::uninit(); 8], MSG_PEEK)?;
-+    Ok(sender)
++pub(crate) unsafe fn getsockname(fd: c_int, addr: *mut sockaddr, len: *mut socklen_t) -> c_int {
++    unsafe { sc(nr::GETSOCKNAME, fd as usize, addr as usize, len as usize, 0, 0, 0) as c_int }
 +}
-+
-+pub(crate) fn recv_vectored(
-+    fd: Socket,
-+    bufs: &mut [crate::MaybeUninitSlice<'_>],
-+    flags: c_int,
-+) -> io::Result<(usize, RecvFlags)> {
-+    let mut msg = MsgHdrMut::new().with_buffers(bufs);
-+    let n = recvmsg(fd, &mut msg, flags)?;
-+    Ok((n, msg.flags()))
++pub(crate) unsafe fn getpeername(fd: c_int, addr: *mut sockaddr, len: *mut socklen_t) -> c_int {
++    unsafe { sc(nr::GETPEERNAME, fd as usize, addr as usize, len as usize, 0, 0, 0) as c_int }
 +}
-+
-+pub(crate) fn recv_from_vectored(
-+    fd: Socket,
-+    bufs: &mut [crate::MaybeUninitSlice<'_>],
-+    flags: c_int,
-+) -> io::Result<(usize, RecvFlags, SockAddr)> {
-+    let mut msg = MsgHdrMut::new().with_buffers(bufs);
-+    let (n, addr) = unsafe {
-+        SockAddr::try_init(|storage, len| {
-+            msg.inner.msg_name = storage.cast();
-+            msg.inner.msg_namelen = *len;
-+            let n = recvmsg(fd, &mut msg, flags)?;
-+            *len = msg.inner.msg_namelen;
-+            Ok(n)
-+        })?
-+    };
-+    Ok((n, msg.flags(), addr))
++pub(crate) unsafe fn shutdown(fd: c_int, how: c_int) -> c_int {
++    unsafe { sc(nr::SHUTDOWN, fd as usize, how as usize, 0, 0, 0, 0) as c_int }
 +}
-+
-+pub(crate) fn recvmsg(
-+    fd: Socket,
-+    msg: &mut MsgHdrMut<'_, '_, '_>,
-+    flags: c_int,
-+) -> io::Result<usize> {
-+    let n = cvt(unsafe {
-+        sys3(NR_RECVMSG, fd as usize, ptr::addr_of_mut!(msg.inner) as usize, flags as usize)
-+    })?;
-+    Ok(n as usize)
-+}
-+
-+pub(crate) fn send(fd: Socket, buf: &[u8], flags: c_int) -> io::Result<usize> {
-+    let n = cvt(unsafe {
-+        sys6(
-+            NR_SENDTO,
-+            fd as usize,
-+            buf.as_ptr() as usize,
-+            min(buf.len(), MAX_BUF_LEN),
-+            flags as usize,
-+            0,
-+            0,
-+        )
-+    })?;
-+    Ok(n as usize)
-+}
-+
-+pub(crate) fn send_vectored(fd: Socket, bufs: &[IoSlice<'_>], flags: c_int) -> io::Result<usize> {
-+    let msg = MsgHdr::new().with_buffers(bufs);
-+    sendmsg(fd, &msg, flags)
-+}
-+
-+pub(crate) fn send_to(fd: Socket, buf: &[u8], addr: &SockAddr, flags: c_int) -> io::Result<usize> {
-+    let n = cvt(unsafe {
-+        sys6(
-+            NR_SENDTO,
-+            fd as usize,
-+            buf.as_ptr() as usize,
-+            min(buf.len(), MAX_BUF_LEN),
-+            flags as usize,
-+            addr.as_ptr() as usize,
-+            addr.len() as usize,
-+        )
-+    })?;
-+    Ok(n as usize)
-+}
-+
-+pub(crate) fn send_to_vectored(
-+    fd: Socket,
-+    bufs: &[IoSlice<'_>],
-+    addr: &SockAddr,
-+    flags: c_int,
-+) -> io::Result<usize> {
-+    let msg = MsgHdr::new().with_addr(addr).with_buffers(bufs);
-+    sendmsg(fd, &msg, flags)
-+}
-+
-+pub(crate) fn sendmsg(fd: Socket, msg: &MsgHdr<'_, '_, '_>, flags: c_int) -> io::Result<usize> {
-+    let n = cvt(unsafe {
-+        sys3(NR_SENDMSG, fd as usize, ptr::addr_of!(msg.inner) as usize, flags as usize)
-+    })?;
-+    Ok(n as usize)
-+}
-+
-+// ---------------------------------------------------------------------------
-+// Socket options
-+// ---------------------------------------------------------------------------
-+
-+/// Caller must ensure `T` is the correct type for `opt`/`val`.
-+pub(crate) unsafe fn getsockopt<T>(fd: Socket, opt: c_int, val: c_int) -> io::Result<T> {
-+    let mut payload: MaybeUninit<T> = MaybeUninit::uninit();
-+    let mut len = size_of::<T>() as socklen_t;
-+    cvt(unsafe {
-+        sys5(
-+            NR_GETSOCKOPT,
-+            fd as usize,
-+            opt as usize,
-+            val as usize,
-+            payload.as_mut_ptr() as usize,
-+            ptr::addr_of_mut!(len) as usize,
-+        )
-+    })?;
-+    debug_assert_eq!(len as usize, size_of::<T>());
-+    Ok(unsafe { payload.assume_init() })
-+}
-+
-+/// Caller must ensure `T` is the correct type for `opt`/`val`.
-+pub(crate) unsafe fn setsockopt<T>(fd: Socket, opt: c_int, val: c_int, payload: T) -> io::Result<()> {
-+    cvt(unsafe {
-+        sys5(
-+            NR_SETSOCKOPT,
-+            fd as usize,
-+            opt as usize,
-+            val as usize,
-+            ptr::addr_of!(payload) as usize,
-+            size_of::<T>(),
-+        )
-+    })?;
-+    Ok(())
-+}
-+
-+pub(crate) fn timeout_opt(fd: Socket, opt: c_int, val: c_int) -> io::Result<Option<Duration>> {
-+    unsafe { getsockopt(fd, opt, val).map(from_timeval) }
-+}
-+
-+pub(crate) fn set_timeout_opt(
-+    fd: Socket,
-+    opt: c_int,
-+    val: c_int,
-+    duration: Option<Duration>,
-+) -> io::Result<()> {
-+    let duration = into_timeval(duration);
-+    unsafe { setsockopt(fd, opt, val, duration) }
-+}
-+
-+const fn from_timeval(duration: timeval) -> Option<Duration> {
-+    if duration.tv_sec == 0 && duration.tv_usec == 0 {
-+        None
-+    } else {
-+        Some(Duration::new(duration.tv_sec as u64, (duration.tv_usec as u32) * 1000))
-+    }
-+}
-+
-+fn into_timeval(duration: Option<Duration>) -> timeval {
-+    match duration {
-+        Some(duration) => timeval {
-+            tv_sec: min(duration.as_secs(), time_t::MAX as u64) as time_t,
-+            tv_usec: duration.subsec_micros() as suseconds_t,
-+        },
-+        None => timeval { tv_sec: 0, tv_usec: 0 },
-+    }
-+}
-+
-+fn into_secs(duration: Duration) -> c_int {
-+    min(duration.as_secs(), c_int::MAX as u64) as c_int
-+}
-+
-+pub(crate) fn set_tcp_keepalive(fd: Socket, keepalive: &TcpKeepalive) -> io::Result<()> {
-+    if let Some(time) = keepalive.time {
-+        let secs = into_secs(time);
-+        unsafe { setsockopt(fd, IPPROTO_TCP, KEEPALIVE_TIME, secs)? }
-+    }
-+    if let Some(interval) = keepalive.interval {
-+        let secs = into_secs(interval);
-+        unsafe { setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, secs)? }
-+    }
-+    if let Some(retries) = keepalive.retries {
-+        unsafe { setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, retries as c_int)? }
-+    }
-+    Ok(())
-+}
-+
-+pub(crate) fn nonblocking(fd: Socket) -> io::Result<bool> {
-+    let flags = cvt(unsafe { sys3(NR_FCNTL, fd as usize, F_GETFL as usize, 0) })? as c_int;
-+    Ok((flags & O_NONBLOCK) != 0)
-+}
-+
-+pub(crate) fn keepalive_time(fd: Socket) -> io::Result<Duration> {
++pub(crate) unsafe fn getsockopt(
++    fd: c_int,
++    level: c_int,
++    name: c_int,
++    val: *mut c_void,
++    len: *mut socklen_t,
++) -> c_int {
 +    unsafe {
-+        getsockopt::<c_int>(fd, IPPROTO_TCP, KEEPALIVE_TIME).map(|secs| Duration::from_secs(secs as u64))
++        sc(nr::GETSOCKOPT, fd as usize, level as usize, name as usize, val as usize, len as usize, 0)
++            as c_int
 +    }
 +}
-+
-+pub(crate) fn socketpair(family: c_int, ty: c_int, protocol: c_int) -> io::Result<[Socket; 2]> {
-+    let mut fds = [0 as Socket; 2];
-+    cvt(unsafe {
-+        sys4(
-+            NR_SOCKETPAIR,
-+            family as usize,
-+            ty as usize,
-+            protocol as usize,
-+            fds.as_mut_ptr() as usize,
-+        )
-+    })?;
-+    Ok(fds)
-+}
-+
-+// ---------------------------------------------------------------------------
-+// Address conversions
-+// ---------------------------------------------------------------------------
-+
-+pub(crate) const fn to_in_addr(addr: &Ipv4Addr) -> in_addr {
-+    in_addr { s_addr: u32::from_ne_bytes(addr.octets()) }
-+}
-+pub(crate) fn from_in_addr(in_addr: in_addr) -> Ipv4Addr {
-+    Ipv4Addr::from(in_addr.s_addr.to_ne_bytes())
-+}
-+pub(crate) const fn to_in6_addr(addr: &Ipv6Addr) -> in6_addr {
-+    in6_addr { s6_addr: addr.octets() }
-+}
-+pub(crate) fn from_in6_addr(addr: in6_addr) -> Ipv6Addr {
-+    Ipv6Addr::from(addr.s6_addr)
-+}
-+
-+// ---------------------------------------------------------------------------
-+// Unix-domain addresses (AF_UNIX). `sun_path` sits right after the 2-byte
-+// `sun_family` on Linux, so its offset is a constant 2.
-+// ---------------------------------------------------------------------------
-+
-+pub(crate) fn offset_of_path(storage: &sockaddr_un) -> usize {
-+    let base = storage as *const _ as usize;
-+    (ptr::addr_of!(storage.sun_path) as usize) - base
-+}
-+
-+pub(crate) fn unix_sockaddr(path: &Path) -> io::Result<SockAddr> {
-+    // SAFETY: an all-zero `sockaddr_storage` is a valid (empty) address.
-+    let mut storage = unsafe { mem::zeroed::<sockaddr_storage>() };
-+    let len = {
-+        let storage = unsafe { &mut *ptr::addr_of_mut!(storage).cast::<sockaddr_un>() };
-+        let bytes = path.as_os_str().as_bytes();
-+        let too_long = match bytes.first() {
-+            None => false,
-+            // Linux abstract namespaces (leading NUL) aren't NUL-terminated.
-+            Some(&0) => bytes.len() > storage.sun_path.len(),
-+            Some(_) => bytes.len() >= storage.sun_path.len(),
-+        };
-+        if too_long {
-+            return Err(io::Error::new(
-+                io::ErrorKind::InvalidInput,
-+                "path must be shorter than SUN_LEN",
-+            ));
-+        }
-+        storage.sun_family = AF_UNIX as sa_family_t;
-+        // SAFETY: non-overlapping; storage is zeroed so a pathname stays
-+        // NUL-terminated.
-+        unsafe {
-+            ptr::copy_nonoverlapping(
-+                bytes.as_ptr(),
-+                storage.sun_path.as_mut_ptr().cast(),
-+                bytes.len(),
-+            );
-+        }
-+        offset_of_path(storage)
-+            + bytes.len()
-+            + match bytes.first() {
-+                Some(&0) | None => 0,
-+                Some(_) => 1,
-+            }
-+    };
-+    Ok(unsafe { SockAddr::new(storage, len as socklen_t) })
-+}
-+
-+pub(crate) const fn to_mreqn(
-+    multiaddr: &Ipv4Addr,
-+    interface: &crate::socket::InterfaceIndexOrAddress,
-+) -> ip_mreqn {
-+    match interface {
-+        crate::socket::InterfaceIndexOrAddress::Index(interface) => ip_mreqn {
-+            imr_multiaddr: to_in_addr(multiaddr),
-+            imr_address: to_in_addr(&Ipv4Addr::UNSPECIFIED),
-+            imr_ifindex: *interface as _,
-+        },
-+        crate::socket::InterfaceIndexOrAddress::Address(interface) => ip_mreqn {
-+            imr_multiaddr: to_in_addr(multiaddr),
-+            imr_address: to_in_addr(interface),
-+            imr_ifindex: 0,
-+        },
++pub(crate) unsafe fn setsockopt(
++    fd: c_int,
++    level: c_int,
++    name: c_int,
++    val: *const c_void,
++    len: socklen_t,
++) -> c_int {
++    unsafe {
++        sc(nr::SETSOCKOPT, fd as usize, level as usize, name as usize, val as usize, len as usize, 0)
++            as c_int
 +    }
 +}
++pub(crate) unsafe fn recv(fd: c_int, buf: *mut c_void, len: size_t, flags: c_int) -> ssize_t {
++    unsafe { recvfrom(fd, buf, len, flags, core::ptr::null_mut(), core::ptr::null_mut()) }
++}
++pub(crate) unsafe fn recvfrom(
++    fd: c_int,
++    buf: *mut c_void,
++    len: size_t,
++    flags: c_int,
++    addr: *mut sockaddr,
++    addrlen: *mut socklen_t,
++) -> ssize_t {
++    unsafe {
++        sc(nr::RECVFROM, fd as usize, buf as usize, len, flags as usize, addr as usize, addrlen as usize)
++    }
++}
++pub(crate) unsafe fn send(fd: c_int, buf: *const c_void, len: size_t, flags: c_int) -> ssize_t {
++    unsafe { sendto(fd, buf, len, flags, core::ptr::null(), 0) }
++}
++pub(crate) unsafe fn sendto(
++    fd: c_int,
++    buf: *const c_void,
++    len: size_t,
++    flags: c_int,
++    addr: *const sockaddr,
++    addrlen: socklen_t,
++) -> ssize_t {
++    unsafe {
++        sc(nr::SENDTO, fd as usize, buf as usize, len, flags as usize, addr as usize, addrlen as usize)
++    }
++}
++pub(crate) unsafe fn recvmsg(fd: c_int, msg: *mut msghdr, flags: c_int) -> ssize_t {
++    unsafe { sc(nr::RECVMSG, fd as usize, msg as usize, flags as usize, 0, 0, 0) }
++}
++pub(crate) unsafe fn sendmsg(fd: c_int, msg: *const msghdr, flags: c_int) -> ssize_t {
++    unsafe { sc(nr::SENDMSG, fd as usize, msg as usize, flags as usize, 0, 0, 0) }
++}
++pub(crate) unsafe fn poll(fds: *mut pollfd, nfds: nfds_t, timeout: c_int) -> c_int {
++    unsafe { sc(nr::POLL, fds as usize, nfds as usize, timeout as usize, 0, 0, 0) as c_int }
++}
++/// `fcntl(fd, cmd[, arg])`: C-variadic in libc; the fullrust `syscall!` arm
++/// passes `0` for the two-argument form (the kernel ignores it).
++pub(crate) unsafe fn fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int {
++    unsafe { sc(nr::FCNTL, fd as usize, cmd as usize, arg as usize, 0, 0, 0) as c_int }
++}
++pub(crate) unsafe fn sendfile(out_fd: c_int, in_fd: c_int, offset: *mut off_t, count: size_t) -> ssize_t {
++    unsafe { sc(nr::SENDFILE, out_fd as usize, in_fd as usize, offset as usize, count, 0, 0) }
++}
 +
 +// ---------------------------------------------------------------------------
-+// Platform methods socket2 defines in its `sys/unix.rs` `impl Socket` block.
-+// fullrust uses this file instead of unix.rs, so the ones we support live here.
++// fullrust-only extension: SO_PEERCRED.
 +// ---------------------------------------------------------------------------
++
++/// Credentials of the peer process of a connected `AF_UNIX` socket, as read
++/// with `SO_PEERCRED` (shape follows std's `std::os::unix::net::UCred`).
++///
++/// **fullrust extension** — upstream socket2 has no `peer_cred`; on Linux
++/// callers use `libc::getsockopt(.., SO_PEERCRED, ..)`, which is unavailable
++/// without libc.
++#[cfg(feature = "all")]
++#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
++pub struct UCred {
++    /// The user ID of the peer process.
++    pub uid: u32,
++    /// The group ID of the peer process.
++    pub gid: u32,
++    /// The process ID of the peer process (always `Some` on Linux, as in std).
++    pub pid: Option<i32>,
++}
 +
 +#[cfg(feature = "all")]
 +impl crate::Socket {
-+    /// Copies data between a `file` and this socket using the `sendfile(2)`
-+    /// syscall (zero-copy), starting at `offset` in the file. `length` bounds
-+    /// the number of bytes; `None` sends as many as the kernel allows in one
-+    /// call. Returns the number of bytes sent.
-+    pub fn sendfile<F>(
-+        &self,
-+        file: &F,
-+        offset: usize,
-+        length: Option<NonZeroUsize>,
-+    ) -> io::Result<usize>
-+    where
-+        F: AsRawFd,
-+    {
-+        // Linux `sendfile(out_fd, in_fd, offset*, count)`. A null offset would
-+        // advance the file's own position; we pass a mutable one like socket2.
-+        let count = match length {
-+            Some(n) => n.get(),
-+            // The most the Linux kernel writes in a single call.
-+            None => 0x7fff_f000,
-+        };
-+        let mut offset = offset as i64; // loff_t
-+        let n = cvt(unsafe {
-+            sys4(
-+                NR_SENDFILE,
-+                self.as_raw() as usize,
-+                file.as_raw_fd() as usize,
-+                ptr::addr_of_mut!(offset) as usize,
-+                count,
++    /// Get the credentials of the peer process (`SO_PEERCRED`).
++    ///
++    /// **fullrust extension** (not part of upstream socket2's API). Valid on
++    /// connected `AF_UNIX` stream/seqpacket sockets, including both ends of
++    /// [`Socket::pair`](crate::Socket::pair).
++    pub fn peer_cred(&self) -> std::io::Result<UCred> {
++        use std::os::fd::AsRawFd;
++        let mut cred = ucred { pid: 0, uid: 0, gid: 0 };
++        let mut len = size_of::<ucred>() as socklen_t;
++        let r = unsafe {
++            getsockopt(
++                self.as_raw_fd(),
++                SOL_SOCKET,
++                SO_PEERCRED,
++                (&mut cred as *mut ucred).cast(),
++                &mut len,
 +            )
-+        })?;
-+        Ok(n as usize)
++        };
++        if r < 0 {
++            return Err(std::io::Error::from_raw_os_error(-r));
++        }
++        debug_assert_eq!(len as usize, size_of::<ucred>());
++        Ok(UCred {
++            uid: cred.uid,
++            gid: cred.gid,
++            pid: Some(cred.pid),
++        })
 +    }
 +}
 +
 +// ---------------------------------------------------------------------------
-+// `std::os::fd` interop for `crate::Socket`
++// Layout checks: size/alignment of each struct as reported by the real
++// `libc` crate on x86_64-unknown-linux-gnu.
 +// ---------------------------------------------------------------------------
 +
-+impl AsFd for crate::Socket {
-+    fn as_fd(&self) -> BorrowedFd<'_> {
-+        unsafe { BorrowedFd::borrow_raw(self.as_raw()) }
-+    }
++const _: () = assert!(size_of::<in6_addr>() == 16 && align_of::<in6_addr>() == 4);
++const _: () = assert!(size_of::<in_addr>() == 4 && align_of::<in_addr>() == 4);
++const _: () = assert!(size_of::<iovec>() == 16 && align_of::<iovec>() == 8);
++const _: () = assert!(size_of::<ip_mreq>() == 8 && align_of::<ip_mreq>() == 4);
++const _: () = assert!(size_of::<ip_mreq_source>() == 12 && align_of::<ip_mreq_source>() == 4);
++const _: () = assert!(size_of::<ip_mreqn>() == 12 && align_of::<ip_mreqn>() == 4);
++const _: () = assert!(size_of::<ipv6_mreq>() == 20 && align_of::<ipv6_mreq>() == 4);
++const _: () = assert!(size_of::<linger>() == 8 && align_of::<linger>() == 4);
++const _: () = assert!(size_of::<msghdr>() == 56 && align_of::<msghdr>() == 8);
++const _: () = assert!(size_of::<pollfd>() == 8 && align_of::<pollfd>() == 4);
++const _: () = assert!(size_of::<sock_filter>() == 8 && align_of::<sock_filter>() == 4);
++const _: () = assert!(size_of::<sock_fprog>() == 16 && align_of::<sock_fprog>() == 8);
++const _: () = assert!(size_of::<sockaddr>() == 16 && align_of::<sockaddr>() == 2);
++const _: () = assert!(size_of::<sockaddr_in>() == 16 && align_of::<sockaddr_in>() == 4);
++const _: () = assert!(size_of::<sockaddr_in6>() == 28 && align_of::<sockaddr_in6>() == 4);
++const _: () = assert!(size_of::<sockaddr_storage>() == 128 && align_of::<sockaddr_storage>() == 8);
++const _: () = assert!(size_of::<sockaddr_un>() == 110 && align_of::<sockaddr_un>() == 2);
++const _: () = assert!(size_of::<sockaddr_vm>() == 16 && align_of::<sockaddr_vm>() == 4);
++const _: () = assert!(size_of::<timeval>() == 16 && align_of::<timeval>() == 8);
++const _: () = assert!(size_of::<ucred>() == 12 && align_of::<ucred>() == 4);
++
++// ---------------------------------------------------------------------------
++// Constants (generated from libc 0.2.189, x86_64-unknown-linux-gnu).
++// ---------------------------------------------------------------------------
++
++pub const AF_INET: c_int = 2;
++pub const AF_INET6: c_int = 10;
++pub const AF_PACKET: c_int = 17;
++pub const AF_UNIX: c_int = 1;
++pub const AF_UNSPEC: c_int = 0;
++pub const AF_VSOCK: c_int = 40;
++pub const DCCP_SOCKOPT_AVAILABLE_CCIDS: c_int = 12;
++pub const DCCP_SOCKOPT_CCID: c_int = 13;
++pub const DCCP_SOCKOPT_GET_CUR_MPS: c_int = 5;
++pub const DCCP_SOCKOPT_QPOLICY_TXQLEN: c_int = 17;
++pub const DCCP_SOCKOPT_RECV_CSCOV: c_int = 11;
++pub const DCCP_SOCKOPT_RX_CCID: c_int = 15;
++pub const DCCP_SOCKOPT_SEND_CSCOV: c_int = 10;
++pub const DCCP_SOCKOPT_SERVER_TIMEWAIT: c_int = 6;
++pub const DCCP_SOCKOPT_SERVICE: c_int = 2;
++pub const DCCP_SOCKOPT_TX_CCID: c_int = 14;
++pub const EINPROGRESS: c_int = 115;
++pub const FD_CLOEXEC: c_int = 1;
++pub const F_DUPFD_CLOEXEC: c_int = 1030;
++pub const F_GETFD: c_int = 1;
++pub const F_GETFL: c_int = 3;
++pub const F_SETFD: c_int = 2;
++pub const F_SETFL: c_int = 4;
++pub const IFNAMSIZ: usize = 16;
++pub const IP6T_SO_ORIGINAL_DST: c_int = 80;
++pub const IPPROTO_DCCP: c_int = 33;
++pub const IPPROTO_ICMP: c_int = 1;
++pub const IPPROTO_ICMPV6: c_int = 58;
++pub const IPPROTO_IP: c_int = 0;
++pub const IPPROTO_IPV6: c_int = 41;
++pub const IPPROTO_MPTCP: c_int = 262;
++pub const IPPROTO_SCTP: c_int = 132;
++pub const IPPROTO_TCP: c_int = 6;
++pub const IPPROTO_UDP: c_int = 17;
++pub const IPPROTO_UDPLITE: c_int = 136;
++pub const IPV6_ADD_MEMBERSHIP: c_int = 20;
++pub const IPV6_DROP_MEMBERSHIP: c_int = 21;
++pub const IPV6_FREEBIND: c_int = 78;
++pub const IPV6_HDRINCL: c_int = 36;
++pub const IPV6_MULTICAST_ALL: c_int = 29;
++pub const IPV6_MULTICAST_HOPS: c_int = 18;
++pub const IPV6_MULTICAST_IF: c_int = 17;
++pub const IPV6_MULTICAST_LOOP: c_int = 19;
++pub const IPV6_RECVHOPLIMIT: c_int = 51;
++pub const IPV6_RECVTCLASS: c_int = 66;
++pub const IPV6_TCLASS: c_int = 67;
++pub const IPV6_TRANSPARENT: c_int = 75;
++pub const IPV6_UNICAST_HOPS: c_int = 16;
++pub const IPV6_V6ONLY: c_int = 26;
++pub const IP_ADD_MEMBERSHIP: c_int = 35;
++pub const IP_ADD_SOURCE_MEMBERSHIP: c_int = 39;
++pub const IP_DROP_MEMBERSHIP: c_int = 36;
++pub const IP_DROP_SOURCE_MEMBERSHIP: c_int = 40;
++pub const IP_FREEBIND: c_int = 15;
++pub const IP_HDRINCL: c_int = 3;
++pub const IP_MULTICAST_ALL: c_int = 49;
++pub const IP_MULTICAST_IF: c_int = 32;
++pub const IP_MULTICAST_LOOP: c_int = 34;
++pub const IP_MULTICAST_TTL: c_int = 33;
++pub const IP_RECVTOS: c_int = 13;
++pub const IP_TOS: c_int = 1;
++pub const IP_TRANSPARENT: c_int = 19;
++pub const IP_TTL: c_int = 2;
++pub const MSG_CONFIRM: c_int = 2048;
++pub const MSG_DONTROUTE: c_int = 4;
++pub const MSG_EOR: c_int = 128;
++pub const MSG_OOB: c_int = 1;
++pub const MSG_PEEK: c_int = 2;
++pub const MSG_TRUNC: c_int = 32;
++pub const O_NONBLOCK: c_int = 2048;
++pub const POLLERR: c_short = 8;
++pub const POLLHUP: c_short = 16;
++pub const POLLIN: c_short = 1;
++pub const POLLOUT: c_short = 4;
++pub const SHUT_RD: c_int = 0;
++pub const SHUT_RDWR: c_int = 2;
++pub const SHUT_WR: c_int = 1;
++pub const SOCK_CLOEXEC: c_int = 524288;
++pub const SOCK_DCCP: c_int = 6;
++pub const SOCK_DGRAM: c_int = 2;
++pub const SOCK_NONBLOCK: c_int = 2048;
++pub const SOCK_RAW: c_int = 3;
++pub const SOCK_RDM: c_int = 4;
++pub const SOCK_SEQPACKET: c_int = 5;
++pub const SOCK_STREAM: c_int = 1;
++pub const SOL_DCCP: c_int = 269;
++pub const SOL_IP: c_int = 0;
++pub const SOL_IPV6: c_int = 41;
++pub const SOL_SOCKET: c_int = 1;
++pub const SO_ACCEPTCONN: c_int = 30;
++pub const SO_ATTACH_FILTER: c_int = 26;
++pub const SO_BINDTODEVICE: c_int = 25;
++pub const SO_BINDTOIFINDEX: c_int = 62;
++pub const SO_BROADCAST: c_int = 6;
++pub const SO_BUSY_POLL: c_int = 46;
++pub const SO_COOKIE: c_int = 57;
++pub const SO_DETACH_FILTER: c_int = 27;
++pub const SO_DOMAIN: c_int = 39;
++pub const SO_ERROR: c_int = 4;
++pub const SO_INCOMING_CPU: c_int = 49;
++pub const SO_KEEPALIVE: c_int = 9;
++pub const SO_LINGER: c_int = 13;
++pub const SO_MARK: c_int = 36;
++pub const SO_OOBINLINE: c_int = 10;
++pub const SO_ORIGINAL_DST: c_int = 80;
++pub const SO_PASSCRED: c_int = 16;
++pub const SO_PRIORITY: c_int = 12;
++pub const SO_PROTOCOL: c_int = 38;
++pub const SO_RCVBUF: c_int = 8;
++pub const SO_RCVTIMEO: c_int = 20;
++pub const SO_REUSEADDR: c_int = 2;
++pub const SO_REUSEPORT: c_int = 15;
++pub const SO_SNDBUF: c_int = 7;
++pub const SO_SNDTIMEO: c_int = 21;
++pub const SO_TYPE: c_int = 3;
++pub const TCP_CONGESTION: c_int = 13;
++pub const TCP_CORK: c_int = 3;
++pub const TCP_KEEPCNT: c_int = 6;
++pub const TCP_KEEPIDLE: c_int = 4;
++pub const TCP_KEEPINTVL: c_int = 5;
++pub const TCP_MAXSEG: c_int = 2;
++pub const TCP_NODELAY: c_int = 1;
++pub const TCP_NOTSENT_LOWAT: c_int = 25;
++pub const TCP_QUICKACK: c_int = 12;
++pub const TCP_THIN_LINEAR_TIMEOUTS: c_int = 16;
++pub const TCP_USER_TIMEOUT: c_int = 18;
++pub const SO_PEERCRED: c_int = 17;
+--- a/src/sys/unix.rs
++++ b/src/sys/unix.rs
+@@ -35,14 +35,18 @@
+         target_os = "freebsd",
+         target_os = "ios",
+         target_os = "visionos",
+-        target_os = "linux",
++        any(target_os = "linux", target_os = "fullrust"),
+         target_os = "macos",
+         target_os = "tvos",
+         target_os = "watchos",
+     )
+ ))]
+ use std::num::NonZeroUsize;
++#[cfg(unix)]
+ use std::os::unix::ffi::OsStrExt;
++// fullrust: not `unix`, but std exposes the same OsStr byte view here.
++#[cfg(target_os = "fullrust")]
++use std::os::fullrust::ffi::OsStrExt;
+ #[cfg(all(
+     feature = "all",
+     any(
+@@ -51,21 +55,32 @@
+         target_os = "freebsd",
+         target_os = "ios",
+         target_os = "visionos",
+-        target_os = "linux",
++        any(target_os = "linux", target_os = "fullrust"),
+         target_os = "macos",
+         target_os = "tvos",
+         target_os = "watchos",
+     )
+ ))]
++#[cfg(unix)]
+ use std::os::unix::io::RawFd;
++#[cfg(all(feature = "all", target_os = "fullrust"))]
++use std::os::fd::RawFd;
++#[cfg(unix)]
+ use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
+-#[cfg(feature = "all")]
++#[cfg(target_os = "fullrust")]
++use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
++// fullrust std has no `std::os::unix::net` types to convert to/from.
++#[cfg(all(feature = "all", unix))]
+ use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
+ use std::path::Path;
+ use std::ptr;
+ use std::time::{Duration, Instant};
+ use std::{io, slice};
+ 
++// fullrust: no libc crate; a private raw-syscall shim with the same names.
++#[cfg(target_os = "fullrust")]
++use crate::libc;
++
+ #[cfg(not(any(
+     target_os = "ios",
+     target_os = "visionos",
+@@ -86,7 +101,7 @@
+ // Used in `Domain`.
+ pub(crate) use libc::{AF_INET, AF_INET6, AF_UNIX};
+ // Used in `Type`.
+-#[cfg(all(feature = "all", target_os = "linux"))]
++#[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+ pub(crate) use libc::SOCK_DCCP;
+ #[cfg(all(feature = "all", not(any(target_os = "redox", target_os = "espidf"))))]
+ pub(crate) use libc::SOCK_RAW;
+@@ -94,11 +109,11 @@
+ pub(crate) use libc::SOCK_SEQPACKET;
+ pub(crate) use libc::{SOCK_DGRAM, SOCK_STREAM};
+ // Used in `Protocol`.
+-#[cfg(all(feature = "all", target_os = "linux"))]
++#[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+ pub(crate) use libc::IPPROTO_DCCP;
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "fullrust"))]
+ pub(crate) use libc::IPPROTO_MPTCP;
+-#[cfg(all(feature = "all", any(target_os = "freebsd", target_os = "linux")))]
++#[cfg(all(feature = "all", any(target_os = "freebsd", any(target_os = "linux", target_os = "fullrust"))))]
+ pub(crate) use libc::IPPROTO_SCTP;
+ #[cfg(all(
+     feature = "all",
+@@ -106,7 +121,7 @@
+         target_os = "android",
+         target_os = "freebsd",
+         target_os = "fuchsia",
+-        target_os = "linux",
++        any(target_os = "linux", target_os = "fullrust"),
+     )
+ ))]
+ pub(crate) use libc::IPPROTO_UDPLITE;
+@@ -200,7 +215,7 @@
+     target_os = "watchos",
+ ))]
+ pub(crate) use libc::SO_LINGER_SEC as SO_LINGER;
+-#[cfg(any(target_os = "linux", target_os = "cygwin"))]
++#[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "cygwin"))]
+ pub(crate) use libc::SO_PASSCRED;
+ pub(crate) use libc::{
+     ip_mreq as IpMreq, linger, IPPROTO_IP, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, IPV6_MULTICAST_IF,
+@@ -267,7 +282,7 @@
+         target_os = "illumos",
+         target_os = "ios",
+         target_os = "visionos",
+-        target_os = "linux",
++        any(target_os = "linux", target_os = "fullrust"),
+         target_os = "macos",
+         target_os = "netbsd",
+         target_os = "tvos",
+@@ -303,6 +318,7 @@
+ use libc::TCP_KEEPIDLE as KEEPALIVE_TIME;
+ 
+ /// Helper macro to execute a system call that returns an `io::Result`.
++#[cfg(not(target_os = "fullrust"))]
+ macro_rules! syscall {
+     ($fn: ident ( $($arg: expr),* $(,)* ) ) => {{
+         #[allow(unused_unsafe)]
+@@ -315,6 +331,22 @@
+     }};
+ }
+ 
++/// fullrust: calls go to the private raw-syscall `libc` shim, which returns
++/// the kernel's `-errno` (there is no libc errno for `last_os_error` to read).
++#[cfg(target_os = "fullrust")]
++macro_rules! syscall {
++    (fcntl ( $fd: expr, $cmd: expr $(,)* ) ) => { syscall!(fcntl($fd, $cmd, 0)) };
++    ($fn: ident ( $($arg: expr),* $(,)* ) ) => {{
++        #[allow(unused_unsafe)]
++        let res = unsafe { libc::$fn($($arg, )*) };
++        if res < 0 {
++            Err(std::io::Error::from_raw_os_error(-(res as i32)))
++        } else {
++            Ok(res)
++        }
++    }};
 +}
-+impl AsRawFd for crate::Socket {
-+    fn as_raw_fd(&self) -> RawFd {
-+        self.as_raw()
-+    }
-+}
-+impl IntoRawFd for crate::Socket {
-+    fn into_raw_fd(self) -> RawFd {
-+        self.into_raw()
-+    }
-+}
-+impl FromRawFd for crate::Socket {
-+    unsafe fn from_raw_fd(fd: RawFd) -> crate::Socket {
-+        crate::Socket::from_raw(fd)
-+    }
-+}
-+impl From<crate::Socket> for OwnedFd {
-+    fn from(sock: crate::Socket) -> OwnedFd {
-+        unsafe { OwnedFd::from_raw_fd(sock.into_raw()) }
-+    }
-+}
-+impl From<OwnedFd> for crate::Socket {
-+    fn from(fd: OwnedFd) -> crate::Socket {
-+        unsafe { crate::Socket::from_raw_fd(fd.into_raw_fd()) }
-+    }
-+}
++
+ /// Maximum size of a buffer passed to system call like `recv` and `send`.
+ #[cfg(not(any(
+     target_os = "ios",
+@@ -345,14 +377,14 @@
+ const MAX_BUF_LEN: usize = c_int::MAX as usize - 1;
+ 
+ // TCP_CA_NAME_MAX isn't defined in user space include files(not in libc)
+-#[cfg(all(feature = "all", any(target_os = "freebsd", target_os = "linux")))]
++#[cfg(all(feature = "all", any(target_os = "freebsd", any(target_os = "linux", target_os = "fullrust"))))]
+ const TCP_CA_NAME_MAX: usize = 16;
+ 
+ #[cfg(any(
+     all(
+-        target_os = "linux",
++        any(target_os = "linux", target_os = "fullrust"),
+         any(
+-            target_env = "gnu",
++            any(target_env = "gnu", target_os = "fullrust"),
+             all(target_env = "uclibc", target_pointer_width = "64")
+         )
+     ),
+@@ -362,7 +394,7 @@
+ 
+ #[cfg(any(
+     all(
+-        target_os = "linux",
++        any(target_os = "linux", target_os = "fullrust"),
+         any(
+             target_env = "musl",
+             target_env = "ohos",
+@@ -396,7 +428,7 @@
+     /// Domain for low-level packet interface, corresponding to `AF_PACKET`.
+     #[cfg(all(
+         feature = "all",
+-        any(target_os = "android", target_os = "fuchsia", target_os = "linux")
++        any(target_os = "android", target_os = "fuchsia", any(target_os = "linux", target_os = "fullrust"))
+     ))]
+     #[cfg_attr(
+         docsrs,
+@@ -408,7 +440,7 @@
+     pub const PACKET: Domain = Domain(libc::AF_PACKET);
+ 
+     /// Domain for low-level VSOCK interface, corresponding to `AF_VSOCK`.
+-    #[cfg(all(feature = "all", any(target_os = "android", target_os = "linux")))]
++    #[cfg(all(feature = "all", any(target_os = "android", any(target_os = "linux", target_os = "fullrust"))))]
+     #[cfg_attr(
+         docsrs,
+         doc(cfg(all(feature = "all", any(target_os = "android", target_os = "linux"))))
+@@ -421,13 +453,13 @@
+     libc::AF_INET,
+     libc::AF_INET6,
+     libc::AF_UNIX,
+-    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
++    #[cfg(any(target_os = "android", target_os = "fuchsia", any(target_os = "linux", target_os = "fullrust")))]
+     #[cfg_attr(
+         docsrs,
+         doc(cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))
+     )]
+     libc::AF_PACKET,
+-    #[cfg(any(target_os = "android", target_os = "linux"))]
++    #[cfg(any(target_os = "android", any(target_os = "linux", target_os = "fullrust")))]
+     #[cfg_attr(docsrs, doc(cfg(any(target_os = "android", target_os = "linux"))))]
+     libc::AF_VSOCK,
+     libc::AF_UNSPEC, // = 0.
+@@ -444,7 +476,7 @@
+             target_os = "freebsd",
+             target_os = "fuchsia",
+             target_os = "illumos",
+-            target_os = "linux",
++            any(target_os = "linux", target_os = "fullrust"),
+             target_os = "netbsd",
+             target_os = "openbsd",
+             target_os = "cygwin",
+@@ -480,7 +512,7 @@
+             target_os = "fuchsia",
+             target_os = "hurd",
+             target_os = "illumos",
+-            target_os = "linux",
++            any(target_os = "linux", target_os = "fullrust"),
+             target_os = "netbsd",
+             target_os = "openbsd",
+             target_os = "redox",
+@@ -518,7 +550,7 @@
+         target_os = "fuchsia",
+         target_os = "hurd",
+         target_os = "illumos",
+-        target_os = "linux",
++        any(target_os = "linux", target_os = "fullrust"),
+         target_os = "netbsd",
+         target_os = "openbsd",
+         target_os = "redox",
+@@ -534,7 +566,7 @@
+     Type,
+     libc::SOCK_STREAM,
+     libc::SOCK_DGRAM,
+-    #[cfg(all(feature = "all", target_os = "linux"))]
++    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+     libc::SOCK_DCCP,
+     #[cfg(not(any(target_os = "redox", target_os = "espidf")))]
+     libc::SOCK_RAW,
+@@ -548,7 +580,7 @@
+         target_os = "dragonfly",
+         target_os = "freebsd",
+         target_os = "fuchsia",
+-        target_os = "linux",
++        any(target_os = "linux", target_os = "fullrust"),
+         target_os = "netbsd",
+         target_os = "openbsd"
+     ))]
+@@ -558,7 +590,7 @@
+         target_os = "dragonfly",
+         target_os = "freebsd",
+         target_os = "fuchsia",
+-        target_os = "linux",
++        any(target_os = "linux", target_os = "fullrust"),
+         target_os = "netbsd",
+         target_os = "openbsd"
+     ))]
+@@ -572,11 +604,11 @@
+     libc::IPPROTO_ICMPV6,
+     libc::IPPROTO_TCP,
+     libc::IPPROTO_UDP,
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "fullrust"))]
+     libc::IPPROTO_MPTCP,
+-    #[cfg(all(feature = "all", target_os = "linux"))]
++    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+     libc::IPPROTO_DCCP,
+-    #[cfg(all(feature = "all", any(target_os = "freebsd", target_os = "linux")))]
++    #[cfg(all(feature = "all", any(target_os = "freebsd", any(target_os = "linux", target_os = "fullrust"))))]
+     libc::IPPROTO_SCTP,
+     #[cfg(all(
+         feature = "all",
+@@ -584,7 +616,7 @@
+             target_os = "android",
+             target_os = "freebsd",
+             target_os = "fuchsia",
+-            target_os = "linux",
++            any(target_os = "linux", target_os = "fullrust"),
+         )
+     ))]
+     libc::IPPROTO_UDPLITE,
+@@ -626,7 +658,7 @@
+     /// 'transmission confirmation'.
+     ///
+     /// On Unix this corresponds to the `MSG_CONFIRM` flag.
+-    #[cfg(all(feature = "all", any(target_os = "android", target_os = "linux")))]
++    #[cfg(all(feature = "all", any(target_os = "android", any(target_os = "linux", target_os = "fullrust"))))]
+     #[cfg_attr(
+         docsrs,
+         doc(cfg(all(feature = "all", any(target_os = "android", target_os = "linux"))))
+@@ -643,7 +675,7 @@
+     /// On Unix this corresponds to the `MSG_DONTROUTE` flag.
+     #[cfg(all(
+         feature = "all",
+-        any(target_os = "android", target_os = "linux", target_os = "cygwin"),
++        any(target_os = "android", any(target_os = "linux", target_os = "fullrust"), target_os = "cygwin"),
+     ))]
+     #[cfg_attr(
+         docsrs,
+@@ -666,11 +698,11 @@
+         s.field("is_out_of_band", &self.is_out_of_band());
+         #[cfg(not(target_os = "espidf"))]
+         s.field("is_truncated", &self.is_truncated());
+-        #[cfg(all(feature = "all", any(target_os = "android", target_os = "linux")))]
++        #[cfg(all(feature = "all", any(target_os = "android", any(target_os = "linux", target_os = "fullrust"))))]
+         s.field("is_confirm", &self.is_confirm());
+         #[cfg(all(
+             feature = "all",
+-            any(target_os = "android", target_os = "linux", target_os = "cygwin"),
++            any(target_os = "android", any(target_os = "linux", target_os = "fullrust"), target_os = "cygwin"),
+         ))]
+         s.field("is_dontroute", &self.is_dontroute());
+         s.finish()
+@@ -806,7 +838,7 @@
+     /// This function can never fail. In a future version of this library it will be made
+     /// infallible.
+     #[allow(unsafe_op_in_unsafe_fn)]
+-    #[cfg(all(feature = "all", any(target_os = "android", target_os = "linux")))]
++    #[cfg(all(feature = "all", any(target_os = "android", any(target_os = "linux", target_os = "fullrust"))))]
+     #[cfg_attr(
+         docsrs,
+         doc(cfg(all(feature = "all", any(target_os = "android", target_os = "linux"))))
+@@ -826,7 +858,7 @@
+ 
+     /// Returns this address VSOCK CID/port if it is in the `AF_VSOCK` family,
+     /// otherwise return `None`.
+-    #[cfg(all(feature = "all", any(target_os = "android", target_os = "linux")))]
++    #[cfg(all(feature = "all", any(target_os = "android", any(target_os = "linux", target_os = "fullrust"))))]
+     #[cfg_attr(
+         docsrs,
+         doc(cfg(all(feature = "all", any(target_os = "android", target_os = "linux"))))
+@@ -851,7 +883,7 @@
+                     // Abstract addresses only exist on Linux.
+                     // NOTE: although Fuchsia does define `AF_UNIX` it's not actually implemented.
+                     // See https://github.com/rust-lang/socket2/pull/403#discussion_r1123557978
+-                    || (cfg!(not(any(target_os = "linux", target_os = "android", target_os = "cygwin")))
++                    || (cfg!(not(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android", target_os = "cygwin")))
+                     && storage.sun_path[0] == 0)
+             })
+             .unwrap_or_default()
+@@ -898,6 +930,7 @@
+ 
+     /// Returns this address as Unix `SocketAddr` if it is an `AF_UNIX` pathname
+     /// address, otherwise returns `None`.
++    #[cfg(unix)] // fullrust std has no `std::os::unix::net::SocketAddr`.
+     pub fn as_unix(&self) -> Option<std::os::unix::net::SocketAddr> {
+         let path = self.as_pathname()?;
+         // SAFETY: we can represent this as a valid pathname, then so can the
+@@ -924,14 +957,14 @@
+     pub fn as_abstract_namespace(&self) -> Option<&[u8]> {
+         // NOTE: although Fuchsia does define `AF_UNIX` it's not actually implemented.
+         // See https://github.com/rust-lang/socket2/pull/403#discussion_r1123557978
+-        #[cfg(any(target_os = "linux", target_os = "android", target_os = "cygwin"))]
++        #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android", target_os = "cygwin"))]
+         {
+             self.as_sockaddr_un().and_then(|storage| {
+                 (self.len() > offset_of_path(storage) as _ && storage.sun_path[0] == 0)
+                     .then(|| self.path_bytes(storage, true))
+             })
+         }
+-        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "cygwin")))]
++        #[cfg(not(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android", target_os = "cygwin")))]
+         None
+     }
+ }
+@@ -954,7 +987,7 @@
+     syscall!(socket(family, ty, protocol))
+ }
+ 
+-#[cfg(all(feature = "all", unix))]
++#[cfg(all(feature = "all", any(unix, target_os = "fullrust")))]
+ #[cfg_attr(docsrs, doc(cfg(all(feature = "all", unix))))]
+ pub(crate) fn socketpair(family: c_int, ty: c_int, protocol: c_int) -> io::Result<[Socket; 2]> {
+     let mut fds = [0, 0];
+@@ -1036,7 +1069,7 @@
+     syscall!(fcntl(fd, libc::F_DUPFD_CLOEXEC, 0))
+ }
+ 
+-#[cfg(all(feature = "all", unix, not(target_os = "vita")))]
++#[cfg(all(feature = "all", any(unix, target_os = "fullrust"), not(target_os = "vita")))]
+ pub(crate) fn nonblocking(fd: Socket) -> io::Result<bool> {
+     let file_status_flags = fcntl_get(fd, libc::F_GETFL)?;
+     Ok((file_status_flags & libc::O_NONBLOCK) != 0)
+@@ -1287,7 +1320,7 @@
+         target_os = "illumos",
+         target_os = "ios",
+         target_os = "visionos",
+-        target_os = "linux",
++        any(target_os = "linux", target_os = "fullrust"),
+         target_os = "macos",
+         target_os = "netbsd",
+         target_os = "tvos",
+@@ -1448,7 +1481,7 @@
+ 
+ #[cfg(all(
+     feature = "all",
+-    any(target_os = "android", target_os = "fuchsia", target_os = "linux")
++    any(target_os = "android", target_os = "fuchsia", any(target_os = "linux", target_os = "fullrust"))
+ ))]
+ pub(crate) fn original_dst(fd: Socket) -> io::Result<SockAddr> {
+     // Safety: `getsockopt` initialises the `SockAddr` for us.
+@@ -1470,7 +1503,7 @@
+ ///
+ /// This value contains the original destination IPv6 address of the connection
+ /// redirected using `ip6tables` `REDIRECT` or `TPROXY`.
+-#[cfg(all(feature = "all", any(target_os = "android", target_os = "linux")))]
++#[cfg(all(feature = "all", any(target_os = "android", any(target_os = "linux", target_os = "fullrust"))))]
+ pub(crate) fn original_dst_ipv6(fd: Socket) -> io::Result<SockAddr> {
+     // Safety: `getsockopt` initialises the `SockAddr` for us.
+     unsafe {
+@@ -1505,7 +1538,7 @@
+             target_os = "freebsd",
+             target_os = "fuchsia",
+             target_os = "illumos",
+-            target_os = "linux",
++            any(target_os = "linux", target_os = "fullrust"),
+             target_os = "netbsd",
+             target_os = "openbsd",
+             target_os = "cygwin",
+@@ -1537,7 +1570,7 @@
+         target_os = "freebsd",
+         target_os = "fuchsia",
+         target_os = "illumos",
+-        target_os = "linux",
++        any(target_os = "linux", target_os = "fullrust"),
+         target_os = "netbsd",
+         target_os = "openbsd",
+         target_os = "cygwin",
+@@ -1703,7 +1736,7 @@
+             target_os = "android",
+             target_os = "freebsd",
+             target_os = "fuchsia",
+-            target_os = "linux",
++            any(target_os = "linux", target_os = "fullrust"),
+             target_os = "cygwin",
+         )
+     ))]
+@@ -1736,7 +1769,7 @@
+             // TODO: add FreeBSD.
+             // target_os = "freebsd",
+             target_os = "fuchsia",
+-            target_os = "linux",
++            any(target_os = "linux", target_os = "fullrust"),
+         )
+     ))]
+     #[cfg_attr(docsrs, doc(cfg(all(
+@@ -1761,7 +1794,7 @@
+             target_os = "android",
+             target_os = "freebsd",
+             target_os = "fuchsia",
+-            target_os = "linux",
++            any(target_os = "linux", target_os = "fullrust"),
+         )
+     ))]
+     #[cfg_attr(
+@@ -1794,7 +1827,7 @@
+     /// On Linux this function requires the `CAP_NET_ADMIN` capability.
+     #[cfg(all(
+         feature = "all",
+-        any(target_os = "android", target_os = "fuchsia", target_os = "linux")
++        any(target_os = "android", target_os = "fuchsia", any(target_os = "linux", target_os = "fullrust"))
+     ))]
+     #[cfg_attr(
+         docsrs,
+@@ -1819,7 +1852,7 @@
+     /// On Linux this function requires the `CAP_NET_ADMIN` capability.
+     #[cfg(all(
+         feature = "all",
+-        any(target_os = "android", target_os = "fuchsia", target_os = "linux")
++        any(target_os = "android", target_os = "fuchsia", any(target_os = "linux", target_os = "fullrust"))
+     ))]
+     #[cfg_attr(
+         docsrs,
+@@ -1846,7 +1879,7 @@
+     /// [`set_cork`]: crate::Socket::set_cork
+     #[cfg(all(
+         feature = "all",
+-        any(target_os = "android", target_os = "fuchsia", target_os = "linux")
++        any(target_os = "android", target_os = "fuchsia", any(target_os = "linux", target_os = "fullrust"))
+     ))]
+     #[cfg_attr(
+         docsrs,
+@@ -1870,7 +1903,7 @@
+     /// then queued data is automatically transmitted.
+     #[cfg(all(
+         feature = "all",
+-        any(target_os = "android", target_os = "fuchsia", target_os = "linux")
++        any(target_os = "android", target_os = "fuchsia", any(target_os = "linux", target_os = "fullrust"))
+     ))]
+     #[cfg_attr(
+         docsrs,
+@@ -1900,7 +1933,7 @@
+         any(
+             target_os = "android",
+             target_os = "fuchsia",
+-            target_os = "linux",
++            any(target_os = "linux", target_os = "fullrust"),
+             target_os = "cygwin",
+         )
+     ))]
+@@ -1934,7 +1967,7 @@
+         any(
+             target_os = "android",
+             target_os = "fuchsia",
+-            target_os = "linux",
++            any(target_os = "linux", target_os = "fullrust"),
+             target_os = "cygwin",
+         )
+     ))]
+@@ -1968,7 +2001,7 @@
+     /// [`set_thin_linear_timeouts`]: crate::Socket::set_thin_linear_timeouts
+     #[cfg(all(
+         feature = "all",
+-        any(target_os = "android", target_os = "fuchsia", target_os = "linux")
++        any(target_os = "android", target_os = "fuchsia", any(target_os = "linux", target_os = "fullrust"))
+     ))]
+     #[cfg_attr(
+         docsrs,
+@@ -1995,7 +2028,7 @@
+     /// The kernel will modify the retransmission to avoid the very high latencies that thin stream suffer because of exponential backoff.
+     #[cfg(all(
+         feature = "all",
+-        any(target_os = "android", target_os = "fuchsia", target_os = "linux")
++        any(target_os = "android", target_os = "fuchsia", any(target_os = "linux", target_os = "fullrust"))
+     ))]
+     #[cfg_attr(
+         docsrs,
+@@ -2020,7 +2053,7 @@
+     /// This value gets the socket binded device's interface name.
+     #[cfg(all(
+         feature = "all",
+-        any(target_os = "android", target_os = "fuchsia", target_os = "linux")
++        any(target_os = "android", target_os = "fuchsia", any(target_os = "linux", target_os = "fullrust"))
+     ))]
+     #[cfg_attr(
+         docsrs,
+@@ -2059,7 +2092,7 @@
+     /// If `interface` is `None` or an empty string it removes the binding.
+     #[cfg(all(
+         feature = "all",
+-        any(target_os = "android", target_os = "fuchsia", target_os = "linux")
++        any(target_os = "android", target_os = "fuchsia", any(target_os = "linux", target_os = "fullrust"))
+     ))]
+     #[cfg_attr(
+         docsrs,
+@@ -2316,7 +2349,7 @@
+     /// For more information about this option, see [`set_cpu_affinity`].
+     ///
+     /// [`set_cpu_affinity`]: crate::Socket::set_cpu_affinity
+-    #[cfg(all(feature = "all", target_os = "linux"))]
++    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
+     pub fn cpu_affinity(&self) -> io::Result<usize> {
+         unsafe {
+@@ -2328,7 +2361,7 @@
+     /// Set value for the `SO_INCOMING_CPU` option on this socket.
+     ///
+     /// Sets the CPU affinity of the socket.
+-    #[cfg(all(feature = "all", target_os = "linux"))]
++    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
+     pub fn set_cpu_affinity(&self, cpu: usize) -> io::Result<()> {
+         unsafe {
+@@ -2429,7 +2462,7 @@
+     /// [`set_freebind`]: crate::Socket::set_freebind
+     #[cfg(all(
+         feature = "all",
+-        any(target_os = "android", target_os = "fuchsia", target_os = "linux")
++        any(target_os = "android", target_os = "fuchsia", any(target_os = "linux", target_os = "fullrust"))
+     ))]
+     #[cfg_attr(
+         docsrs,
+@@ -2454,7 +2487,7 @@
+     /// to bind to it.
+     #[cfg(all(
+         feature = "all",
+-        any(target_os = "android", target_os = "fuchsia", target_os = "linux")
++        any(target_os = "android", target_os = "fuchsia", any(target_os = "linux", target_os = "fullrust"))
+     ))]
+     #[cfg_attr(
+         docsrs,
+@@ -2481,7 +2514,7 @@
+     /// [`set_freebind`].
+     ///
+     /// [`set_freebind`]: crate::Socket::set_freebind
+-    #[cfg(all(feature = "all", any(target_os = "android", target_os = "linux")))]
++    #[cfg(all(feature = "all", any(target_os = "android", any(target_os = "linux", target_os = "fullrust"))))]
+     #[cfg_attr(
+         docsrs,
+         doc(cfg(all(feature = "all", any(target_os = "android", target_os = "linux"))))
+@@ -2523,7 +2556,7 @@
+     /// #     enable_freebind(&socket)
+     /// # }
+     /// ```
+-    #[cfg(all(feature = "all", any(target_os = "android", target_os = "linux")))]
++    #[cfg(all(feature = "all", any(target_os = "android", any(target_os = "linux", target_os = "fullrust"))))]
+     #[cfg_attr(
+         docsrs,
+         doc(cfg(all(feature = "all", any(target_os = "android", target_os = "linux"))))
+@@ -2566,7 +2599,7 @@
+             target_os = "freebsd",
+             target_os = "ios",
+             target_os = "visionos",
+-            target_os = "linux",
++            any(target_os = "linux", target_os = "fullrust"),
+             target_os = "macos",
+             target_os = "tvos",
+             target_os = "watchos",
+@@ -2635,7 +2668,7 @@
+         .map(|_| length as usize)
+     }
+ 
+-    #[cfg(all(feature = "all", any(target_os = "android", target_os = "linux")))]
++    #[cfg(all(feature = "all", any(target_os = "android", any(target_os = "linux", target_os = "fullrust"))))]
+     fn _sendfile(
+         &self,
+         file: RawFd,
+@@ -2722,7 +2755,7 @@
+         any(
+             target_os = "android",
+             target_os = "fuchsia",
+-            target_os = "linux",
++            any(target_os = "linux", target_os = "fullrust"),
+             target_os = "cygwin",
+         )
+     ))]
+@@ -2762,7 +2795,7 @@
+         any(
+             target_os = "android",
+             target_os = "fuchsia",
+-            target_os = "linux",
++            any(target_os = "linux", target_os = "fullrust"),
+             target_os = "cygwin",
+         )
+     ))]
+@@ -2797,7 +2830,7 @@
+     /// and allow or disallow certain types of data to come through the socket.
+     ///
+     /// For more information about this option, see [filter](https://www.kernel.org/doc/html/v5.12/networking/filter.html)
+-    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "android")))]
++    #[cfg(all(feature = "all", any(any(target_os = "linux", target_os = "fullrust"), target_os = "android")))]
+     pub fn attach_filter(&self, filters: &[libc::sock_filter]) -> io::Result<()> {
+         let prog = libc::sock_fprog {
+             len: filters.len() as u16,
+@@ -2819,7 +2852,7 @@
+     /// For more information about this option, see [`attach_filter`]
+     ///
+     /// [`attach_filter`]: crate::Socket::attach_filter
+-    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "android")))]
++    #[cfg(all(feature = "all", any(any(target_os = "linux", target_os = "fullrust"), target_os = "android")))]
+     pub fn detach_filter(&self) -> io::Result<()> {
+         unsafe { setsockopt(self.as_raw(), libc::SOL_SOCKET, libc::SO_DETACH_FILTER, 0) }
+     }
+@@ -2830,7 +2863,7 @@
+     /// Therefore, there is no corresponding `set` helper.
+     ///
+     /// For more information about this option, see [Linux patch](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=5daab9db7b65df87da26fd8cfa695fb9546a1ddb)
+-    #[cfg(all(feature = "all", target_os = "linux"))]
++    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
+     pub fn cookie(&self) -> io::Result<u64> {
+         unsafe { getsockopt::<libc::c_ulonglong>(self.as_raw(), libc::SOL_SOCKET, libc::SO_COOKIE) }
+@@ -2848,7 +2881,7 @@
+             target_os = "dragonfly",
+             target_os = "freebsd",
+             target_os = "fuchsia",
+-            target_os = "linux",
++            any(target_os = "linux", target_os = "fullrust"),
+             target_os = "macos",
+             target_os = "netbsd",
+             target_os = "openbsd",
+@@ -2889,7 +2922,7 @@
+             target_os = "dragonfly",
+             target_os = "freebsd",
+             target_os = "fuchsia",
+-            target_os = "linux",
++            any(target_os = "linux", target_os = "fullrust"),
+             target_os = "macos",
+             target_os = "netbsd",
+             target_os = "openbsd",
+@@ -2928,7 +2961,7 @@
+     /// For more information about this option, see [`set_tcp_congestion`].
+     ///
+     /// [`set_tcp_congestion`]: crate::Socket::set_tcp_congestion
+-    #[cfg(all(feature = "all", any(target_os = "freebsd", target_os = "linux")))]
++    #[cfg(all(feature = "all", any(target_os = "freebsd", any(target_os = "linux", target_os = "fullrust"))))]
+     #[cfg_attr(
+         docsrs,
+         doc(cfg(all(feature = "all", any(target_os = "freebsd", target_os = "linux"))))
+@@ -2952,7 +2985,7 @@
+     ///
+     /// The value must be a valid TCP congestion control algorithm name of the
+     /// platform. For example, Linux may supports "reno", "cubic".
+-    #[cfg(all(feature = "all", any(target_os = "freebsd", target_os = "linux")))]
++    #[cfg(all(feature = "all", any(target_os = "freebsd", any(target_os = "linux", target_os = "fullrust"))))]
+     #[cfg_attr(
+         docsrs,
+         doc(cfg(all(feature = "all", any(target_os = "freebsd", target_os = "linux"))))
+@@ -2978,7 +3011,7 @@
+     ///
+     /// [`connect`]: crate::Socket::connect
+     /// [`bind`]: crate::Socket::bind
+-    #[cfg(all(feature = "all", target_os = "linux"))]
++    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
+     pub fn set_dccp_service(&self, code: u32) -> io::Result<()> {
+         unsafe {
+@@ -2996,7 +3029,7 @@
+     /// For more information about this option see [`set_dccp_service`]
+     ///
+     /// [`set_dccp_service`]: crate::Socket::set_dccp_service
+-    #[cfg(all(feature = "all", target_os = "linux"))]
++    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
+     pub fn dccp_service(&self) -> io::Result<u32> {
+         unsafe { getsockopt(self.as_raw(), libc::SOL_DCCP, libc::DCCP_SOCKOPT_SERVICE) }
+@@ -3005,7 +3038,7 @@
+     /// Set value for the `DCCP_SOCKOPT_CCID` option on this socket.
+     ///
+     /// This option sets both the TX and RX CCIDs at the same time.
+-    #[cfg(all(feature = "all", target_os = "linux"))]
++    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
+     pub fn set_dccp_ccid(&self, ccid: u8) -> io::Result<()> {
+         unsafe { setsockopt(self.as_raw(), libc::SOL_DCCP, libc::DCCP_SOCKOPT_CCID, ccid) }
+@@ -3016,7 +3049,7 @@
+     /// For more information about this option see [`set_dccp_ccid`].
+     ///
+     /// [`set_dccp_ccid`]: crate::Socket::set_dccp_ccid
+-    #[cfg(all(feature = "all", target_os = "linux"))]
++    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
+     pub fn dccp_tx_ccid(&self) -> io::Result<u32> {
+         unsafe { getsockopt(self.as_raw(), libc::SOL_DCCP, libc::DCCP_SOCKOPT_TX_CCID) }
+@@ -3027,7 +3060,7 @@
+     /// For more information about this option see [`set_dccp_ccid`].
+     ///
+     /// [`set_dccp_ccid`]: crate::Socket::set_dccp_ccid
+-    #[cfg(all(feature = "all", target_os = "linux"))]
++    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
+     pub fn dccp_xx_ccid(&self) -> io::Result<u32> {
+         unsafe { getsockopt(self.as_raw(), libc::SOL_DCCP, libc::DCCP_SOCKOPT_RX_CCID) }
+@@ -3037,7 +3070,7 @@
+     ///
+     /// Enables a listening socket to hold timewait state when closing the
+     /// connection. This option must be set after `accept` returns.
+-    #[cfg(all(feature = "all", target_os = "linux"))]
++    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
+     pub fn set_dccp_server_timewait(&self, hold_timewait: bool) -> io::Result<()> {
+         unsafe {
+@@ -3055,7 +3088,7 @@
+     /// For more information see [`set_dccp_server_timewait`]
+     ///
+     /// [`set_dccp_server_timewait`]: crate::Socket::set_dccp_server_timewait
+-    #[cfg(all(feature = "all", target_os = "linux"))]
++    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
+     pub fn dccp_server_timewait(&self) -> io::Result<bool> {
+         unsafe {
+@@ -3074,7 +3107,7 @@
+     /// the entire packet and that only fully covered application data is
+     /// accepted by the receiver. Hence, when using this feature on the sender,
+     /// it must be enabled at the receiver too, with suitable choice of CsCov.
+-    #[cfg(all(feature = "all", target_os = "linux"))]
++    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
+     pub fn set_dccp_send_cscov(&self, level: u32) -> io::Result<()> {
+         unsafe {
+@@ -3092,7 +3125,7 @@
+     /// For more information on this option see [`set_dccp_send_cscov`].
+     ///
+     /// [`set_dccp_send_cscov`]: crate::Socket::set_dccp_send_cscov
+-    #[cfg(all(feature = "all", target_os = "linux"))]
++    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
+     pub fn dccp_send_cscov(&self) -> io::Result<u32> {
+         unsafe { getsockopt(self.as_raw(), libc::SOL_DCCP, libc::DCCP_SOCKOPT_SEND_CSCOV) }
+@@ -3103,7 +3136,7 @@
+     /// This option is only useful when combined with [`set_dccp_send_cscov`].
+     ///
+     /// [`set_dccp_send_cscov`]: crate::Socket::set_dccp_send_cscov
+-    #[cfg(all(feature = "all", target_os = "linux"))]
++    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
+     pub fn set_dccp_recv_cscov(&self, level: u32) -> io::Result<()> {
+         unsafe {
+@@ -3121,7 +3154,7 @@
+     /// For more information on this option see [`set_dccp_recv_cscov`].
+     ///
+     /// [`set_dccp_recv_cscov`]: crate::Socket::set_dccp_recv_cscov
+-    #[cfg(all(feature = "all", target_os = "linux"))]
++    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
+     pub fn dccp_recv_cscov(&self) -> io::Result<u32> {
+         unsafe { getsockopt(self.as_raw(), libc::SOL_DCCP, libc::DCCP_SOCKOPT_RECV_CSCOV) }
+@@ -3131,7 +3164,7 @@
+     ///
+     /// This option sets the maximum length of the output queue. A zero value is
+     /// interpreted as unbounded queue length.
+-    #[cfg(all(feature = "all", target_os = "linux"))]
++    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
+     pub fn set_dccp_qpolicy_txqlen(&self, length: u32) -> io::Result<()> {
+         unsafe {
+@@ -3149,7 +3182,7 @@
+     /// For more information on this option see [`set_dccp_qpolicy_txqlen`].
+     ///
+     /// [`set_dccp_qpolicy_txqlen`]: crate::Socket::set_dccp_qpolicy_txqlen
+-    #[cfg(all(feature = "all", target_os = "linux"))]
++    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
+     pub fn dccp_qpolicy_txqlen(&self) -> io::Result<u32> {
+         unsafe {
+@@ -3170,7 +3203,7 @@
+     /// of writing.
+     ///
+     /// [documentation]: https://www.kernel.org/doc/html/latest/networking/dccp.html
+-    #[cfg(all(feature = "all", target_os = "linux"))]
++    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
+     pub fn dccp_available_ccids<const N: usize>(&self) -> io::Result<CcidEndpoints<N>> {
+         let mut endpoints = [0; N];
+@@ -3189,7 +3222,7 @@
+     ///
+     /// This option retrieves the current maximum packet size (application
+     /// payload size) in bytes.
+-    #[cfg(all(feature = "all", target_os = "linux"))]
++    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
+     pub fn dccp_cur_mps(&self) -> io::Result<u32> {
+         unsafe {
+@@ -3203,7 +3236,7 @@
+ }
+ 
+ /// See [`Socket::dccp_available_ccids`].
+-#[cfg(all(feature = "all", target_os = "linux"))]
++#[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+ #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
+ #[derive(Debug)]
+ pub struct CcidEndpoints<const N: usize> {
+@@ -3211,7 +3244,7 @@
+     length: u32,
+ }
+ 
+-#[cfg(all(feature = "all", target_os = "linux"))]
++#[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
+ #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
+ impl<const N: usize> std::ops::Deref for CcidEndpoints<N> {
+     type Target = [u8];
+@@ -3266,17 +3299,17 @@
+     }
+ }
+ 
+-#[cfg(feature = "all")]
++#[cfg(all(feature = "all", unix))]
+ from!(UnixStream, crate::Socket);
+-#[cfg(feature = "all")]
++#[cfg(all(feature = "all", unix))]
+ from!(UnixListener, crate::Socket);
+-#[cfg(feature = "all")]
++#[cfg(all(feature = "all", unix))]
+ from!(UnixDatagram, crate::Socket);
+-#[cfg(feature = "all")]
++#[cfg(all(feature = "all", unix))]
+ from!(crate::Socket, UnixStream);
+-#[cfg(feature = "all")]
++#[cfg(all(feature = "all", unix))]
+ from!(crate::Socket, UnixListener);
+-#[cfg(feature = "all")]
++#[cfg(all(feature = "all", unix))]
+ from!(crate::Socket, UnixDatagram);
+ 
+ #[test]

@@ -170,16 +170,27 @@ macro_rules! man_links {
     };
 }
 
+// fullrust: libc-free target; socket2's Linux code runs on this private
+// raw-syscall stand-in for the `libc` crate (Linux x86-64 layouts/values).
+#[cfg(target_os = "fullrust")]
+#[path = "sys/fullrust_libc.rs"]
+mod libc;
+#[cfg(all(feature = "all", target_os = "fullrust"))]
+pub use crate::libc::UCred;
+/// fullrust: 0.5's public API takes/returns these `libc` types (e.g.
+/// `SockAddr::new`/`as_storage`, `attach_filter`); with no `libc` crate here
+/// they are re-exported so callers can name them.
+#[cfg(target_os = "fullrust")]
+pub use crate::libc::{sock_filter, sockaddr_storage};
 mod sockaddr;
 mod socket;
 mod sockref;
 
-#[cfg_attr(unix, path = "sys/unix.rs")]
-#[cfg_attr(target_os = "fullrust", path = "sys/fullrust.rs")]
+#[cfg_attr(any(unix, target_os = "fullrust"), path = "sys/unix.rs")]
 #[cfg_attr(windows, path = "sys/windows.rs")]
 mod sys;
 
-#[cfg(not(any(windows, unix, target_os = "fullrust")))]
+#[cfg(not(any(windows, any(unix, target_os = "fullrust"))))]
 compile_error!("Socket2 doesn't support the compile target");
 
 use sys::c_int;
@@ -266,7 +277,7 @@ impl Type {
     /// Type corresponding to `SOCK_DCCP`.
     ///
     /// Used for the DCCP protocol.
-    #[cfg(all(feature = "all", target_os = "linux"))]
+    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
     pub const DCCP: Type = Type(sys::SOCK_DCCP);
 
@@ -319,17 +330,17 @@ impl Protocol {
     /// Protocol corresponding to `UDP`.
     pub const UDP: Protocol = Protocol(sys::IPPROTO_UDP);
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "fullrust"))]
     /// Protocol corresponding to `MPTCP`.
     pub const MPTCP: Protocol = Protocol(sys::IPPROTO_MPTCP);
 
     /// Protocol corresponding to `DCCP`.
-    #[cfg(all(feature = "all", target_os = "linux"))]
+    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
     pub const DCCP: Protocol = Protocol(sys::IPPROTO_DCCP);
 
     /// Protocol corresponding to `SCTP`.
-    #[cfg(all(feature = "all", any(target_os = "freebsd", target_os = "linux")))]
+    #[cfg(all(feature = "all", any(target_os = "freebsd", any(target_os = "linux", target_os = "fullrust"))))]
     pub const SCTP: Protocol = Protocol(sys::IPPROTO_SCTP);
 
     /// Protocol corresponding to `UDPLITE`.
@@ -339,7 +350,7 @@ impl Protocol {
             target_os = "android",
             target_os = "freebsd",
             target_os = "fuchsia",
-            target_os = "linux",
+            any(target_os = "linux", target_os = "fullrust"),
         )
     ))]
     pub const UDPLITE: Protocol = Protocol(sys::IPPROTO_UDPLITE);
@@ -517,7 +528,7 @@ impl TcpKeepalive {
         target_os = "illumos",
         target_os = "ios",
         target_os = "visionos",
-        target_os = "linux",
+        any(target_os = "linux", target_os = "fullrust"),
         target_os = "macos",
         target_os = "netbsd",
         target_os = "tvos",
@@ -564,7 +575,7 @@ impl TcpKeepalive {
             target_os = "illumos",
             target_os = "ios",
             target_os = "visionos",
-            target_os = "linux",
+            any(target_os = "linux", target_os = "fullrust"),
             target_os = "macos",
             target_os = "netbsd",
             target_os = "tvos",

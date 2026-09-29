@@ -4,6 +4,8 @@ use std::mem::ManuallyDrop;
 use std::ops::Deref;
 #[cfg(unix)]
 use std::os::unix::io::{AsFd, AsRawFd, FromRawFd};
+#[cfg(target_os = "fullrust")]
+use std::os::fd::{AsFd, AsRawFd, FromRawFd};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawSocket, AsSocket, FromRawSocket};
 
@@ -77,7 +79,7 @@ impl<'s> Deref for SockRef<'s> {
 }
 
 /// On Windows, a corresponding `From<&impl AsSocket>` implementation exists.
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fullrust"))]
 #[cfg_attr(docsrs, doc(cfg(unix)))]
 impl<'s, S> From<&'s S> for SockRef<'s>
 where

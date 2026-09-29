@@ -23,9 +23,11 @@ use std::os::windows::io::{FromRawSocket, IntoRawSocket};
 use std::time::Duration;
 
 use crate::sys::{self, c_int, getsockopt, setsockopt, Bool};
-#[cfg(all(unix, not(target_os = "redox")))]
+#[cfg(all(any(unix, target_os = "fullrust"), not(target_os = "redox")))]
 use crate::MsgHdrMut;
 use crate::{Domain, Protocol, SockAddr, TcpKeepalive, Type};
+#[cfg(target_os = "fullrust")]
+use crate::libc;
 #[cfg(not(target_os = "redox"))]
 use crate::{MaybeUninitSlice, MsgHdr, RecvFlags};
 
@@ -104,7 +106,7 @@ impl Socket {
                 // Violating this assumption (fd never negative) causes UB,
                 // something we don't want. So check for that we have this
                 // `assert!`.
-                #[cfg(unix)]
+                #[cfg(any(unix, target_os = "fullrust"))]
                 assert!(raw >= 0, "tried to create a `Socket` with an invalid fd");
                 sys::socket_from_raw(raw)
             },
@@ -240,7 +242,7 @@ impl Socket {
         match res {
             Ok(()) => return Ok(()),
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
-            #[cfg(unix)]
+            #[cfg(any(unix, target_os = "fullrust"))]
             Err(ref e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
             Err(e) => return Err(e),
         }
@@ -284,7 +286,7 @@ impl Socket {
             target_os = "freebsd",
             target_os = "fuchsia",
             target_os = "illumos",
-            target_os = "linux",
+            any(target_os = "linux", target_os = "fullrust"),
             target_os = "netbsd",
             target_os = "openbsd",
             target_os = "cygwin",
@@ -298,7 +300,7 @@ impl Socket {
             target_os = "freebsd",
             target_os = "fuchsia",
             target_os = "illumos",
-            target_os = "linux",
+            any(target_os = "linux", target_os = "fullrust"),
             target_os = "netbsd",
             target_os = "openbsd",
             target_os = "cygwin",
@@ -652,7 +654,7 @@ impl Socket {
     /// <https://github.com/microsoft/Windows-classic-samples/blob/7cbd99ac1d2b4a0beffbaba29ea63d024ceff700/Samples/Win7Samples/netds/winsock/recvmsg/rmmc.cpp>
     /// for an example (in C++).
     #[doc = man_links!(recvmsg(2))]
-    #[cfg(all(unix, not(target_os = "redox")))]
+    #[cfg(all(any(unix, target_os = "fullrust"), not(target_os = "redox")))]
     #[cfg_attr(docsrs, doc(cfg(all(unix, not(target_os = "redox")))))]
     pub fn recvmsg(&self, msg: &mut MsgHdrMut<'_, '_, '_>, flags: sys::c_int) -> io::Result<usize> {
         sys::recvmsg(self.as_raw(), msg, flags)
@@ -778,7 +780,7 @@ const fn set_common_type(ty: Type) -> Type {
         target_os = "fuchsia",
         target_os = "hurd",
         target_os = "illumos",
-        target_os = "linux",
+        any(target_os = "linux", target_os = "fullrust"),
         target_os = "netbsd",
         target_os = "openbsd",
         target_os = "cygwin",
@@ -798,7 +800,7 @@ const fn set_common_type(ty: Type) -> Type {
 fn set_common_flags(socket: Socket) -> io::Result<Socket> {
     // On platforms that don't have `SOCK_CLOEXEC` use `FD_CLOEXEC`.
     #[cfg(all(
-        unix,
+        any(unix, target_os = "fullrust"),
         not(any(
             target_os = "android",
             target_os = "dragonfly",
@@ -806,7 +808,7 @@ fn set_common_flags(socket: Socket) -> io::Result<Socket> {
             target_os = "fuchsia",
             target_os = "hurd",
             target_os = "illumos",
-            target_os = "linux",
+            any(target_os = "linux", target_os = "fullrust"),
             target_os = "netbsd",
             target_os = "openbsd",
             target_os = "espidf",
@@ -989,7 +991,7 @@ impl Socket {
     /// For more information about this option, see [`set_passcred`].
     ///
     /// [`set_passcred`]: Socket::set_passcred
-    #[cfg(any(target_os = "linux", target_os = "cygwin"))]
+    #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "cygwin"))]
     #[cfg_attr(docsrs, doc(cfg(any(target_os = "linux", target_os = "cygwin"))))]
     pub fn passcred(&self) -> io::Result<bool> {
         unsafe {
@@ -1002,7 +1004,7 @@ impl Socket {
     ///
     /// If this option is enabled, enables the receiving of the `SCM_CREDENTIALS`
     /// control messages.
-    #[cfg(any(target_os = "linux", target_os = "cygwin"))]
+    #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "cygwin"))]
     #[cfg_attr(docsrs, doc(cfg(any(target_os = "linux", target_os = "cygwin"))))]
     pub fn set_passcred(&self, passcred: bool) -> io::Result<()> {
         unsafe {
@@ -1235,7 +1237,7 @@ impl Socket {
     /// For more information about this option, see [`set_ip_transparent`].
     ///
     /// [`set_ip_transparent`]: Socket::set_ip_transparent
-    #[cfg(all(feature = "all", target_os = "linux"))]
+    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
     pub fn ip_transparent(&self) -> io::Result<bool> {
         unsafe {
@@ -1259,7 +1261,7 @@ impl Socket {
     ///
     /// TProxy redirection with the iptables TPROXY target also
     /// requires that this option be set on the redirected socket.
-    #[cfg(all(feature = "all", target_os = "linux"))]
+    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
     pub fn set_ip_transparent(&self, transparent: bool) -> io::Result<()> {
         unsafe {
@@ -1459,7 +1461,7 @@ impl Socket {
     /// For more information about this option, see [`set_multicast_all_v4`].
     ///
     /// [`set_multicast_all_v4`]: Socket::set_multicast_all_v4
-    #[cfg(all(feature = "all", target_os = "linux"))]
+    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
     pub fn multicast_all_v4(&self) -> io::Result<bool> {
         unsafe {
@@ -1478,7 +1480,7 @@ impl Socket {
     /// messages only from the groups that have been explicitly
     /// joined (for example via the `IP_ADD_MEMBERSHIP` option) on
     /// this particular socket.
-    #[cfg(all(feature = "all", target_os = "linux"))]
+    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
     pub fn set_multicast_all_v4(&self, all: bool) -> io::Result<()> {
         unsafe {
@@ -1845,7 +1847,7 @@ impl Socket {
     /// For more information about this option, see [`set_multicast_all_v6`].
     ///
     /// [`set_multicast_all_v6`]: Socket::set_multicast_all_v6
-    #[cfg(all(feature = "all", target_os = "linux"))]
+    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
     pub fn multicast_all_v6(&self) -> io::Result<bool> {
         unsafe {
@@ -1864,7 +1866,7 @@ impl Socket {
     /// messages only from the groups that have been explicitly
     /// joined (for example via the `IPV6_ADD_MEMBERSHIP` option) on
     /// this particular socket.
-    #[cfg(all(feature = "all", target_os = "linux"))]
+    #[cfg(all(feature = "all", any(target_os = "linux", target_os = "fullrust")))]
     #[cfg_attr(docsrs, doc(cfg(all(feature = "all", target_os = "linux"))))]
     pub fn set_multicast_all_v6(&self, all: bool) -> io::Result<()> {
         unsafe {
@@ -2155,7 +2157,7 @@ impl Socket {
             target_os = "illumos",
             target_os = "ios",
             target_os = "visionos",
-            target_os = "linux",
+            any(target_os = "linux", target_os = "fullrust"),
             target_os = "macos",
             target_os = "netbsd",
             target_os = "tvos",
@@ -2205,7 +2207,7 @@ impl Socket {
             target_os = "illumos",
             target_os = "ios",
             target_os = "visionos",
-            target_os = "linux",
+            any(target_os = "linux", target_os = "fullrust"),
             target_os = "macos",
             target_os = "netbsd",
             target_os = "tvos",
@@ -2319,7 +2321,7 @@ impl Socket {
         any(
             target_os = "android",
             target_os = "fuchsia",
-            target_os = "linux",
+            any(target_os = "linux", target_os = "fullrust"),
             target_os = "windows",
         )
     ))]
@@ -2342,7 +2344,7 @@ impl Socket {
     /// Get the value for the `IP6T_SO_ORIGINAL_DST` option on this socket.
     #[cfg(all(
         feature = "all",
-        any(target_os = "android", target_os = "linux", target_os = "windows")
+        any(target_os = "android", any(target_os = "linux", target_os = "fullrust"), target_os = "windows")
     ))]
     #[cfg_attr(
         docsrs,

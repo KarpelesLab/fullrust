@@ -317,7 +317,7 @@ impl From<SocketAddrV6> for SockAddr {
             storage.sin6_port = addr.port().to_be();
             storage.sin6_addr = crate::sys::to_in6_addr(addr.ip());
             storage.sin6_flowinfo = addr.flowinfo();
-            #[cfg(unix)]
+            #[cfg(any(unix, target_os = "fullrust"))]
             {
                 storage.sin6_scope_id = addr.scope_id();
             }
@@ -415,7 +415,7 @@ mod tests {
         assert_eq!(addr.as_socket(), Some(SocketAddr::V4(std)));
         assert_eq!(addr.as_socket_ipv4(), Some(std));
         assert!(addr.as_socket_ipv6().is_none());
-        #[cfg(unix)]
+        #[cfg(any(unix, target_os = "fullrust"))]
         {
             assert!(addr.as_pathname().is_none());
             assert!(addr.as_abstract_namespace().is_none());
@@ -443,7 +443,7 @@ mod tests {
         assert_eq!(addr.as_socket(), Some(SocketAddr::V6(std)));
         assert!(addr.as_socket_ipv4().is_none());
         assert_eq!(addr.as_socket_ipv6(), Some(std));
-        #[cfg(unix)]
+        #[cfg(any(unix, target_os = "fullrust"))]
         {
             assert!(addr.as_pathname().is_none());
             assert!(addr.as_abstract_namespace().is_none());

@@ -95,3 +95,9 @@ features = [
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
 ]
+
+# fullrust: target_os = "fullrust" is known to the fullrust toolchain but not
+# to stock rustc's check-cfg list.
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ['cfg(target_os, values("fullrust"))']
