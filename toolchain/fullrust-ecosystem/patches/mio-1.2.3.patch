@@ -1,0 +1,996 @@
+# fullrust support for mio 1.2.3 — route target_os = "fullrust" through mio's
+# own unix backend (epoll selector, eventfd waker, net/tcp/udp, pipe, SourceFd)
+# exactly as on Linux: cfg broadenings + a private raw-syscall `libc` shim
+# (src/sys/unix/libc.rs) standing in for the libc crate. No libc dependency.
+# UDS (UnixStream/Listener/Datagram) stays gated out: it wraps std::os::unix::net.
+# Applied on top of crates.io mio 1.2.3 (vendored in crates/mio/).
+diff -ruN a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml	2026-09-29 13:30:48.616598750 +0900
++++ b/Cargo.toml	2026-09-29 13:30:48.618524272 +0900
+@@ -150,4 +150,5 @@
+ check-cfg = [
+     "cfg(mio_unsupported_force_poll_poll)",
+     "cfg(mio_unsupported_force_waker_pipe)",
++    'cfg(target_os, values("fullrust"))',
+ ]
+diff -ruN a/src/interest.rs b/src/interest.rs
+--- a/src/interest.rs	2026-09-29 13:30:48.616759258 +0900
++++ b/src/interest.rs	2026-09-29 13:30:48.618726384 +0900
+@@ -48,7 +48,7 @@
+     pub const LIO: Interest = Interest(unsafe { NonZeroU8::new_unchecked(LIO) });
+ 
+     /// Returns a `Interest` set representing priority completion interests.
+-    #[cfg(any(target_os = "linux", target_os = "android"))]
++    #[cfg(any(target_os = "linux", target_os = "fullrust", target_os = "android"))]
+     pub const PRIORITY: Interest = Interest(unsafe { NonZeroU8::new_unchecked(PRIORITY) });
+ 
+     /// Add together two `Interest`.
+@@ -186,7 +186,7 @@
+                 one = true
+             }
+         }
+-        #[cfg(any(target_os = "linux", target_os = "android"))]
++        #[cfg(any(target_os = "linux", target_os = "fullrust", target_os = "android"))]
+         {
+             if self.is_priority() {
+                 if one {
+diff -ruN a/src/io_source.rs b/src/io_source.rs
+--- a/src/io_source.rs	2026-09-29 13:30:48.616759258 +0900
++++ b/src/io_source.rs	2026-09-29 13:30:48.618726384 +0900
+@@ -1,5 +1,5 @@
+ use std::ops::{Deref, DerefMut};
+-#[cfg(any(unix, target_os = "wasi"))]
++#[cfg(any(unix, target_os = "fullrust", target_os = "wasi"))]
+ use std::os::fd::AsRawFd;
+ // TODO: once <https://github.com/rust-lang/rust/issues/126198> is fixed this
+ // can use `std::os::fd` and be merged with the above.
+@@ -106,6 +106,7 @@
+ 
+ #[cfg(any(
+     unix,
++    target_os = "fullrust",
+     target_os = "hermit",
+     all(target_os = "wasi", not(target_env = "p1"))
+ ))]
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs	2026-09-29 13:30:48.616759258 +0900
++++ b/src/lib.rs	2026-09-29 13:30:48.618726384 +0900
+@@ -72,8 +72,8 @@
+ #[cfg(not(any(target_os = "horizon", target_os = "wasi")))]
+ pub use waker::Waker;
+ 
+-#[cfg(all(unix, feature = "os-ext"))]
+-#[cfg_attr(docsrs, doc(cfg(all(unix, feature = "os-ext"))))]
++#[cfg(all(any(unix, target_os = "fullrust"), feature = "os-ext"))]
++#[cfg_attr(docsrs, doc(cfg(all(any(unix, target_os = "fullrust"), feature = "os-ext"))))]
+ pub mod unix {
+     //! Unix only extensions.
+ 
+diff -ruN a/src/macros.rs b/src/macros.rs
+--- a/src/macros.rs	2026-09-29 13:30:48.616759258 +0900
++++ b/src/macros.rs	2026-09-29 13:30:48.618726384 +0900
+@@ -51,8 +51,8 @@
+ macro_rules! cfg_io_source {
+     ($($item:item)*) => {
+         $(
+-            #[cfg(any(feature = "net", all(unix, feature = "os-ext")))]
+-            #[cfg_attr(docsrs, doc(cfg(any(feature = "net", all(unix, feature = "os-ext")))))]
++            #[cfg(any(feature = "net", all(any(unix, target_os = "fullrust"), feature = "os-ext")))]
++            #[cfg_attr(docsrs, doc(cfg(any(feature = "net", all(any(unix, target_os = "fullrust"), feature = "os-ext")))))]
+             $item
+         )*
+     }
+diff -ruN a/src/net/tcp/listener.rs b/src/net/tcp/listener.rs
+--- a/src/net/tcp/listener.rs	2026-09-29 13:30:48.616888417 +0900
++++ b/src/net/tcp/listener.rs	2026-09-29 13:30:48.618919573 +0900
+@@ -1,5 +1,5 @@
+ use std::net::{self, SocketAddr};
+-#[cfg(any(unix, target_os = "wasi"))]
++#[cfg(any(unix, target_os = "fullrust", target_os = "wasi"))]
+ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+ // TODO: once <https://github.com/rust-lang/rust/issues/126198> is fixed this
+ // can use `std::os::fd` and be merged with the above.
+@@ -15,6 +15,7 @@
+ use crate::net::TcpStream;
+ #[cfg(any(
+     unix,
++    target_os = "fullrust",
+     target_os = "hermit",
+     all(target_os = "wasi", not(target_env = "p1"))
+ ))]
+@@ -66,7 +67,7 @@
+     #[cfg(not(all(target_os = "wasi", target_env = "p1")))]
+     pub fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
+         let socket = new_for_addr(addr)?;
+-        #[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
++        #[cfg(any(unix, target_os = "fullrust", target_os = "hermit", target_os = "wasi"))]
+         let listener = unsafe { TcpListener::from_raw_fd(socket) };
+         #[cfg(windows)]
+         let listener = unsafe { TcpListener::from_raw_socket(socket as _) };
+@@ -183,21 +184,21 @@
+     }
+ }
+ 
+-#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
++#[cfg(any(unix, target_os = "fullrust", target_os = "hermit", target_os = "wasi"))]
+ impl IntoRawFd for TcpListener {
+     fn into_raw_fd(self) -> RawFd {
+         self.inner.into_inner().into_raw_fd()
+     }
+ }
+ 
+-#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
++#[cfg(any(unix, target_os = "fullrust", target_os = "hermit", target_os = "wasi"))]
+ impl AsRawFd for TcpListener {
+     fn as_raw_fd(&self) -> RawFd {
+         self.inner.as_raw_fd()
+     }
+ }
+ 
+-#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
++#[cfg(any(unix, target_os = "fullrust", target_os = "hermit", target_os = "wasi"))]
+ impl FromRawFd for TcpListener {
+     /// Converts a `RawFd` to a `TcpListener`.
+     ///
+@@ -210,21 +211,21 @@
+     }
+ }
+ 
+-#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
++#[cfg(any(unix, target_os = "fullrust", target_os = "hermit", target_os = "wasi"))]
+ impl From<TcpListener> for OwnedFd {
+     fn from(tcp_listener: TcpListener) -> Self {
+         tcp_listener.inner.into_inner().into()
+     }
+ }
+ 
+-#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
++#[cfg(any(unix, target_os = "fullrust", target_os = "hermit", target_os = "wasi"))]
+ impl AsFd for TcpListener {
+     fn as_fd(&self) -> BorrowedFd<'_> {
+         self.inner.as_fd()
+     }
+ }
+ 
+-#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
++#[cfg(any(unix, target_os = "fullrust", target_os = "hermit", target_os = "wasi"))]
+ impl From<OwnedFd> for TcpListener {
+     /// Converts a `RawFd` to a `TcpListener`.
+     ///
+@@ -297,7 +298,7 @@
+         // mio::net::TcpListener which ensures that we actually pass in a valid file
+         // descriptor/socket
+         unsafe {
+-            #[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
++            #[cfg(any(unix, target_os = "fullrust", target_os = "hermit", target_os = "wasi"))]
+             {
+                 net::TcpListener::from_raw_fd(listener.into_raw_fd())
+             }
+diff -ruN a/src/net/tcp/stream.rs b/src/net/tcp/stream.rs
+--- a/src/net/tcp/stream.rs	2026-09-29 13:30:48.616888417 +0900
++++ b/src/net/tcp/stream.rs	2026-09-29 13:30:48.618919573 +0900
+@@ -1,7 +1,7 @@
+ use std::fmt;
+ use std::io::{self, IoSlice, IoSliceMut, Read, Write};
+ use std::net::{self, Shutdown, SocketAddr};
+-#[cfg(any(unix, target_os = "wasi"))]
++#[cfg(any(unix, target_os = "fullrust", target_os = "wasi"))]
+ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+ // TODO: once <https://github.com/rust-lang/rust/issues/126198> is fixed this
+ // can use `std::os::fd` and be merged with the above.
+@@ -90,7 +90,7 @@
+     #[cfg(not(all(target_os = "wasi", target_env = "p1")))]
+     pub fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
+         let socket = new_for_addr(addr)?;
+-        #[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
++        #[cfg(any(unix, target_os = "fullrust", target_os = "hermit", target_os = "wasi"))]
+         let stream = unsafe { TcpStream::from_raw_fd(socket) };
+         #[cfg(windows)]
+         let stream = unsafe { TcpStream::from_raw_socket(socket as _) };
+@@ -354,21 +354,21 @@
+     }
+ }
+ 
+-#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
++#[cfg(any(unix, target_os = "fullrust", target_os = "hermit", target_os = "wasi"))]
+ impl IntoRawFd for TcpStream {
+     fn into_raw_fd(self) -> RawFd {
+         self.inner.into_inner().into_raw_fd()
+     }
+ }
+ 
+-#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
++#[cfg(any(unix, target_os = "fullrust", target_os = "hermit", target_os = "wasi"))]
+ impl AsRawFd for TcpStream {
+     fn as_raw_fd(&self) -> RawFd {
+         self.inner.as_raw_fd()
+     }
+ }
+ 
+-#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
++#[cfg(any(unix, target_os = "fullrust", target_os = "hermit", target_os = "wasi"))]
+ impl FromRawFd for TcpStream {
+     /// Converts a `RawFd` to a `TcpStream`.
+     ///
+@@ -381,21 +381,21 @@
+     }
+ }
+ 
+-#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
++#[cfg(any(unix, target_os = "fullrust", target_os = "hermit", target_os = "wasi"))]
+ impl From<TcpStream> for OwnedFd {
+     fn from(tcp_stream: TcpStream) -> Self {
+         tcp_stream.inner.into_inner().into()
+     }
+ }
+ 
+-#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
++#[cfg(any(unix, target_os = "fullrust", target_os = "hermit", target_os = "wasi"))]
+ impl AsFd for TcpStream {
+     fn as_fd(&self) -> BorrowedFd<'_> {
+         self.inner.as_fd()
+     }
+ }
+ 
+-#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
++#[cfg(any(unix, target_os = "fullrust", target_os = "hermit", target_os = "wasi"))]
+ impl From<OwnedFd> for TcpStream {
+     /// Converts a `RawFd` to a `TcpStream`.
+     ///
+@@ -468,7 +468,7 @@
+         // mio::net::TcpStream which ensures that we actually pass in a valid file
+         // descriptor/socket
+         unsafe {
+-            #[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
++            #[cfg(any(unix, target_os = "fullrust", target_os = "hermit", target_os = "wasi"))]
+             {
+                 net::TcpStream::from_raw_fd(stream.into_raw_fd())
+             }
+diff -ruN a/src/net/udp.rs b/src/net/udp.rs
+--- a/src/net/udp.rs	2026-09-29 13:30:48.616888417 +0900
++++ b/src/net/udp.rs	2026-09-29 13:30:48.618967396 +0900
+@@ -8,7 +8,7 @@
+ //! [portability guidelines]: ../struct.Poll.html#portability
+ 
+ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+-#[cfg(any(unix, target_os = "wasi"))]
++#[cfg(any(unix, target_os = "fullrust", target_os = "wasi"))]
+ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+ // TODO: once <https://github.com/rust-lang/rust/issues/126198> is fixed this
+ // can use `std::os::fd` and be merged with the above.
+@@ -653,21 +653,21 @@
+     }
+ }
+ 
+-#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
++#[cfg(any(unix, target_os = "fullrust", target_os = "hermit", target_os = "wasi"))]
+ impl IntoRawFd for UdpSocket {
+     fn into_raw_fd(self) -> RawFd {
+         self.inner.into_inner().into_raw_fd()
+     }
+ }
+ 
+-#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
++#[cfg(any(unix, target_os = "fullrust", target_os = "hermit", target_os = "wasi"))]
+ impl AsRawFd for UdpSocket {
+     fn as_raw_fd(&self) -> RawFd {
+         self.inner.as_raw_fd()
+     }
+ }
+ 
+-#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
++#[cfg(any(unix, target_os = "fullrust", target_os = "hermit", target_os = "wasi"))]
+ impl FromRawFd for UdpSocket {
+     /// Converts a `RawFd` to a `UdpSocket`.
+     ///
+@@ -680,21 +680,21 @@
+     }
+ }
+ 
+-#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
++#[cfg(any(unix, target_os = "fullrust", target_os = "hermit", target_os = "wasi"))]
+ impl From<UdpSocket> for OwnedFd {
+     fn from(udp_socket: UdpSocket) -> Self {
+         udp_socket.inner.into_inner().into()
+     }
+ }
+ 
+-#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
++#[cfg(any(unix, target_os = "fullrust", target_os = "hermit", target_os = "wasi"))]
+ impl AsFd for UdpSocket {
+     fn as_fd(&self) -> BorrowedFd<'_> {
+         self.inner.as_fd()
+     }
+ }
+ 
+-#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
++#[cfg(any(unix, target_os = "fullrust", target_os = "hermit", target_os = "wasi"))]
+ impl From<OwnedFd> for UdpSocket {
+     /// Converts a `RawFd` to a `UdpSocket`.
+     ///
+@@ -767,7 +767,7 @@
+         // mio::net::UdpSocket which ensures that we actually pass in a valid file
+         // descriptor/socket
+         unsafe {
+-            #[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
++            #[cfg(any(unix, target_os = "fullrust", target_os = "hermit", target_os = "wasi"))]
+             {
+                 net::UdpSocket::from_raw_fd(socket.into_raw_fd())
+             }
+diff -ruN a/src/poll.rs b/src/poll.rs
+--- a/src/poll.rs	2026-09-29 13:30:48.616941800 +0900
++++ b/src/poll.rs	2026-09-29 13:30:48.618967396 +0900
+@@ -1,5 +1,5 @@
+ #[cfg(all(
+-    unix,
++    any(unix, target_os = "fullrust"),
+     not(mio_unsupported_force_poll_poll),
+     not(any(
+         target_os = "aix",
+@@ -441,7 +441,7 @@
+ }
+ 
+ #[cfg(all(
+-    unix,
++    any(unix, target_os = "fullrust"),
+     not(mio_unsupported_force_poll_poll),
+     not(any(
+         target_os = "aix",
+@@ -745,7 +745,7 @@
+ }
+ 
+ #[cfg(all(
+-    unix,
++    any(unix, target_os = "fullrust"),
+     not(mio_unsupported_force_poll_poll),
+     not(any(
+         target_os = "aix",
+@@ -768,7 +768,7 @@
+ }
+ 
+ #[cfg(all(
+-    unix,
++    any(unix, target_os = "fullrust"),
+     not(mio_unsupported_force_poll_poll),
+     not(any(
+         target_os = "aix",
+@@ -792,7 +792,7 @@
+ 
+ cfg_os_poll! {
+     #[cfg(all(
+-        unix,
++        any(unix, target_os = "fullrust"),
+         not(mio_unsupported_force_poll_poll),
+         not(any(
+             target_os = "aix",
+diff -ruN a/src/sys/mod.rs b/src/sys/mod.rs
+--- a/src/sys/mod.rs	2026-09-29 13:30:48.617011307 +0900
++++ b/src/sys/mod.rs	2026-09-29 13:30:48.619059859 +0900
+@@ -52,6 +52,7 @@
+ 
+ #[cfg(any(
+     unix,
++    target_os = "fullrust",
+     target_os = "hermit",
+     all(target_os = "wasi", not(target_env = "p1"))
+ ))]
+@@ -77,7 +78,7 @@
+     mod shell;
+     pub(crate) use self::shell::*;
+ 
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "fullrust"))]
+     cfg_any_os_ext! {
+         mod unix;
+         #[cfg(feature = "os-ext")]
+diff -ruN a/src/sys/shell/mod.rs b/src/sys/shell/mod.rs
+--- a/src/sys/shell/mod.rs	2026-09-29 13:30:48.617038619 +0900
++++ b/src/sys/shell/mod.rs	2026-09-29 13:30:48.619083836 +0900
+@@ -21,7 +21,7 @@
+ 
+ cfg_io_source! {
+     use std::io;
+-    #[cfg(any(unix))]
++    #[cfg(any(unix, target_os = "fullrust"))]
+     use std::os::fd::RawFd;
+     // TODO: once <https://github.com/rust-lang/rust/issues/126198> is fixed this
+     // can use `std::os::fd` and be merged with the above.
+@@ -30,7 +30,7 @@
+     #[cfg(windows)]
+     use std::os::windows::io::RawSocket;
+ 
+-    #[cfg(any(windows, unix, target_os = "hermit"))]
++    #[cfg(any(windows, unix, target_os = "fullrust", target_os = "hermit"))]
+     use crate::{Registry, Token, Interest};
+ 
+     pub(crate) struct IoSourceState;
+@@ -50,7 +50,7 @@
+         }
+     }
+ 
+-    #[cfg(any(unix, target_os = "hermit"))]
++    #[cfg(any(unix, target_os = "fullrust", target_os = "hermit"))]
+     impl IoSourceState {
+         pub fn register(
+             &mut self,
+diff -ruN a/src/sys/shell/selector.rs b/src/sys/shell/selector.rs
+--- a/src/sys/shell/selector.rs	2026-09-29 13:30:48.617038619 +0900
++++ b/src/sys/shell/selector.rs	2026-09-29 13:30:48.619083836 +0900
+@@ -1,5 +1,5 @@
+ use std::io;
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "fullrust"))]
+ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
+ use std::time::Duration;
+ 
+@@ -20,7 +20,7 @@
+     }
+ }
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "fullrust"))]
+ cfg_os_ext! {
+     use crate::{Interest, Token};
+ 
+@@ -67,14 +67,14 @@
+     }
+ }
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "fullrust"))]
+ impl AsFd for Selector {
+     fn as_fd(&self) -> BorrowedFd<'_> {
+         os_required!()
+     }
+ }
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "fullrust"))]
+ impl AsRawFd for Selector {
+     fn as_raw_fd(&self) -> RawFd {
+         os_required!()
+diff -ruN a/src/sys/shell/tcp.rs b/src/sys/shell/tcp.rs
+--- a/src/sys/shell/tcp.rs	2026-09-29 13:30:48.617038619 +0900
++++ b/src/sys/shell/tcp.rs	2026-09-29 13:30:48.619083836 +0900
+@@ -21,7 +21,7 @@
+     os_required!();
+ }
+ 
+-#[cfg(any(unix, target_os = "hermit"))]
++#[cfg(any(unix, target_os = "fullrust", target_os = "hermit"))]
+ pub(crate) fn set_reuseaddr(_: &net::TcpListener, _: bool) -> io::Result<()> {
+     os_required!();
+ }
+diff -ruN a/src/sys/unix/libc.rs b/src/sys/unix/libc.rs
+--- a/src/sys/unix/libc.rs	1970-01-01 09:00:00.000000000 +0900
++++ b/src/sys/unix/libc.rs	2026-09-29 13:30:48.619391261 +0900
+@@ -0,0 +1,316 @@
++//! A private, minimal stand-in for the `libc` crate on the `fullrust` target.
++//!
++//! `fullrust` (`x86_64-unknown-linux-fullrust`) is the Linux kernel ABI with no
++//! C library, so mio's ordinary Linux code paths (epoll selector, eventfd
++//! waker, `net`/`tcp`/`udp`, `pipe`) are compiled unchanged and resolve their
++//! `libc::…` paths to this module instead. It supplies exactly the types,
++//! constants and functions those paths use, with Linux x86_64 layouts and
++//! values, implemented as raw `syscall` instructions.
++//!
++//! One deliberate difference from libc: the functions return the **raw kernel
++//! result** (`-errno` on failure) instead of `-1` + `errno`, since there is no
++//! C `errno` for `io::Error::last_os_error()` to read. mio's `syscall!` macro
++//! has a matching `fullrust` arm that maps negative results to
++//! `io::Error::from_raw_os_error(-res)`; the only direct (non-`syscall!`) libc
++//! calls on the Linux path, in `pipe.rs`, are routed through `syscall!` too.
++#![allow(dead_code, non_camel_case_types, non_upper_case_globals, clippy::missing_safety_doc)]
++
++use core::arch::asm;
++
++// ---------------------------------------------------------------------------
++// Primitive types
++// ---------------------------------------------------------------------------
++
++pub(crate) type c_int = core::ffi::c_int;
++pub(crate) type c_uint = core::ffi::c_uint;
++pub(crate) type c_char = core::ffi::c_char;
++pub(crate) type c_void = core::ffi::c_void;
++pub(crate) type c_ulong = core::ffi::c_ulong;
++pub(crate) type size_t = usize;
++pub(crate) type ssize_t = isize;
++pub(crate) type socklen_t = u32;
++pub(crate) type sa_family_t = u16;
++
++// ---------------------------------------------------------------------------
++// Structs (Linux x86_64 layouts)
++// ---------------------------------------------------------------------------
++
++#[repr(C)]
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct in_addr {
++    pub s_addr: u32,
++}
++
++#[repr(C)]
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct in6_addr {
++    pub s6_addr: [u8; 16],
++}
++
++#[repr(C)]
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct sockaddr {
++    pub sa_family: sa_family_t,
++    pub sa_data: [c_char; 14],
++}
++
++#[repr(C)]
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct sockaddr_in {
++    pub sin_family: sa_family_t,
++    pub sin_port: u16,
++    pub sin_addr: in_addr,
++    pub sin_zero: [u8; 8],
++}
++
++#[repr(C)]
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct sockaddr_in6 {
++    pub sin6_family: sa_family_t,
++    pub sin6_port: u16,
++    pub sin6_flowinfo: u32,
++    pub sin6_addr: in6_addr,
++    pub sin6_scope_id: u32,
++}
++
++#[repr(C)]
++#[derive(Clone, Copy)]
++pub(crate) struct sockaddr_storage {
++    pub ss_family: sa_family_t,
++    __ss_pad1: [u8; 6],
++    __ss_align: u64,
++    __ss_pad2: [u8; 112],
++}
++
++/// `struct epoll_event`. On x86_64 the kernel declares it
++/// `__attribute__((packed))` (12 bytes), unlike every other architecture.
++#[repr(C, packed)]
++#[derive(Clone, Copy)]
++pub(crate) struct epoll_event {
++    pub events: u32,
++    pub u64: u64,
++}
++
++// Compile-time layout checks against the kernel ABI.
++const _: () = {
++    assert!(core::mem::size_of::<epoll_event>() == 12);
++    assert!(core::mem::size_of::<sockaddr>() == 16);
++    assert!(core::mem::size_of::<sockaddr_in>() == 16);
++    assert!(core::mem::size_of::<sockaddr_in6>() == 28);
++    assert!(core::mem::size_of::<sockaddr_storage>() == 128);
++    assert!(core::mem::align_of::<sockaddr_storage>() == 8);
++};
++
++// ---------------------------------------------------------------------------
++// Constants (Linux x86_64 values)
++// ---------------------------------------------------------------------------
++
++// errno
++pub(crate) const EINTR: c_int = 4;
++pub(crate) const EAGAIN: c_int = 11;
++pub(crate) const EINPROGRESS: c_int = 115;
++
++// socket domains / types / options
++pub(crate) const AF_UNSPEC: c_int = 0;
++pub(crate) const AF_UNIX: c_int = 1;
++pub(crate) const AF_INET: c_int = 2;
++pub(crate) const AF_INET6: c_int = 10;
++pub(crate) const SOCK_STREAM: c_int = 1;
++pub(crate) const SOCK_DGRAM: c_int = 2;
++pub(crate) const SOCK_NONBLOCK: c_int = 0o4000;
++pub(crate) const SOCK_CLOEXEC: c_int = 0o2000000;
++pub(crate) const SOL_SOCKET: c_int = 1;
++pub(crate) const SO_REUSEADDR: c_int = 2;
++pub(crate) const IPPROTO_IPV6: c_int = 41;
++pub(crate) const IPV6_V6ONLY: c_int = 26;
++pub(crate) const SOMAXCONN: c_int = 4096;
++
++// fcntl / ioctl / open flags
++pub(crate) const F_SETFD: c_int = 2;
++pub(crate) const F_GETFL: c_int = 3;
++pub(crate) const F_SETFL: c_int = 4;
++pub(crate) const FD_CLOEXEC: c_int = 1;
++pub(crate) const O_NONBLOCK: c_int = 0o4000;
++pub(crate) const O_CLOEXEC: c_int = 0o2000000;
++pub(crate) const FIONBIO: c_ulong = 0x5421;
++
++// eventfd
++pub(crate) const EFD_NONBLOCK: c_int = 0o4000;
++pub(crate) const EFD_CLOEXEC: c_int = 0o2000000;
++
++// epoll
++pub(crate) const EPOLL_CLOEXEC: c_int = 0o2000000;
++pub(crate) const EPOLL_CTL_ADD: c_int = 1;
++pub(crate) const EPOLL_CTL_DEL: c_int = 2;
++pub(crate) const EPOLL_CTL_MOD: c_int = 3;
++pub(crate) const EPOLLIN: c_int = 0x1;
++pub(crate) const EPOLLPRI: c_int = 0x2;
++pub(crate) const EPOLLOUT: c_int = 0x4;
++pub(crate) const EPOLLERR: c_int = 0x8;
++pub(crate) const EPOLLHUP: c_int = 0x10;
++pub(crate) const EPOLLRDNORM: c_int = 0x40;
++pub(crate) const EPOLLRDBAND: c_int = 0x80;
++pub(crate) const EPOLLWRNORM: c_int = 0x100;
++pub(crate) const EPOLLWRBAND: c_int = 0x200;
++pub(crate) const EPOLLMSG: c_int = 0x400;
++pub(crate) const EPOLLRDHUP: c_int = 0x2000;
++pub(crate) const EPOLLEXCLUSIVE: c_int = 1 << 28;
++pub(crate) const EPOLLWAKEUP: c_int = 1 << 29;
++pub(crate) const EPOLLONESHOT: c_int = 1 << 30;
++pub(crate) const EPOLLET: c_int = 1 << 31;
++
++// ---------------------------------------------------------------------------
++// Raw syscalls (x86_64: nr in rax, args rdi rsi rdx r10 r8 r9; rcx/r11 clobbered)
++// ---------------------------------------------------------------------------
++
++const NR_IOCTL: usize = 16;
++const NR_CLOSE: usize = 3;
++const NR_SOCKET: usize = 41;
++const NR_CONNECT: usize = 42;
++const NR_BIND: usize = 49;
++const NR_LISTEN: usize = 50;
++const NR_SOCKETPAIR: usize = 53;
++const NR_SETSOCKOPT: usize = 54;
++const NR_GETSOCKOPT: usize = 55;
++const NR_FCNTL: usize = 72;
++const NR_EPOLL_WAIT: usize = 232;
++const NR_EPOLL_CTL: usize = 233;
++const NR_ACCEPT4: usize = 288;
++const NR_EVENTFD2: usize = 290;
++const NR_EPOLL_CREATE1: usize = 291;
++const NR_PIPE2: usize = 293;
++
++#[inline]
++unsafe fn sys1(n: usize, a: usize) -> isize {
++    let r: isize;
++    asm!("syscall", inlateout("rax") n as isize => r, in("rdi") a,
++        lateout("rcx") _, lateout("r11") _, options(nostack, preserves_flags));
++    r
++}
++#[inline]
++unsafe fn sys2(n: usize, a: usize, b: usize) -> isize {
++    let r: isize;
++    asm!("syscall", inlateout("rax") n as isize => r, in("rdi") a, in("rsi") b,
++        lateout("rcx") _, lateout("r11") _, options(nostack, preserves_flags));
++    r
++}
++#[inline]
++unsafe fn sys3(n: usize, a: usize, b: usize, c: usize) -> isize {
++    let r: isize;
++    asm!("syscall", inlateout("rax") n as isize => r, in("rdi") a, in("rsi") b, in("rdx") c,
++        lateout("rcx") _, lateout("r11") _, options(nostack, preserves_flags));
++    r
++}
++#[inline]
++unsafe fn sys4(n: usize, a: usize, b: usize, c: usize, d: usize) -> isize {
++    let r: isize;
++    asm!("syscall", inlateout("rax") n as isize => r, in("rdi") a, in("rsi") b, in("rdx") c,
++        in("r10") d, lateout("rcx") _, lateout("r11") _, options(nostack, preserves_flags));
++    r
++}
++#[inline]
++unsafe fn sys5(n: usize, a: usize, b: usize, c: usize, d: usize, e: usize) -> isize {
++    let r: isize;
++    asm!("syscall", inlateout("rax") n as isize => r, in("rdi") a, in("rsi") b, in("rdx") c,
++        in("r10") d, in("r8") e, lateout("rcx") _, lateout("r11") _,
++        options(nostack, preserves_flags));
++    r
++}
++
++// Integer arguments are sign-extended (`as isize as usize`) exactly as the C
++// ABI would pass an `int` in a 64-bit register; the kernel truncates to `int`.
++#[inline]
++fn i(v: c_int) -> usize {
++    v as isize as usize
++}
++
++// ---------------------------------------------------------------------------
++// Functions: libc signatures, raw kernel return values (`-errno` on error)
++// ---------------------------------------------------------------------------
++
++pub(crate) unsafe fn close(fd: c_int) -> c_int {
++    sys1(NR_CLOSE, i(fd)) as c_int
++}
++
++pub(crate) unsafe fn socket(domain: c_int, ty: c_int, protocol: c_int) -> c_int {
++    sys3(NR_SOCKET, i(domain), i(ty), i(protocol)) as c_int
++}
++
++pub(crate) unsafe fn socketpair(domain: c_int, ty: c_int, protocol: c_int, sv: *mut c_int) -> c_int {
++    sys4(NR_SOCKETPAIR, i(domain), i(ty), i(protocol), sv as usize) as c_int
++}
++
++pub(crate) unsafe fn bind(fd: c_int, addr: *const sockaddr, len: socklen_t) -> c_int {
++    sys3(NR_BIND, i(fd), addr as usize, len as usize) as c_int
++}
++
++pub(crate) unsafe fn connect(fd: c_int, addr: *const sockaddr, len: socklen_t) -> c_int {
++    sys3(NR_CONNECT, i(fd), addr as usize, len as usize) as c_int
++}
++
++pub(crate) unsafe fn listen(fd: c_int, backlog: c_int) -> c_int {
++    sys2(NR_LISTEN, i(fd), i(backlog)) as c_int
++}
++
++pub(crate) unsafe fn accept4(
++    fd: c_int,
++    addr: *mut sockaddr,
++    len: *mut socklen_t,
++    flags: c_int,
++) -> c_int {
++    sys4(NR_ACCEPT4, i(fd), addr as usize, len as usize, i(flags)) as c_int
++}
++
++pub(crate) unsafe fn setsockopt(
++    fd: c_int,
++    level: c_int,
++    name: c_int,
++    value: *const c_void,
++    len: socklen_t,
++) -> c_int {
++    sys5(NR_SETSOCKOPT, i(fd), i(level), i(name), value as usize, len as usize) as c_int
++}
++
++pub(crate) unsafe fn getsockopt(
++    fd: c_int,
++    level: c_int,
++    name: c_int,
++    value: *mut c_void,
++    len: *mut socklen_t,
++) -> c_int {
++    sys5(NR_GETSOCKOPT, i(fd), i(level), i(name), value as usize, len as usize) as c_int
++}
++
++/// Three-argument `fcntl(fd, cmd, arg)` (all mio uses on Linux-ABI paths).
++pub(crate) unsafe fn fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int {
++    sys3(NR_FCNTL, i(fd), i(cmd), i(arg)) as c_int
++}
++
++pub(crate) unsafe fn ioctl(fd: c_int, request: c_ulong, arg: *const c_int) -> c_int {
++    sys3(NR_IOCTL, i(fd), request as usize, arg as usize) as c_int
++}
++
++pub(crate) unsafe fn pipe2(fds: *mut c_int, flags: c_int) -> c_int {
++    sys2(NR_PIPE2, fds as usize, i(flags)) as c_int
++}
++
++pub(crate) unsafe fn eventfd(initval: c_uint, flags: c_int) -> c_int {
++    sys2(NR_EVENTFD2, initval as usize, i(flags)) as c_int
++}
++
++pub(crate) unsafe fn epoll_create1(flags: c_int) -> c_int {
++    sys1(NR_EPOLL_CREATE1, i(flags)) as c_int
++}
++
++pub(crate) unsafe fn epoll_ctl(epfd: c_int, op: c_int, fd: c_int, event: *mut epoll_event) -> c_int {
++    sys4(NR_EPOLL_CTL, i(epfd), i(op), i(fd), event as usize) as c_int
++}
++
++pub(crate) unsafe fn epoll_wait(
++    epfd: c_int,
++    events: *mut epoll_event,
++    maxevents: c_int,
++    timeout: c_int,
++) -> c_int {
++    sys4(NR_EPOLL_WAIT, i(epfd), events as usize, i(maxevents), i(timeout)) as c_int
++}
+diff -ruN a/src/sys/unix/mod.rs b/src/sys/unix/mod.rs
+--- a/src/sys/unix/mod.rs	2026-09-29 13:30:48.617121257 +0900
++++ b/src/sys/unix/mod.rs	2026-09-29 13:30:48.619391261 +0900
+@@ -1,6 +1,7 @@
+ /// Helper macro to execute a system call that returns an `io::Result`.
+ //
+ // Macro must be defined before any modules that use them.
++#[cfg(not(target_os = "fullrust"))]
+ #[allow(unused_macros)]
+ macro_rules! syscall {
+     ($fn: ident ( $($arg: expr),* $(,)* ) ) => {{
+@@ -14,6 +15,25 @@
+     }};
+ }
+ 
++// `fullrust` has no C library (and so no `errno`): the private `libc` shim
++// below issues raw syscalls, which return `-errno` on failure.
++#[cfg(target_os = "fullrust")]
++#[allow(unused_macros)]
++macro_rules! syscall {
++    ($fn: ident ( $($arg: expr),* $(,)* ) ) => {{
++        #[allow(unused_unsafe)]
++        let res = unsafe { $crate::sys::unix::libc::$fn($($arg, )*) };
++        if res < 0 {
++            Err(std::io::Error::from_raw_os_error(-(res as i32)))
++        } else {
++            Ok(res)
++        }
++    }};
++}
++
++#[cfg(target_os = "fullrust")]
++pub(crate) mod libc;
++
+ cfg_os_poll! {
+     #[cfg_attr(all(
+         not(mio_unsupported_force_poll_poll),
+@@ -21,6 +41,7 @@
+             target_os = "android",
+             target_os = "illumos",
+             target_os = "linux",
++            target_os = "fullrust",
+             target_os = "redox",
+         )
+     ), path = "selector/epoll.rs")]
+@@ -70,6 +91,7 @@
+             target_os = "hermit",
+             target_os = "illumos",
+             target_os = "linux",
++            target_os = "fullrust",
+         )
+     ), path = "waker/eventfd.rs")]
+     #[cfg_attr(all(
+@@ -133,7 +155,7 @@
+ 
+         pub(crate) mod tcp;
+         pub(crate) mod udp;
+-        #[cfg(not(any(target_os = "hermit", target_os = "wasi")))]
++        #[cfg(not(any(target_os = "hermit", target_os = "wasi", target_os = "fullrust")))]
+         pub(crate) mod uds;
+     }
+ 
+diff -ruN a/src/sys/unix/net.rs b/src/sys/unix/net.rs
+--- a/src/sys/unix/net.rs	2026-09-29 13:30:48.617121257 +0900
++++ b/src/sys/unix/net.rs	2026-09-29 13:30:48.619166814 +0900
+@@ -1,3 +1,5 @@
++#[cfg(target_os = "fullrust")]
++use crate::sys::unix::libc;
+ use std::io;
+ use std::mem::size_of;
+ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+@@ -20,6 +22,7 @@
+         target_os = "hurd",
+         target_os = "illumos",
+         target_os = "linux",
++        target_os = "fullrust",
+         target_os = "netbsd",
+         target_os = "openbsd",
+         target_os = "solaris",
+diff -ruN a/src/sys/unix/pipe.rs b/src/sys/unix/pipe.rs
+--- a/src/sys/unix/pipe.rs	2026-09-29 13:30:48.617121257 +0900
++++ b/src/sys/unix/pipe.rs	2026-09-29 13:30:48.619391261 +0900
+@@ -4,6 +4,8 @@
+ 
+ use std::io;
+ use std::os::fd::RawFd;
++#[cfg(target_os = "fullrust")]
++use crate::sys::unix::libc;
+ 
+ #[cfg_attr(not(feature = "os-ext"), allow(dead_code))] // Used by pipe waker, but not for all OS.
+ pub(crate) fn new_raw() -> io::Result<[RawFd; 2]> {
+@@ -31,6 +33,10 @@
+         }
+     }
+ 
++    // No C `errno` on fullrust: `syscall!` maps the raw `-errno` result.
++    #[cfg(target_os = "fullrust")]
++    syscall!(pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK))?;
++
+     #[cfg(any(
+         target_os = "aix",
+         target_os = "haiku",
+@@ -69,6 +75,7 @@
+ use std::fs::File;
+ use std::io::{IoSlice, IoSliceMut, Read, Write};
+ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
++#[cfg(not(target_os = "fullrust"))]
+ use std::process::{ChildStderr, ChildStdin, ChildStdout};
+ 
+ use crate::io_source::IoSource;
+@@ -354,6 +361,8 @@
+ /// # Notes
+ ///
+ /// The underlying pipe is **not** set to non-blocking.
++// fullrust std has no `IntoRawFd` for child stdio handles (yet).
++#[cfg(not(target_os = "fullrust"))]
+ impl From<ChildStdin> for Sender {
+     fn from(stdin: ChildStdin) -> Sender {
+         // Safety: `ChildStdin` is guaranteed to be a valid file descriptor.
+@@ -531,6 +540,8 @@
+ /// # Notes
+ ///
+ /// The underlying pipe is **not** set to non-blocking.
++// fullrust std has no `IntoRawFd` for child stdio handles (yet).
++#[cfg(not(target_os = "fullrust"))]
+ impl From<ChildStdout> for Receiver {
+     fn from(stdout: ChildStdout) -> Receiver {
+         // Safety: `ChildStdout` is guaranteed to be a valid file descriptor.
+@@ -541,6 +552,8 @@
+ /// # Notes
+ ///
+ /// The underlying pipe is **not** set to non-blocking.
++// fullrust std has no `IntoRawFd` for child stdio handles (yet).
++#[cfg(not(target_os = "fullrust"))]
+ impl From<ChildStderr> for Receiver {
+     fn from(stderr: ChildStderr) -> Receiver {
+         // Safety: `ChildStderr` is guaranteed to be a valid file descriptor.
+@@ -588,7 +601,7 @@
+     }
+ }
+ 
+-#[cfg(not(any(target_os = "aix", target_os = "illumos", target_os = "solaris", target_os = "vita")))]
++#[cfg(not(any(target_os = "aix", target_os = "illumos", target_os = "solaris", target_os = "vita", target_os = "fullrust")))]
+ fn set_nonblocking(fd: RawFd, nonblocking: bool) -> io::Result<()> {
+     let value = nonblocking as libc::c_int;
+     if unsafe { libc::ioctl(fd, libc::FIONBIO, &value) } == -1 {
+@@ -598,6 +611,12 @@
+     }
+ }
+ 
++#[cfg(target_os = "fullrust")]
++fn set_nonblocking(fd: RawFd, nonblocking: bool) -> io::Result<()> {
++    let value = nonblocking as libc::c_int;
++    syscall!(ioctl(fd, libc::FIONBIO, &value)).map(|_| ())
++}
++
+ #[cfg(any(target_os = "aix", target_os = "illumos", target_os = "solaris", target_os = "vita"))]
+ fn set_nonblocking(fd: RawFd, nonblocking: bool) -> io::Result<()> {
+     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+diff -ruN a/src/sys/unix/selector/epoll.rs b/src/sys/unix/selector/epoll.rs
+--- a/src/sys/unix/selector/epoll.rs	2026-09-29 13:30:48.617168229 +0900
++++ b/src/sys/unix/selector/epoll.rs	2026-09-29 13:30:48.619190821 +0900
+@@ -1,3 +1,5 @@
++#[cfg(target_os = "fullrust")]
++use crate::sys::unix::libc;
+ use std::io;
+ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+ #[cfg(debug_assertions)]
+@@ -150,6 +152,9 @@
+ pub mod event {
+     use std::fmt;
+ 
++    #[cfg(target_os = "fullrust")]
++    use crate::sys::unix::libc;
++
+     use crate::sys::Event;
+     use crate::Token;
+ 
+diff -ruN a/src/sys/unix/tcp.rs b/src/sys/unix/tcp.rs
+--- a/src/sys/unix/tcp.rs	2026-09-29 13:30:48.617168229 +0900
++++ b/src/sys/unix/tcp.rs	2026-09-29 13:30:48.619190821 +0900
+@@ -1,3 +1,5 @@
++#[cfg(target_os = "fullrust")]
++use crate::sys::unix::libc;
+ use std::io;
+ use std::mem::{size_of, MaybeUninit};
+ use std::net::{self, SocketAddr};
+@@ -70,6 +72,7 @@
+         target_os = "hurd",
+         target_os = "illumos",
+         target_os = "linux",
++        target_os = "fullrust",
+         target_os = "netbsd",
+         target_os = "openbsd",
+         target_os = "solaris",
+diff -ruN a/src/sys/unix/udp.rs b/src/sys/unix/udp.rs
+--- a/src/sys/unix/udp.rs	2026-09-29 13:30:48.617168229 +0900
++++ b/src/sys/unix/udp.rs	2026-09-29 13:30:48.619190821 +0900
+@@ -1,3 +1,5 @@
++#[cfg(target_os = "fullrust")]
++use crate::sys::unix::libc;
+ use std::io;
+ use std::mem;
+ use std::net::{self, SocketAddr};
+diff -ruN a/src/sys/unix/waker/eventfd.rs b/src/sys/unix/waker/eventfd.rs
+--- a/src/sys/unix/waker/eventfd.rs	2026-09-29 13:30:48.617376250 +0900
++++ b/src/sys/unix/waker/eventfd.rs	2026-09-29 13:30:48.619391261 +0900
+@@ -1,3 +1,5 @@
++#[cfg(target_os = "fullrust")]
++use crate::sys::unix::libc;
+ use std::fs::File;
+ use std::io::{self, Read, Write};
+ #[cfg(not(target_os = "hermit"))]
