@@ -67,7 +67,7 @@ cfg_io_uring! {
         // uses 1.25 musl on all *-linux-musl platforms starting
         // in 1.93 stable rust version.
         // https://blog.rust-lang.org/2025/12/05/Updating-musl-1.2.5/
-        any(target_env = "gnu", target_os = "android")
+        any(any(target_env = "gnu", target_os = "fullrust"), target_os = "android")
     )]
     async fn try_exists_uring(path: &Path) -> io::Result<bool> {
         use crate::runtime::driver::op::Op;

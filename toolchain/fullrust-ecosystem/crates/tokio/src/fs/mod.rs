@@ -281,7 +281,7 @@ pub use self::try_exists::try_exists;
 mod mocks;
 
 feature! {
-    #![unix]
+    #![any(unix, target_os = "fullrust")]
 
     mod symlink;
     pub use self::symlink::symlink;

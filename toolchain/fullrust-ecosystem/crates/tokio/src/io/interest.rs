@@ -14,7 +14,7 @@ const WRITABLE: usize = 0b0010;
 const AIO: usize = 0b0100;
 #[cfg(target_os = "freebsd")]
 const LIO: usize = 0b1000;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
 const PRIORITY: usize = 0b0001_0000;
 // error is available on all platforms, but behavior is platform-specific
 // mio does not have this interest
@@ -66,7 +66,7 @@ impl Interest {
     pub const ERROR: Interest = Interest(ERROR);
 
     /// Returns a `Interest` set representing priority completion interests.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
     #[cfg_attr(docsrs, doc(cfg(any(target_os = "linux", target_os = "android"))))]
     pub const PRIORITY: Interest = Interest(PRIORITY);
 
@@ -144,7 +144,7 @@ impl Interest {
     /// let both = Interest::READABLE | Interest::PRIORITY;
     /// assert!(both.is_priority());
     /// ```
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
     #[cfg_attr(docsrs, doc(cfg(any(target_os = "linux", target_os = "android"))))]
     pub const fn is_priority(self) -> bool {
         self.0 & PRIORITY != 0
@@ -222,7 +222,7 @@ impl Interest {
             mio_add(&mut mio, mio::Interest::WRITABLE);
         }
 
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
         if self.is_priority() {
             mio_add(&mut mio, mio::Interest::PRIORITY);
         }
@@ -259,7 +259,7 @@ impl Interest {
         match self {
             Interest::READABLE => Ready::READABLE | Ready::READ_CLOSED,
             Interest::WRITABLE => Ready::WRITABLE | Ready::WRITE_CLOSED,
-            #[cfg(any(target_os = "linux", target_os = "android"))]
+            #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
             Interest::PRIORITY => Ready::PRIORITY | Ready::READ_CLOSED,
             Interest::ERROR => Ready::ERROR,
             _ => Ready::EMPTY,
@@ -303,7 +303,7 @@ impl fmt::Debug for Interest {
             separator = true;
         }
 
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
         if self.is_priority() {
             if separator {
                 write!(fmt, " | ")?;

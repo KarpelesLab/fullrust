@@ -3,7 +3,7 @@
 //! This module is only defined on Unix platforms and contains the primary
 //! `Signal` type for receiving notifications of signals.
 
-#![cfg(unix)]
+#![cfg(any(unix, target_os = "fullrust"))]
 #![cfg_attr(docsrs, doc(cfg(all(unix, feature = "signal"))))]
 
 use crate::runtime::scheduler;
@@ -12,15 +12,17 @@ use crate::signal::registry::{globals, EventId, EventInfo, Globals, Storage};
 use crate::signal::RxFuture;
 use crate::sync::watch;
 
+#[cfg(target_os = "fullrust")]
+use crate::fullrust_libc::{self as libc, signal_hook_registry};
 use mio::net::UnixStream;
 use std::io::{self, Error, ErrorKind, Write};
 use std::sync::OnceLock;
 use std::task::{Context, Poll};
 
-#[cfg(not(any(target_os = "linux", target_os = "illumos")))]
+#[cfg(not(any(any(target_os = "linux", target_os = "fullrust"), target_os = "illumos")))]
 pub(crate) struct OsStorage([SignalInfo; 33]);
 
-#[cfg(any(target_os = "linux", target_os = "illumos"))]
+#[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "illumos"))]
 pub(crate) struct OsStorage(Box<[SignalInfo]>);
 
 impl OsStorage {
@@ -32,13 +34,13 @@ impl OsStorage {
 impl Default for OsStorage {
     fn default() -> Self {
         // There are reliable signals ranging from 1 to 33 available on every Unix platform.
-        #[cfg(not(any(target_os = "linux", target_os = "illumos")))]
+        #[cfg(not(any(any(target_os = "linux", target_os = "fullrust"), target_os = "illumos")))]
         let inner = std::array::from_fn(|_| SignalInfo::default());
 
         // On Linux and illumos, there are additional real-time signals
         // available. (This is also likely true on Solaris, but this should be
         // verified before being enabled.)
-        #[cfg(any(target_os = "linux", target_os = "illumos"))]
+        #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "illumos"))]
         let inner = std::iter::repeat_with(SignalInfo::default)
             .take(libc::SIGRTMAX() as usize)
             .collect();

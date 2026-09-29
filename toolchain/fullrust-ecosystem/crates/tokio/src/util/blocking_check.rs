@@ -1,7 +1,7 @@
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fullrust"))]
 use std::os::fd::AsFd;
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fullrust"))]
 #[allow(unused_variables)]
 #[track_caller]
 pub(crate) fn check_socket_for_blocking<S: AsFd>(s: &S) -> crate::io::Result<()> {
@@ -20,7 +20,7 @@ pub(crate) fn check_socket_for_blocking<S: AsFd>(s: &S) -> crate::io::Result<()>
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, target_os = "fullrust")))]
 #[allow(unused_variables)]
 pub(crate) fn check_socket_for_blocking<S>(s: &S) -> crate::io::Result<()> {
     // we cannot retrieve the nonblocking status on windows

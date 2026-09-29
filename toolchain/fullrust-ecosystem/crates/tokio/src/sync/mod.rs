@@ -504,7 +504,7 @@ cfg_not_sync! {
         pub(crate) use mutex::Mutex;
     }
 
-    #[cfg(any(feature = "rt", feature = "signal", all(unix, feature = "process")))]
+    #[cfg(any(feature = "rt", feature = "signal", all(any(unix, target_os = "fullrust"), feature = "process")))]
     pub(crate) mod notify;
 
     #[cfg(any(feature = "rt", all(windows, feature = "process")))]
@@ -515,7 +515,7 @@ cfg_not_sync! {
         pub(crate) use task::AtomicWaker;
     }
 
-    #[cfg(any(feature = "signal", all(unix, feature = "process")))]
+    #[cfg(any(feature = "signal", all(any(unix, target_os = "fullrust"), feature = "process")))]
     pub(crate) mod watch;
 }
 

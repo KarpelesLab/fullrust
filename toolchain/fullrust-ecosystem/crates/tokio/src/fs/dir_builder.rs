@@ -13,7 +13,7 @@ pub struct DirBuilder {
     recursive: bool,
 
     /// Sets the Unix mode for newly created directories.
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "fullrust"))]
     pub(super) mode: Option<u32>,
 }
 
@@ -93,7 +93,7 @@ impl DirBuilder {
         let mut builder = std::fs::DirBuilder::new();
         builder.recursive(self.recursive);
 
-        #[cfg(unix)]
+        #[cfg(any(unix, target_os = "fullrust"))]
         {
             if let Some(mode) = self.mode {
                 std::os::unix::fs::DirBuilderExt::mode(&mut builder, mode);
@@ -105,7 +105,7 @@ impl DirBuilder {
 }
 
 feature! {
-    #![unix]
+    #![any(unix, target_os = "fullrust")]
 
     impl DirBuilder {
         /// Sets the mode to create new directories with.

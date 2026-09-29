@@ -6,6 +6,8 @@ use crate::{
     },
 };
 
+#[cfg(target_os = "fullrust")]
+use crate::fullrust_libc as libc;
 use libc::{syscall, SYS_pidfd_open, ENOSYS, PIDFD_NONBLOCK};
 use mio::{event::Source, unix::SourceFd};
 use std::{
@@ -39,7 +41,7 @@ impl Pidfd {
         // which takes two parameter: pidfd_open(fd: c_int, flag: c_int)
         let fd = unsafe { syscall(SYS_pidfd_open, pid, PIDFD_NONBLOCK) };
         if fd == -1 {
-            let errno = io::Error::last_os_error().raw_os_error().unwrap();
+            let errno = last_os_error!().raw_os_error().unwrap();
 
             if errno == ENOSYS {
                 NO_PIDFD_SUPPORT.store(true, Relaxed)

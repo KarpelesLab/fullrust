@@ -136,7 +136,7 @@ impl Globals {
         self.registry.broadcast()
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "fullrust"))]
     pub(crate) fn storage(&self) -> &OsStorage {
         &self.registry.storage
     }

@@ -11,9 +11,9 @@ use std::io::{self, Read, Write};
 use std::net::Shutdown;
 #[cfg(target_os = "android")]
 use std::os::android::net::SocketAddrExt;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "fullrust"))]
 use std::os::linux::net::SocketAddrExt;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::{self, SocketAddr as StdSocketAddr};
@@ -83,7 +83,7 @@ impl UnixStream {
         P: AsRef<Path>,
     {
         // On linux, abstract socket paths need to be considered.
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
         let addr = {
             let os_str_bytes = path.as_ref().as_os_str().as_bytes();
             if os_str_bytes.starts_with(b"\0") {
@@ -92,7 +92,7 @@ impl UnixStream {
                 StdSocketAddr::from_pathname(path)?
             }
         };
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        #[cfg(not(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android")))]
         let addr = StdSocketAddr::from_pathname(path)?;
 
         let addr = SocketAddr::from(addr);

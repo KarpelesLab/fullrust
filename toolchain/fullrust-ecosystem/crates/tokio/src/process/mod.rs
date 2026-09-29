@@ -227,10 +227,10 @@
 //! [`Child`]: crate::process::Child
 
 #[path = "unix/mod.rs"]
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fullrust"))]
 mod imp;
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fullrust"))]
 pub(crate) mod unix {
     pub(crate) use super::imp::*;
 }
@@ -252,7 +252,7 @@ use std::pin::Pin;
 use std::process::{Child as StdChild, Command as StdCommand, ExitStatus, Output, Stdio};
 use std::task::{ready, Context, Poll};
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fullrust"))]
 use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -681,7 +681,7 @@ impl Command {
     /// Sets the child process's user ID. This translates to a
     /// `setuid` call in the child process. Failure in the `setuid`
     /// call will cause the spawn to fail.
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "fullrust"))]
     #[cfg_attr(docsrs, doc(cfg(unix)))]
     pub fn uid(&mut self, id: u32) -> &mut Command {
         #[cfg(target_os = "nto")]
@@ -692,7 +692,7 @@ impl Command {
 
     /// Similar to `uid` but sets the group ID of the child process. This has
     /// the same semantics as the `uid` field.
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "fullrust"))]
     #[cfg_attr(docsrs, doc(cfg(unix)))]
     pub fn gid(&mut self, id: u32) -> &mut Command {
         #[cfg(target_os = "nto")]
@@ -705,7 +705,7 @@ impl Command {
     ///
     /// Set the first process argument, `argv[0]`, to something other than the
     /// default executable path.
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "fullrust"))]
     #[cfg_attr(docsrs, doc(cfg(unix)))]
     pub fn arg0<S>(&mut self, arg: S) -> &mut Command
     where
@@ -744,7 +744,7 @@ impl Command {
     /// When this closure is run, aspects such as the stdio file descriptors and
     /// working directory have successfully been changed, so output to these
     /// locations may not appear where intended.
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "fullrust"))]
     #[cfg_attr(docsrs, doc(cfg(unix)))]
     pub unsafe fn pre_exec<F>(&mut self, f: F) -> &mut Command
     where
@@ -785,7 +785,7 @@ impl Command {
     /// ```
     ///
     /// [signal handler]: crate::signal
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "fullrust"))]
     #[cfg_attr(docsrs, doc(cfg(unix)))]
     pub fn process_group(&mut self, pgroup: i32) -> &mut Command {
         self.std.process_group(pgroup);
@@ -1620,7 +1620,7 @@ impl TryInto<Stdio> for ChildStderr {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fullrust"))]
 #[cfg_attr(docsrs, doc(cfg(unix)))]
 mod sys {
     use std::{

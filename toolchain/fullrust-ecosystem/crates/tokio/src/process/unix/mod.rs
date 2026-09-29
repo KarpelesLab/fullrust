@@ -27,7 +27,7 @@ use orphan::{OrphanQueue, OrphanQueueImpl, Wait};
 mod reap;
 use reap::Reaper;
 
-#[cfg(all(target_os = "linux", feature = "rt"))]
+#[cfg(all(any(target_os = "linux", target_os = "fullrust"), feature = "rt"))]
 mod pidfd_reaper;
 
 use crate::io::{AsyncRead, AsyncWrite, PollEvented, ReadBuf};
@@ -36,6 +36,8 @@ use crate::process::SpawnedChild;
 use crate::runtime::signal::Handle as SignalHandle;
 use crate::signal::unix::{signal, Signal, SignalKind};
 
+#[cfg(target_os = "fullrust")]
+use crate::fullrust_libc as libc;
 use mio::event::Source;
 use mio::unix::SourceFd;
 use std::fmt;
@@ -105,7 +107,7 @@ impl OrphanQueue<StdChild> for GlobalOrphanQueue {
 #[must_use = "futures do nothing unless polled"]
 pub(crate) enum Child {
     SignalReaper(Reaper<StdChild, GlobalOrphanQueue, Signal>),
-    #[cfg(all(target_os = "linux", feature = "rt"))]
+    #[cfg(all(any(target_os = "linux", target_os = "fullrust"), feature = "rt"))]
     PidfdReaper(pidfd_reaper::PidfdReaper<StdChild, GlobalOrphanQueue>),
 }
 
@@ -120,7 +122,7 @@ pub(crate) fn build_child(mut child: StdChild) -> io::Result<SpawnedChild> {
     let stdout = child.stdout.take().map(stdio).transpose()?;
     let stderr = child.stderr.take().map(stdio).transpose()?;
 
-    #[cfg(all(target_os = "linux", feature = "rt"))]
+    #[cfg(all(any(target_os = "linux", target_os = "fullrust"), feature = "rt"))]
     match pidfd_reaper::PidfdReaper::new(child, GlobalOrphanQueue) {
         Ok(pidfd_reaper) => {
             return Ok(SpawnedChild {
@@ -148,7 +150,7 @@ impl Child {
     pub(crate) fn id(&self) -> u32 {
         match self {
             Self::SignalReaper(signal_reaper) => signal_reaper.id(),
-            #[cfg(all(target_os = "linux", feature = "rt"))]
+            #[cfg(all(any(target_os = "linux", target_os = "fullrust"), feature = "rt"))]
             Self::PidfdReaper(pidfd_reaper) => pidfd_reaper.id(),
         }
     }
@@ -156,7 +158,7 @@ impl Child {
     fn std_child(&mut self) -> &mut StdChild {
         match self {
             Self::SignalReaper(signal_reaper) => signal_reaper.inner_mut(),
-            #[cfg(all(target_os = "linux", feature = "rt"))]
+            #[cfg(all(any(target_os = "linux", target_os = "fullrust"), feature = "rt"))]
             Self::PidfdReaper(pidfd_reaper) => pidfd_reaper.inner_mut(),
         }
     }
@@ -178,7 +180,7 @@ impl Future for Child {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match Pin::into_inner(self) {
             Self::SignalReaper(signal_reaper) => Pin::new(signal_reaper).poll(cx),
-            #[cfg(all(target_os = "linux", feature = "rt"))]
+            #[cfg(all(any(target_os = "linux", target_os = "fullrust"), feature = "rt"))]
             Self::PidfdReaper(pidfd_reaper) => Pin::new(pidfd_reaper).poll(cx),
         }
     }
@@ -342,9 +344,9 @@ impl AsyncRead for ChildStdio {
 fn set_nonblocking<T: AsRawFd>(fd: &mut T, nonblocking: bool) -> io::Result<()> {
     unsafe {
         let fd = fd.as_raw_fd();
-        let previous = libc::fcntl(fd, libc::F_GETFL);
+        let previous = libc::fcntl(fd, libc::F_GETFL, 0);
         if previous == -1 {
-            return Err(io::Error::last_os_error());
+            return Err(last_os_error!());
         }
 
         let new = if nonblocking {
@@ -355,7 +357,7 @@ fn set_nonblocking<T: AsRawFd>(fd: &mut T, nonblocking: bool) -> io::Result<()> 
 
         let r = libc::fcntl(fd, libc::F_SETFL, new);
         if r == -1 {
-            return Err(io::Error::last_os_error());
+            return Err(last_os_error!());
         }
     }
 

@@ -242,7 +242,7 @@ cfg_io_driver_impl! {
 
 // The bsd module can't be build on Windows, so we completely ignore it, even
 // when building documentation.
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fullrust"))]
 cfg_aio! {
     /// BSD-specific I/O types.
     pub mod bsd {
@@ -252,7 +252,7 @@ cfg_aio! {
     }
 }
 
-cfg_net_unix_fd! {
+cfg_net_unix! {
     mod async_fd;
 
     pub mod unix {

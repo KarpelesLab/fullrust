@@ -246,7 +246,7 @@ impl<L: Link> fmt::Debug for LinkedList<L> {
 #[cfg(any(
     feature = "fs",
     feature = "rt",
-    all(unix, feature = "process"),
+    all(any(unix, target_os = "fullrust"), feature = "process"),
     feature = "signal",
     feature = "sync",
 ))]

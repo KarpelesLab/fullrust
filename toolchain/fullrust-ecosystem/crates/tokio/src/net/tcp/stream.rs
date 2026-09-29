@@ -254,7 +254,7 @@ impl TcpStream {
     /// [`std::net::TcpStream`]: std::net::TcpStream
     /// [`set_nonblocking`]: fn@std::net::TcpStream::set_nonblocking
     pub fn into_std(self) -> io::Result<std::net::TcpStream> {
-        #[cfg(unix)]
+        #[cfg(any(unix, target_os = "fullrust"))]
         {
             use std::os::unix::io::{FromRawFd, IntoRawFd};
             self.io
@@ -272,7 +272,7 @@ impl TcpStream {
                 .map(|raw_socket| unsafe { std::net::TcpStream::from_raw_socket(raw_socket) })
         }
 
-        #[cfg(any(target_os = "wasi", target_os = "fullrust"))]
+        #[cfg(target_os = "wasi")]
         {
             use std::os::fd::{FromRawFd, IntoRawFd};
             self.io
@@ -1196,7 +1196,7 @@ impl TcpStream {
     /// # }
     /// ```
     #[cfg(any(
-        target_os = "linux",
+        any(target_os = "linux", target_os = "fullrust"),
         target_os = "android",
         target_os = "fuchsia",
         target_os = "cygwin",
@@ -1236,7 +1236,7 @@ impl TcpStream {
     /// # }
     /// ```
     #[cfg(any(
-        target_os = "linux",
+        any(target_os = "linux", target_os = "fullrust"),
         target_os = "android",
         target_os = "fuchsia",
         target_os = "cygwin",
@@ -1532,10 +1532,7 @@ impl AsRef<Self> for TcpStream {
 #[cfg(any(unix, target_os = "fullrust"))]
 mod sys {
     use super::TcpStream;
-    #[cfg(unix)]
     use std::os::unix::prelude::*;
-    #[cfg(target_os = "fullrust")]
-    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 
     impl AsRawFd for TcpStream {
         fn as_raw_fd(&self) -> RawFd {

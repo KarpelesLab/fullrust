@@ -34,7 +34,7 @@ impl UCred {
 }
 
 #[cfg(any(
-    target_os = "linux",
+    any(target_os = "linux", target_os = "fullrust"),
     target_os = "redox",
     target_os = "android",
     target_os = "openbsd",
@@ -79,7 +79,7 @@ pub(crate) use self::impl_noproc::get_peer_cred;
 pub(crate) use self::impl_nto::get_peer_cred;
 
 #[cfg(any(
-    target_os = "linux",
+    any(target_os = "linux", target_os = "fullrust"),
     target_os = "redox",
     target_os = "android",
     target_os = "openbsd",
@@ -89,13 +89,15 @@ pub(crate) use self::impl_nto::get_peer_cred;
 pub(crate) mod impl_linux {
     use crate::net::unix::{self, UnixStream};
 
+    #[cfg(target_os = "fullrust")]
+    use crate::fullrust_libc as libc;
     use libc::{c_void, getsockopt, socklen_t, SOL_SOCKET, SO_PEERCRED};
     use std::{io, mem};
 
     #[cfg(target_os = "openbsd")]
     use libc::sockpeercred as ucred;
     #[cfg(any(
-        target_os = "linux",
+        any(target_os = "linux", target_os = "fullrust"),
         target_os = "redox",
         target_os = "android",
         target_os = "haiku",
@@ -137,7 +139,7 @@ pub(crate) mod impl_linux {
                     pid: Some(ucred.pid as unix::pid_t),
                 })
             } else {
-                Err(io::Error::last_os_error())
+                Err(last_os_error!())
             }
         }
     }

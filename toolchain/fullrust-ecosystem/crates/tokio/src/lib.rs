@@ -488,7 +488,7 @@ compile_error!("The `taskdump` feature requires `--cfg tokio_unstable`.");
     feature = "taskdump",
     not(doc),
     not(all(
-        target_os = "linux",
+        any(target_os = "linux", target_os = "fullrust"),
         any(
             target_arch = "aarch64",
             target_arch = "x86",
@@ -518,6 +518,25 @@ compile_error!("The `schedule-latency` feature is only currently supported on 64
 #[macro_use]
 #[doc(hidden)]
 pub mod macros;
+
+// fullrust: no libc crate; tokio's Linux paths run on this private raw-syscall
+// stand-in, which has no C `errno` (hence `last_os_error!`).
+#[cfg(target_os = "fullrust")]
+mod fullrust_libc;
+#[cfg(not(target_os = "fullrust"))]
+#[allow(unused_macros)]
+macro_rules! last_os_error {
+    () => {
+        std::io::Error::last_os_error()
+    };
+}
+#[cfg(target_os = "fullrust")]
+#[allow(unused_macros)]
+macro_rules! last_os_error {
+    () => {
+        crate::fullrust_libc::last_os_error()
+    };
+}
 
 cfg_fs! {
     pub mod fs;
@@ -644,15 +663,15 @@ pub mod stream {}
 // local re-exports of platform specific things, allowing for decent
 // documentation to be shimmed in on docs.rs
 
-#[cfg(all(docsrs, unix))]
+#[cfg(all(docsrs, any(unix, target_os = "fullrust")))]
 pub mod doc;
 
 #[cfg(any(feature = "net", feature = "fs"))]
-#[cfg(all(docsrs, unix))]
+#[cfg(all(docsrs, any(unix, target_os = "fullrust")))]
 #[allow(unused)]
 pub(crate) use self::doc::os;
 
-#[cfg(not(all(docsrs, unix)))]
+#[cfg(not(all(docsrs, any(unix, target_os = "fullrust"))))]
 #[allow(unused)]
 pub(crate) use std::os;
 

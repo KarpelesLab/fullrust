@@ -125,7 +125,7 @@ impl<E: Source> PollEvented<E> {
     }
 
     /// Returns a reference to the registration.
-    #[cfg(any(feature = "net", all(feature = "process", target_os = "linux")))]
+    #[cfg(any(feature = "net", all(feature = "process", any(target_os = "linux", target_os = "fullrust"))))]
     pub(crate) fn registration(&self) -> &Registration {
         &self.registration
     }
@@ -139,7 +139,7 @@ impl<E: Source> PollEvented<E> {
     }
 
     /// Re-register under new runtime with `interest`.
-    #[cfg(all(feature = "process", target_os = "linux"))]
+    #[cfg(all(feature = "process", any(target_os = "linux", target_os = "fullrust")))]
     pub(crate) fn reregister(&mut self, interest: Interest) -> io::Result<()> {
         let io = self.io.as_mut().unwrap(); // As io shouldn't ever be None, just unwrap here.
         let _ = self.registration.deregister(io);
@@ -151,7 +151,7 @@ impl<E: Source> PollEvented<E> {
 }
 
 feature! {
-    #![any(feature = "net", all(unix, feature = "process"))]
+    #![any(feature = "net", all(any(unix, target_os = "fullrust"), feature = "process"))]
 
     use crate::io::ReadBuf;
     use std::task::{Context, Poll};
@@ -194,7 +194,7 @@ feature! {
                                 // epoll
                                 target_os = "android",
                                 target_os = "illumos",
-                                target_os = "linux",
+                                any(target_os = "linux", target_os = "fullrust"),
                                 target_os = "redox",
                                 // kqueue
                                 target_os = "dragonfly",
@@ -248,7 +248,7 @@ feature! {
                                 // epoll
                                 target_os = "android",
                                 target_os = "illumos",
-                                target_os = "linux",
+                                any(target_os = "linux", target_os = "fullrust"),
                                 target_os = "redox",
                                 // kqueue
                                 target_os = "dragonfly",

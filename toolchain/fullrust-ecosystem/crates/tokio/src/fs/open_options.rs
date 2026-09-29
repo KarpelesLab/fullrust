@@ -16,7 +16,7 @@ use mock_open_options::MockOpenOptions as StdOpenOptions;
 #[cfg(not(test))]
 use std::fs::OpenOptions as StdOpenOptions;
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fullrust"))]
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
@@ -564,7 +564,7 @@ impl OpenOptions {
 }
 
 feature! {
-    #![unix]
+    #![any(unix, target_os = "fullrust")]
 
     impl OpenOptions {
         /// Sets the mode bits that a new file will be created with.

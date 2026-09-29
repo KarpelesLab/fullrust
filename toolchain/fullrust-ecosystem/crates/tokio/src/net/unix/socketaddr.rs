@@ -35,12 +35,12 @@ impl SocketAddr {
     ///
     ///
     /// [`SocketAddrExt`]: std::os::linux::net::SocketAddrExt
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
     #[cfg_attr(docsrs, doc(cfg(any(target_os = "linux", target_os = "android"))))]
     pub fn as_abstract_name(&self) -> Option<&[u8]> {
         #[cfg(target_os = "android")]
         use std::os::android::net::SocketAddrExt;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "fullrust"))]
         use std::os::linux::net::SocketAddrExt;
 
         self.0.as_abstract_name()

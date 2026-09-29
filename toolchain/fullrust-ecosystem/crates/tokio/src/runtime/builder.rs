@@ -376,8 +376,8 @@ impl Builder {
     pub fn enable_all(&mut self) -> &mut Self {
         #[cfg(any(
             feature = "net",
-            all(unix, feature = "process"),
-            all(unix, feature = "signal")
+            all(any(unix, target_os = "fullrust"), feature = "process"),
+            all(any(unix, target_os = "fullrust"), feature = "signal")
         ))]
         self.enable_io();
 

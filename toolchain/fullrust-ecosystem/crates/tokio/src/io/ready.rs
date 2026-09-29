@@ -9,7 +9,7 @@ const READABLE: usize = 0b0_01;
 const WRITABLE: usize = 0b0_10;
 const READ_CLOSED: usize = 0b0_0100;
 const WRITE_CLOSED: usize = 0b0_1000;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
 const PRIORITY: usize = 0b1_0000;
 const ERROR: usize = 0b10_0000;
 
@@ -37,7 +37,7 @@ impl Ready {
     pub const WRITE_CLOSED: Ready = Ready(WRITE_CLOSED);
 
     /// Returns a `Ready` representing priority readiness.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
     #[cfg_attr(docsrs, doc(cfg(any(target_os = "linux", target_os = "android"))))]
     pub const PRIORITY: Ready = Ready(PRIORITY);
 
@@ -45,12 +45,12 @@ impl Ready {
     pub const ERROR: Ready = Ready(ERROR);
 
     /// Returns a `Ready` representing readiness for all operations.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
     pub const ALL: Ready =
         Ready(READABLE | WRITABLE | READ_CLOSED | WRITE_CLOSED | ERROR | PRIORITY);
 
     /// Returns a `Ready` representing readiness for all operations.
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(not(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android")))]
     pub const ALL: Ready = Ready(READABLE | WRITABLE | READ_CLOSED | WRITE_CLOSED | ERROR);
 
     // Must remain crate-private to avoid adding a public dependency on Mio.
@@ -88,7 +88,7 @@ impl Ready {
             ready |= Ready::ERROR;
         }
 
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
         {
             if event.is_priority() {
                 ready |= Ready::PRIORITY;
@@ -185,7 +185,7 @@ impl Ready {
     /// assert!(!Ready::WRITABLE.is_priority());
     /// assert!(Ready::PRIORITY.is_priority());
     /// ```
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
     #[cfg_attr(docsrs, doc(cfg(any(target_os = "linux", target_os = "android"))))]
     pub fn is_priority(self) -> bool {
         self.contains(Ready::PRIORITY)
@@ -248,7 +248,7 @@ impl Ready {
             ready |= Ready::WRITE_CLOSED;
         }
 
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
         if interest.is_priority() {
             ready |= Ready::PRIORITY;
             ready |= Ready::READ_CLOSED;
@@ -314,7 +314,7 @@ impl fmt::Debug for Ready {
             .field("is_write_closed", &self.is_write_closed())
             .field("is_error", &self.is_error());
 
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
         fmt.field("is_priority", &self.is_priority());
 
         fmt.finish()

@@ -2,6 +2,8 @@ use crate::net::{TcpListener, TcpStream};
 
 use std::fmt;
 use std::io;
+#[cfg(target_os = "fullrust")]
+use crate::fullrust_libc as libc;
 use std::net::SocketAddr;
 
 #[cfg(not(windows))]
@@ -168,8 +170,7 @@ impl TcpSocket {
             target_os = "freebsd",
             target_os = "fuchsia",
             target_os = "illumos",
-            target_os = "linux",
-            target_os = "fullrust",
+            any(target_os = "linux", target_os = "fullrust"),
             target_os = "netbsd",
             target_os = "openbsd",
             target_os = "wasi",
@@ -182,8 +183,7 @@ impl TcpSocket {
             target_os = "freebsd",
             target_os = "fuchsia",
             target_os = "illumos",
-            target_os = "linux",
-            target_os = "fullrust",
+            any(target_os = "linux", target_os = "fullrust"),
             target_os = "netbsd",
             target_os = "openbsd",
             target_os = "wasi",
@@ -293,7 +293,7 @@ impl TcpSocket {
     #[cfg_attr(
         docsrs,
         doc(cfg(all(
-            any(unix, target_os = "fullrust"),
+            unix,
             not(target_os = "solaris"),
             not(target_os = "illumos"),
             not(target_os = "cygwin"),
@@ -340,7 +340,7 @@ impl TcpSocket {
     #[cfg_attr(
         docsrs,
         doc(cfg(all(
-            any(unix, target_os = "fullrust"),
+            unix,
             not(target_os = "solaris"),
             not(target_os = "illumos"),
             not(target_os = "cygwin"),
@@ -532,7 +532,7 @@ impl TcpSocket {
         target_os = "dragonfly",
         target_os = "freebsd",
         target_os = "fuchsia",
-        target_os = "linux",
+        any(target_os = "linux", target_os = "fullrust"),
         target_os = "macos",
         target_os = "netbsd",
         target_os = "openbsd",
@@ -570,7 +570,7 @@ impl TcpSocket {
         target_os = "dragonfly",
         target_os = "freebsd",
         target_os = "fuchsia",
-        target_os = "linux",
+        any(target_os = "linux", target_os = "fullrust"),
         target_os = "macos",
         target_os = "netbsd",
         target_os = "openbsd",
@@ -720,7 +720,7 @@ impl TcpSocket {
     /// Gets the value for the `SO_BINDTODEVICE` option on this socket
     ///
     /// This value gets the socket binded device's interface name.
-    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux",))]
+    #[cfg(any(target_os = "android", target_os = "fuchsia", any(target_os = "linux", target_os = "fullrust"),))]
     #[cfg_attr(
         docsrs,
         doc(cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux",)))
@@ -736,7 +736,7 @@ impl TcpSocket {
     /// works for some socket types, particularly `AF_INET` sockets.
     ///
     /// If `interface` is `None` or an empty string it removes the binding.
-    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    #[cfg(any(target_os = "android", target_os = "fuchsia", any(target_os = "linux", target_os = "fullrust")))]
     #[cfg_attr(
         docsrs,
         doc(cfg(all(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))))
@@ -842,13 +842,8 @@ impl TcpSocket {
     /// ```
     pub async fn connect(self, addr: SocketAddr) -> io::Result<TcpStream> {
         if let Err(err) = self.inner.connect(&addr.into()) {
-            #[cfg(not(any(windows, target_os = "fullrust")))]
+            #[cfg(not(windows))]
             if err.raw_os_error() != Some(libc::EINPROGRESS) {
-                return Err(err);
-            }
-            // No libc on fullrust; Linux `EINPROGRESS` is 115.
-            #[cfg(target_os = "fullrust")]
-            if err.raw_os_error() != Some(115) {
                 return Err(err);
             }
             #[cfg(windows)]
@@ -1001,7 +996,7 @@ impl fmt::Debug for TcpSocket {
 
 // These trait implementations can't be build on Windows, so we completely
 // ignore them, even when building documentation.
-#[cfg(any(unix, target_os = "wasi", target_os = "fullrust"))]
+#[cfg(any(any(unix, target_os = "fullrust"), target_os = "wasi"))]
 cfg_unix_or_wasi! {
     impl AsRawFd for TcpSocket {
         fn as_raw_fd(&self) -> RawFd {

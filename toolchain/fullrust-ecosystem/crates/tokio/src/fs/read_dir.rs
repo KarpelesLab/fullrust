@@ -157,7 +157,7 @@ impl ReadDir {
 }
 
 feature! {
-    #![unix]
+    #![any(unix, target_os = "fullrust")]
 
     use std::os::unix::fs::DirEntryExt;
 
@@ -350,7 +350,7 @@ impl DirEntry {
     }
 
     /// Returns a reference to the underlying `std::fs::DirEntry`.
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "fullrust"))]
     pub(super) fn as_inner(&self) -> &std::fs::DirEntry {
         &self.std
     }

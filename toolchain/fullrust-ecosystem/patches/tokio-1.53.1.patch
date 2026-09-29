@@ -1,101 +1,995 @@
-# fullrust support for tokio 1.53.1 — cfg broadenings only, so feature "net"
-# (TcpListener/TcpStream/TcpSocket/UdpSocket) and tokio::io::unix::AsyncFd build
-# on target_os = "fullrust" via the fd-level (std::os::fd) code paths tokio
-# already has for unix/wasi, and the Linux socket flags. No libc dependency.
-# Needs the bundle's mio (fullrust epoll backend) and a fullrust socket2 0.6.
-# Not covered: process, signal (need libc/signal-hook-registry and
-# std::os::unix::process), net::unix (needs std::os::unix::net).
+# fullrust support for tokio 1.53.1 — route target_os = "fullrust" through
+# tokio's own Unix/Linux code, so feature "full" builds and works: net (TCP,
+# UDP, AsyncFd, net::unix incl. UnixStream/Listener/Datagram, peer_cred,
+# abstract names, unix::pipe), process (pidfd reaper + SIGCHLD orphan/signal
+# reaper, piped stdio, kill_on_drop), signal (unix::signal, ctrl_c), fs Unix
+# extensions (mode, custom_flags, DirEntry::ino, symlink, ...).
 # Applied on top of crates.io tokio 1.53.1 (vendored in crates/tokio/).
-diff -ruN a/Cargo.toml b/Cargo.toml
---- a/Cargo.toml	2026-09-29 13:31:06.391424389 +0900
-+++ b/Cargo.toml	2026-09-29 13:31:06.404778277 +0900
+#
+# * Every cfg predicate in src/ (outside the io-uring-only files) rewritten by
+#   ../patches/fullrust-cfg.py --keep tokio_unstable:
+#     unix               -> any(unix, target_os = "fullrust")
+#     target_os="linux"  -> any(target_os = "linux", target_os = "fullrust")
+#   (also inside tokio's `feature! { #![..] }`). `all(..)` groups naming
+#   tokio_unstable (io-uring, taskdump: their deps are Linux-only) are left
+#   alone. fullrust std provides std::os::unix / std::os::linux, so the
+#   upstream Unix code compiles as is.
+# * New file src/fullrust_libc.rs: a private stand-in for the libc items the
+#   Linux paths use (Linux x86-64 layouts/values, raw `syscall`s) and for the
+#   two signal-hook-registry items tokio uses (`register`, `FORBIDDEN`):
+#   rt_sigaction with an sa_restorer trampoline, SA_RESTART|SA_SIGINFO,
+#   actions run in registration order, previous handler chained. The
+#   signal-hook-registry crate is not used: it is a cfg(unix) dependency whose
+#   own `libc` calls (sigaction) would need a fork of its own.
+# * Hand edits: `mod fullrust_libc` + a `last_os_error!` macro (lib.rs; it is
+#   `io::Error::last_os_error()` on other targets, the shim's errno on
+#   fullrust, which has no C errno), `use crate::fullrust_libc as libc` in the
+#   8 files that name libc (with `signal_hook_registry` in signal/unix.rs),
+#   `last_os_error!()` at the 9 libc error sites, and an explicit 0 third
+#   argument at the 3 two-argument `fcntl(fd, F_GETFL)` calls (libc's fcntl
+#   is variadic; identical on every target).
+# * Cargo.toml: check-cfg for target_os = "fullrust". tokio's cfg(unix)
+#   dependencies (libc, signal-hook-registry) stay out of the build graph.
+
+--- a/Cargo.toml
++++ b/Cargo.toml
 @@ -992,4 +992,5 @@
      "cfg(tokio_no_tuning_tests)",
      "cfg(tokio_unstable)",
      'cfg(target_os, values("cygwin"))',
 +    'cfg(target_os, values("fullrust"))',
  ]
-diff -ruN a/src/io/async_fd.rs b/src/io/async_fd.rs
---- a/src/io/async_fd.rs	2026-09-29 13:31:06.392117409 +0900
-+++ b/src/io/async_fd.rs	2026-09-29 13:31:06.399242775 +0900
-@@ -6,7 +6,7 @@
- use std::error::Error;
- use std::fmt;
- use std::io;
--use std::os::unix::io::{AsRawFd, RawFd};
-+use std::os::fd::{AsRawFd, RawFd};
- use std::task::{ready, Context, Poll};
+--- a/src/fs/dir_builder.rs
++++ b/src/fs/dir_builder.rs
+@@ -13,7 +13,7 @@
+     recursive: bool,
  
- /// Associates an IO object backed by a Unix file descriptor with the tokio
-@@ -930,9 +930,9 @@
+     /// Sets the Unix mode for newly created directories.
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "fullrust"))]
+     pub(super) mode: Option<u32>,
+ }
+ 
+@@ -93,7 +93,7 @@
+         let mut builder = std::fs::DirBuilder::new();
+         builder.recursive(self.recursive);
+ 
+-        #[cfg(unix)]
++        #[cfg(any(unix, target_os = "fullrust"))]
+         {
+             if let Some(mode) = self.mode {
+                 std::os::unix::fs::DirBuilderExt::mode(&mut builder, mode);
+@@ -105,7 +105,7 @@
+ }
+ 
+ feature! {
+-    #![unix]
++    #![any(unix, target_os = "fullrust")]
+ 
+     impl DirBuilder {
+         /// Sets the mode to create new directories with.
+--- a/src/fs/file.rs
++++ b/src/fs/file.rs
+@@ -897,21 +897,21 @@
      }
  }
  
--impl<T: AsRawFd> std::os::unix::io::AsFd for AsyncFd<T> {
--    fn as_fd(&self) -> std::os::unix::io::BorrowedFd<'_> {
--        unsafe { std::os::unix::io::BorrowedFd::borrow_raw(self.as_raw_fd()) }
-+impl<T: AsRawFd> std::os::fd::AsFd for AsyncFd<T> {
-+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-+        unsafe { std::os::fd::BorrowedFd::borrow_raw(self.as_raw_fd()) }
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "fullrust"))]
+ impl From<std::os::fd::OwnedFd> for File {
+     fn from(fd: std::os::fd::OwnedFd) -> Self {
+         Self::from_std(StdFile::from(fd))
      }
  }
  
-diff -ruN a/src/io/mod.rs b/src/io/mod.rs
---- a/src/io/mod.rs	2026-09-29 13:31:06.392189891 +0900
-+++ b/src/io/mod.rs	2026-09-29 13:31:06.399311011 +0900
-@@ -252,7 +252,7 @@
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "fullrust"))]
+ impl std::os::unix::io::AsRawFd for File {
+     fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+         self.std.as_raw_fd()
      }
  }
  
--cfg_net_unix! {
-+cfg_net_unix_fd! {
-     mod async_fd;
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "fullrust"))]
+ impl std::os::unix::io::AsFd for File {
+     fn as_fd(&self) -> std::os::unix::io::BorrowedFd<'_> {
+         unsafe {
+@@ -920,7 +920,7 @@
+     }
+ }
  
-     pub mod unix {
-diff -ruN a/src/macros/cfg.rs b/src/macros/cfg.rs
---- a/src/macros/cfg.rs	2026-09-29 13:31:06.393033743 +0900
-+++ b/src/macros/cfg.rs	2026-09-29 13:31:06.400192561 +0900
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "fullrust"))]
+ impl std::os::unix::io::FromRawFd for File {
+     unsafe fn from_raw_fd(fd: std::os::unix::io::RawFd) -> Self {
+         // Safety: exactly the same safety contract as
+--- a/src/fs/mocks.rs
++++ b/src/fs/mocks.rs
+@@ -2,7 +2,7 @@
+ use mockall::mock;
+ 
+ use crate::sync::oneshot;
+-#[cfg(all(test, unix))]
++#[cfg(all(test, any(unix, target_os = "fullrust")))]
+ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+ use std::{
+     cell::RefCell,
+@@ -49,12 +49,12 @@
+     impl std::os::windows::io::FromRawHandle for File {
+         unsafe fn from_raw_handle(h: std::os::windows::io::RawHandle) -> Self;
+     }
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "fullrust"))]
+     impl std::os::unix::io::AsRawFd for File {
+         fn as_raw_fd(&self) -> std::os::unix::io::RawFd;
+     }
+ 
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "fullrust"))]
+     impl std::os::unix::io::FromRawFd for File {
+         unsafe fn from_raw_fd(h: std::os::unix::io::RawFd) -> Self;
+     }
+@@ -102,7 +102,7 @@
+     }
+ }
+ 
+-#[cfg(all(test, unix))]
++#[cfg(all(test, any(unix, target_os = "fullrust")))]
+ impl From<MockFile> for OwnedFd {
+     #[inline]
+     fn from(file: MockFile) -> OwnedFd {
+@@ -110,7 +110,7 @@
+     }
+ }
+ 
+-#[cfg(all(test, unix))]
++#[cfg(all(test, any(unix, target_os = "fullrust")))]
+ impl From<OwnedFd> for MockFile {
+     #[inline]
+     fn from(file: OwnedFd) -> MockFile {
+--- a/src/fs/mod.rs
++++ b/src/fs/mod.rs
+@@ -281,7 +281,7 @@
+ mod mocks;
+ 
+ feature! {
+-    #![unix]
++    #![any(unix, target_os = "fullrust")]
+ 
+     mod symlink;
+     pub use self::symlink::symlink;
+--- a/src/fs/open_options/mock_open_options.rs
++++ b/src/fs/open_options/mock_open_options.rs
+@@ -3,7 +3,7 @@
+ use mockall::mock;
+ 
+ use crate::fs::mocks::MockFile;
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "fullrust"))]
+ use std::os::unix::fs::OpenOptionsExt;
+ #[cfg(windows)]
+ use std::os::windows::fs::OpenOptionsExt;
+@@ -23,7 +23,7 @@
+     impl Clone for OpenOptions {
+         fn clone(&self) -> Self;
+     }
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "fullrust"))]
+     impl OpenOptionsExt for OpenOptions {
+         fn custom_flags(&mut self, flags: i32) -> &mut Self;
+         fn mode(&mut self, mode: u32) -> &mut Self;
+--- a/src/fs/open_options.rs
++++ b/src/fs/open_options.rs
+@@ -16,7 +16,7 @@
+ #[cfg(not(test))]
+ use std::fs::OpenOptions as StdOpenOptions;
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "fullrust"))]
+ use std::os::unix::fs::OpenOptionsExt;
+ #[cfg(windows)]
+ use std::os::windows::fs::OpenOptionsExt;
+@@ -564,7 +564,7 @@
+ }
+ 
+ feature! {
+-    #![unix]
++    #![any(unix, target_os = "fullrust")]
+ 
+     impl OpenOptions {
+         /// Sets the mode bits that a new file will be created with.
+--- a/src/fs/read_dir.rs
++++ b/src/fs/read_dir.rs
+@@ -157,7 +157,7 @@
+ }
+ 
+ feature! {
+-    #![unix]
++    #![any(unix, target_os = "fullrust")]
+ 
+     use std::os::unix::fs::DirEntryExt;
+ 
+@@ -350,7 +350,7 @@
+     }
+ 
+     /// Returns a reference to the underlying `std::fs::DirEntry`.
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "fullrust"))]
+     pub(super) fn as_inner(&self) -> &std::fs::DirEntry {
+         &self.std
+     }
+--- a/src/fs/try_exists.rs
++++ b/src/fs/try_exists.rs
+@@ -67,7 +67,7 @@
+         // uses 1.25 musl on all *-linux-musl platforms starting
+         // in 1.93 stable rust version.
+         // https://blog.rust-lang.org/2025/12/05/Updating-musl-1.2.5/
+-        any(target_env = "gnu", target_os = "android")
++        any(any(target_env = "gnu", target_os = "fullrust"), target_os = "android")
+     )]
+     async fn try_exists_uring(path: &Path) -> io::Result<bool> {
+         use crate::runtime::driver::op::Op;
+--- /dev/null
++++ b/src/fullrust_libc.rs
+@@ -0,0 +1,364 @@
++//! A private, minimal stand-in for the `libc` crate (and for the few
++//! `signal-hook-registry` items tokio uses) on the `fullrust` target.
++//!
++//! `fullrust` (`x86_64-unknown-linux-fullrust`) is the Linux kernel ABI with no
++//! C library, so tokio's ordinary Linux code paths (`process` with its pidfd
++//! and SIGCHLD reapers, `signal`, `net::unix` incl. `pipe` and `peer_cred`)
++//! are compiled unchanged and resolve their `libc::…` paths to this module
++//! instead. It supplies exactly the types, constants and functions those paths
++//! use, with Linux x86-64 layouts and values, implemented as raw `syscall`s.
++//!
++//! Functions keep libc's convention (`-1` on failure) but, with no C `errno`,
++//! record the error in a thread-local read by [`last_os_error`]; tokio's call
++//! sites use the crate-level `last_os_error!()` macro, which is
++//! `std::io::Error::last_os_error()` on every other target.
++#![allow(dead_code, non_camel_case_types, non_upper_case_globals, non_snake_case)]
++#![allow(clippy::missing_safety_doc, unsafe_op_in_unsafe_fn)]
++
++use core::arch::asm;
++use std::cell::Cell;
++use std::io;
++
++pub(crate) type c_int = core::ffi::c_int;
++pub(crate) type c_uint = core::ffi::c_uint;
++pub(crate) type c_long = core::ffi::c_long;
++pub(crate) type c_void = core::ffi::c_void;
++pub(crate) type size_t = usize;
++pub(crate) type socklen_t = u32;
++pub(crate) type mode_t = u32;
++pub(crate) type pid_t = i32;
++pub(crate) type uid_t = u32;
++pub(crate) type gid_t = u32;
++
++// ---------------------------------------------------------------------------
++// Structs (Linux x86-64 layouts)
++// ---------------------------------------------------------------------------
++
++#[repr(C)]
++#[derive(Clone, Copy)]
++pub(crate) struct ucred {
++    pub pid: pid_t,
++    pub uid: uid_t,
++    pub gid: gid_t,
++}
++
++#[repr(C)]
++#[derive(Clone, Copy)]
++pub(crate) struct stat {
++    pub st_dev: u64,
++    pub st_ino: u64,
++    pub st_nlink: u64,
++    pub st_mode: u32,
++    pub st_uid: u32,
++    pub st_gid: u32,
++    __pad0: i32,
++    pub st_rdev: u64,
++    pub st_size: i64,
++    pub st_blksize: i64,
++    pub st_blocks: i64,
++    pub st_atime: i64,
++    pub st_atime_nsec: i64,
++    pub st_mtime: i64,
++    pub st_mtime_nsec: i64,
++    pub st_ctime: i64,
++    pub st_ctime_nsec: i64,
++    __unused: [i64; 3],
++}
++
++const _: () = {
++    assert!(core::mem::size_of::<ucred>() == 12);
++    assert!(core::mem::size_of::<stat>() == 144);
++};
++
++// ---------------------------------------------------------------------------
++// Constants (Linux x86-64 values)
++// ---------------------------------------------------------------------------
++
++pub(crate) const ENOSYS: c_int = 38;
++pub(crate) const EINPROGRESS: c_int = 115;
++
++pub(crate) const F_GETFL: c_int = 3;
++pub(crate) const F_SETFL: c_int = 4;
++pub(crate) const O_ACCMODE: c_int = 3;
++pub(crate) const O_RDONLY: c_int = 0;
++pub(crate) const O_WRONLY: c_int = 1;
++pub(crate) const O_RDWR: c_int = 2;
++pub(crate) const O_NONBLOCK: c_int = 0o4000;
++pub(crate) const S_IFMT: mode_t = 0o170000;
++pub(crate) const S_IFIFO: mode_t = 0o010000;
++
++pub(crate) const SOL_SOCKET: c_int = 1;
++pub(crate) const SO_PEERCRED: c_int = 17;
++
++pub(crate) const SYS_pidfd_open: c_long = 434;
++pub(crate) const PIDFD_NONBLOCK: c_uint = O_NONBLOCK as c_uint;
++
++pub(crate) const SIGHUP: c_int = 1;
++pub(crate) const SIGINT: c_int = 2;
++pub(crate) const SIGQUIT: c_int = 3;
++pub(crate) const SIGILL: c_int = 4;
++pub(crate) const SIGFPE: c_int = 8;
++pub(crate) const SIGKILL: c_int = 9;
++pub(crate) const SIGUSR1: c_int = 10;
++pub(crate) const SIGSEGV: c_int = 11;
++pub(crate) const SIGUSR2: c_int = 12;
++pub(crate) const SIGPIPE: c_int = 13;
++pub(crate) const SIGALRM: c_int = 14;
++pub(crate) const SIGTERM: c_int = 15;
++pub(crate) const SIGCHLD: c_int = 17;
++pub(crate) const SIGSTOP: c_int = 19;
++pub(crate) const SIGWINCH: c_int = 28;
++pub(crate) const SIGIO: c_int = 29;
++pub(crate) const SIGPOLL: c_int = SIGIO;
++
++/// glibc's `SIGRTMAX()` (the kernel's `_NSIG` is 64 on x86-64).
++pub(crate) fn SIGRTMAX() -> c_int {
++    64
++}
++
++// ---------------------------------------------------------------------------
++// errno stand-in
++// ---------------------------------------------------------------------------
++
++std::thread_local! {
++    static ERRNO: Cell<i32> = const { Cell::new(0) };
++}
++
++/// The error recorded by the last failing function of this module on this
++/// thread (what `io::Error::last_os_error()` is for libc).
++pub(crate) fn last_os_error() -> io::Error {
++    io::Error::from_raw_os_error(ERRNO.with(Cell::get))
++}
++
++/// libc convention: `-errno` from the kernel becomes `-1` + errno.
++fn ret(r: isize) -> isize {
++    if (-4095..0).contains(&r) {
++        ERRNO.with(|e| e.set(-r as i32));
++        -1
++    } else {
++        r
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Raw syscalls (x86-64: nr in rax, args rdi rsi rdx r10 r8 r9; rcx/r11 clobbered)
++// ---------------------------------------------------------------------------
++
++const NR_FSTAT: usize = 5;
++const NR_RT_SIGACTION: usize = 13;
++const NR_GETSOCKOPT: usize = 55;
++const NR_FCNTL: usize = 72;
++const NR_RT_SIGRETURN: usize = 15;
++
++#[inline]
++unsafe fn sys2(n: usize, a: usize, b: usize) -> isize {
++    let r: isize;
++    asm!("syscall", inlateout("rax") n as isize => r, in("rdi") a, in("rsi") b,
++        lateout("rcx") _, lateout("r11") _, options(nostack, preserves_flags));
++    r
++}
++#[inline]
++unsafe fn sys3(n: usize, a: usize, b: usize, c: usize) -> isize {
++    let r: isize;
++    asm!("syscall", inlateout("rax") n as isize => r, in("rdi") a, in("rsi") b, in("rdx") c,
++        lateout("rcx") _, lateout("r11") _, options(nostack, preserves_flags));
++    r
++}
++#[inline]
++unsafe fn sys4(n: usize, a: usize, b: usize, c: usize, d: usize) -> isize {
++    let r: isize;
++    asm!("syscall", inlateout("rax") n as isize => r, in("rdi") a, in("rsi") b, in("rdx") c,
++        in("r10") d, lateout("rcx") _, lateout("r11") _, options(nostack, preserves_flags));
++    r
++}
++#[inline]
++unsafe fn sys5(n: usize, a: usize, b: usize, c: usize, d: usize, e: usize) -> isize {
++    let r: isize;
++    asm!("syscall", inlateout("rax") n as isize => r, in("rdi") a, in("rsi") b, in("rdx") c,
++        in("r10") d, in("r8") e, lateout("rcx") _, lateout("r11") _,
++        options(nostack, preserves_flags));
++    r
++}
++
++// `int` arguments are sign-extended as the C ABI would; the kernel truncates.
++#[inline]
++fn i(v: c_int) -> usize {
++    v as isize as usize
++}
++
++// ---------------------------------------------------------------------------
++// Functions: libc signatures and return convention
++// ---------------------------------------------------------------------------
++
++/// `fcntl(fd, cmd, arg)`; the `F_GETFL` call sites pass a dummy `0` (libc's
++/// is variadic, Rust functions are not).
++pub(crate) unsafe fn fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int {
++    ret(sys3(NR_FCNTL, i(fd), i(cmd), i(arg))) as c_int
++}
++
++pub(crate) unsafe fn fstat(fd: c_int, buf: *mut stat) -> c_int {
++    ret(sys2(NR_FSTAT, i(fd), buf as usize)) as c_int
++}
++
++pub(crate) unsafe fn getsockopt(
++    fd: c_int,
++    level: c_int,
++    name: c_int,
++    value: *mut c_void,
++    len: *mut socklen_t,
++) -> c_int {
++    ret(sys5(NR_GETSOCKOPT, i(fd), i(level), i(name), value as usize, len as usize)) as c_int
++}
++
++/// The one `syscall(2)` shape tokio uses: `syscall(SYS_pidfd_open, pid, flags)`.
++pub(crate) unsafe fn syscall(nr: c_long, pid: u32, flags: c_uint) -> c_long {
++    ret(sys2(nr as usize, pid as usize, flags as usize)) as c_long
++}
++
++pub(crate) unsafe fn memchr(cx: *const c_void, c: c_int, n: size_t) -> *mut c_void {
++    let s = core::slice::from_raw_parts(cx as *const u8, n);
++    match s.iter().position(|&b| b == c as u8) {
++        Some(k) => cx.cast::<u8>().add(k) as *mut c_void,
++        None => core::ptr::null_mut(),
++    }
++}
++
++// ---------------------------------------------------------------------------
++// signal-hook-registry stand-in
++// ---------------------------------------------------------------------------
++
++/// The part of `signal-hook-registry` tokio uses (`register` + `FORBIDDEN`),
++/// with the same semantics on Linux: one process-wide `SA_RESTART |
++/// SA_SIGINFO` handler per signal that runs every registered action in
++/// registration order and then chains to the handler that was installed
++/// before it (if that was a function, not `SIG_DFL`/`SIG_IGN`). Actions are
++/// never unregistered (tokio never does).
++///
++/// (The crate itself can't be used: it calls `libc::sigaction`, and its
++/// `libc` dependency is empty on this non-`unix` target.)
++pub(crate) mod signal_hook_registry {
++    use super::*;
++    use std::sync::atomic::{AtomicPtr, Ordering};
++    use std::sync::Mutex;
++
++    pub(crate) const FORBIDDEN: &[c_int] = &[SIGKILL, SIGSTOP, SIGILL, SIGFPE, SIGSEGV];
++
++    /// Registration handle (tokio ignores it).
++    pub(crate) struct SigId;
++
++    const SA_SIGINFO: u64 = 0x4;
++    const SA_RESTORER: u64 = 0x0400_0000;
++    const SA_RESTART: u64 = 0x1000_0000;
++    const SIG_DFL: usize = 0;
++    const SIG_IGN: usize = 1;
++    const NSIG: usize = 65;
++
++    /// The kernel's `struct sigaction` for `rt_sigaction` on x86-64.
++    #[repr(C)]
++    #[derive(Clone, Copy)]
++    struct KSigaction {
++        handler: usize,
++        flags: u64,
++        restorer: usize,
++        mask: u64,
++    }
++
++    struct Node {
++        action: Box<dyn Fn() + Send + Sync>,
++        next: AtomicPtr<Node>,
++    }
++
++    struct Slot {
++        head: AtomicPtr<Node>,
++        prev: AtomicPtr<KSigaction>,
++    }
++
++    #[allow(clippy::declare_interior_mutable_const)]
++    const EMPTY: Slot = Slot {
++        head: AtomicPtr::new(core::ptr::null_mut()),
++        prev: AtomicPtr::new(core::ptr::null_mut()),
++    };
++    static SLOTS: [Slot; NSIG] = [EMPTY; NSIG];
++    static LOCK: Mutex<()> = Mutex::new(());
++
++    /// `rt_sigreturn` trampoline: x86-64 handlers need an `sa_restorer`.
++    #[unsafe(naked)]
++    unsafe extern "C" fn restorer() -> ! {
++        core::arch::naked_asm!("mov eax, {nr}", "syscall", "ud2", nr = const NR_RT_SIGRETURN)
++    }
++
++    extern "C" fn handler(sig: c_int, info: *mut c_void, ctx: *mut c_void) {
++        let slot = &SLOTS[sig as usize];
++        // Nodes are leaked, only ever appended: safe to walk without a lock.
++        let mut n = slot.head.load(Ordering::Acquire);
++        while !n.is_null() {
++            unsafe {
++                ((*n).action)();
++                n = (*n).next.load(Ordering::Acquire);
++            }
++        }
++        let prev = slot.prev.load(Ordering::Acquire);
++        if !prev.is_null() {
++            let p = unsafe { *prev };
++            if p.handler != SIG_DFL && p.handler != SIG_IGN {
++                unsafe {
++                    if p.flags & SA_SIGINFO != 0 {
++                        let f: extern "C" fn(c_int, *mut c_void, *mut c_void) =
++                            core::mem::transmute(p.handler);
++                        f(sig, info, ctx);
++                    } else {
++                        let f: extern "C" fn(c_int) = core::mem::transmute(p.handler);
++                        f(sig);
++                    }
++                }
++            }
++        }
++    }
++
++    /// Registers `action` to run (in signal-handler context) whenever
++    /// `signal` arrives.
++    pub(crate) unsafe fn register<F>(signal: c_int, action: F) -> Result<SigId, io::Error>
++    where
++        F: Fn() + Sync + Send + 'static,
++    {
++        assert!(
++            !FORBIDDEN.contains(&signal),
++            "Attempted to register forbidden signal {signal}"
++        );
++        if signal <= 0 || signal as usize >= NSIG {
++            return Err(io::Error::from_raw_os_error(22)); // EINVAL
++        }
++        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
++        let slot = &SLOTS[signal as usize];
++        let node = Box::into_raw(Box::new(Node {
++            action: Box::new(action),
++            next: AtomicPtr::new(core::ptr::null_mut()),
++        }));
++        let mut tail = &slot.head;
++        while !tail.load(Ordering::Acquire).is_null() {
++            tail = &(*tail.load(Ordering::Acquire)).next;
++        }
++        tail.store(node, Ordering::Release);
++        if slot.prev.load(Ordering::Acquire).is_null() {
++            let new = KSigaction {
++                handler: handler as *const () as usize,
++                flags: SA_SIGINFO | SA_RESTART | SA_RESTORER,
++                restorer: restorer as *const () as usize,
++                mask: 0,
++            };
++            let mut old = KSigaction { handler: 0, flags: 0, restorer: 0, mask: 0 };
++            let r = sys4(
++                NR_RT_SIGACTION,
++                i(signal),
++                &new as *const KSigaction as usize,
++                &mut old as *mut KSigaction as usize,
++                8,
++            );
++            if r < 0 {
++                return Err(io::Error::from_raw_os_error(-r as i32));
++            }
++            slot.prev.store(Box::into_raw(Box::new(old)), Ordering::Release);
++        }
++        Ok(SigId)
++    }
++}
+--- a/src/io/interest.rs
++++ b/src/io/interest.rs
+@@ -14,7 +14,7 @@
+ const AIO: usize = 0b0100;
+ #[cfg(target_os = "freebsd")]
+ const LIO: usize = 0b1000;
+-#[cfg(any(target_os = "linux", target_os = "android"))]
++#[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
+ const PRIORITY: usize = 0b0001_0000;
+ // error is available on all platforms, but behavior is platform-specific
+ // mio does not have this interest
+@@ -66,7 +66,7 @@
+     pub const ERROR: Interest = Interest(ERROR);
+ 
+     /// Returns a `Interest` set representing priority completion interests.
+-    #[cfg(any(target_os = "linux", target_os = "android"))]
++    #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
+     #[cfg_attr(docsrs, doc(cfg(any(target_os = "linux", target_os = "android"))))]
+     pub const PRIORITY: Interest = Interest(PRIORITY);
+ 
+@@ -144,7 +144,7 @@
+     /// let both = Interest::READABLE | Interest::PRIORITY;
+     /// assert!(both.is_priority());
+     /// ```
+-    #[cfg(any(target_os = "linux", target_os = "android"))]
++    #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
+     #[cfg_attr(docsrs, doc(cfg(any(target_os = "linux", target_os = "android"))))]
+     pub const fn is_priority(self) -> bool {
+         self.0 & PRIORITY != 0
+@@ -222,7 +222,7 @@
+             mio_add(&mut mio, mio::Interest::WRITABLE);
+         }
+ 
+-        #[cfg(any(target_os = "linux", target_os = "android"))]
++        #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
+         if self.is_priority() {
+             mio_add(&mut mio, mio::Interest::PRIORITY);
+         }
+@@ -259,7 +259,7 @@
+         match self {
+             Interest::READABLE => Ready::READABLE | Ready::READ_CLOSED,
+             Interest::WRITABLE => Ready::WRITABLE | Ready::WRITE_CLOSED,
+-            #[cfg(any(target_os = "linux", target_os = "android"))]
++            #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
+             Interest::PRIORITY => Ready::PRIORITY | Ready::READ_CLOSED,
+             Interest::ERROR => Ready::ERROR,
+             _ => Ready::EMPTY,
+@@ -303,7 +303,7 @@
+             separator = true;
+         }
+ 
+-        #[cfg(any(target_os = "linux", target_os = "android"))]
++        #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
+         if self.is_priority() {
+             if separator {
+                 write!(fmt, " | ")?;
+--- a/src/io/mod.rs
++++ b/src/io/mod.rs
+@@ -242,7 +242,7 @@
+ 
+ // The bsd module can't be build on Windows, so we completely ignore it, even
+ // when building documentation.
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "fullrust"))]
+ cfg_aio! {
+     /// BSD-specific I/O types.
+     pub mod bsd {
+--- a/src/io/poll_evented.rs
++++ b/src/io/poll_evented.rs
+@@ -125,7 +125,7 @@
+     }
+ 
+     /// Returns a reference to the registration.
+-    #[cfg(any(feature = "net", all(feature = "process", target_os = "linux")))]
++    #[cfg(any(feature = "net", all(feature = "process", any(target_os = "linux", target_os = "fullrust"))))]
+     pub(crate) fn registration(&self) -> &Registration {
+         &self.registration
+     }
+@@ -139,7 +139,7 @@
+     }
+ 
+     /// Re-register under new runtime with `interest`.
+-    #[cfg(all(feature = "process", target_os = "linux"))]
++    #[cfg(all(feature = "process", any(target_os = "linux", target_os = "fullrust")))]
+     pub(crate) fn reregister(&mut self, interest: Interest) -> io::Result<()> {
+         let io = self.io.as_mut().unwrap(); // As io shouldn't ever be None, just unwrap here.
+         let _ = self.registration.deregister(io);
+@@ -151,7 +151,7 @@
+ }
+ 
+ feature! {
+-    #![any(feature = "net", all(unix, feature = "process"))]
++    #![any(feature = "net", all(any(unix, target_os = "fullrust"), feature = "process"))]
+ 
+     use crate::io::ReadBuf;
+     use std::task::{Context, Poll};
+@@ -194,7 +194,7 @@
+                                 // epoll
+                                 target_os = "android",
+                                 target_os = "illumos",
+-                                target_os = "linux",
++                                any(target_os = "linux", target_os = "fullrust"),
+                                 target_os = "redox",
+                                 // kqueue
+                                 target_os = "dragonfly",
+@@ -248,7 +248,7 @@
+                                 // epoll
+                                 target_os = "android",
+                                 target_os = "illumos",
+-                                target_os = "linux",
++                                any(target_os = "linux", target_os = "fullrust"),
+                                 target_os = "redox",
+                                 // kqueue
+                                 target_os = "dragonfly",
+--- a/src/io/ready.rs
++++ b/src/io/ready.rs
+@@ -9,7 +9,7 @@
+ const WRITABLE: usize = 0b0_10;
+ const READ_CLOSED: usize = 0b0_0100;
+ const WRITE_CLOSED: usize = 0b0_1000;
+-#[cfg(any(target_os = "linux", target_os = "android"))]
++#[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
+ const PRIORITY: usize = 0b1_0000;
+ const ERROR: usize = 0b10_0000;
+ 
+@@ -37,7 +37,7 @@
+     pub const WRITE_CLOSED: Ready = Ready(WRITE_CLOSED);
+ 
+     /// Returns a `Ready` representing priority readiness.
+-    #[cfg(any(target_os = "linux", target_os = "android"))]
++    #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
+     #[cfg_attr(docsrs, doc(cfg(any(target_os = "linux", target_os = "android"))))]
+     pub const PRIORITY: Ready = Ready(PRIORITY);
+ 
+@@ -45,12 +45,12 @@
+     pub const ERROR: Ready = Ready(ERROR);
+ 
+     /// Returns a `Ready` representing readiness for all operations.
+-    #[cfg(any(target_os = "linux", target_os = "android"))]
++    #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
+     pub const ALL: Ready =
+         Ready(READABLE | WRITABLE | READ_CLOSED | WRITE_CLOSED | ERROR | PRIORITY);
+ 
+     /// Returns a `Ready` representing readiness for all operations.
+-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
++    #[cfg(not(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android")))]
+     pub const ALL: Ready = Ready(READABLE | WRITABLE | READ_CLOSED | WRITE_CLOSED | ERROR);
+ 
+     // Must remain crate-private to avoid adding a public dependency on Mio.
+@@ -88,7 +88,7 @@
+             ready |= Ready::ERROR;
+         }
+ 
+-        #[cfg(any(target_os = "linux", target_os = "android"))]
++        #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
+         {
+             if event.is_priority() {
+                 ready |= Ready::PRIORITY;
+@@ -185,7 +185,7 @@
+     /// assert!(!Ready::WRITABLE.is_priority());
+     /// assert!(Ready::PRIORITY.is_priority());
+     /// ```
+-    #[cfg(any(target_os = "linux", target_os = "android"))]
++    #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
+     #[cfg_attr(docsrs, doc(cfg(any(target_os = "linux", target_os = "android"))))]
+     pub fn is_priority(self) -> bool {
+         self.contains(Ready::PRIORITY)
+@@ -248,7 +248,7 @@
+             ready |= Ready::WRITE_CLOSED;
+         }
+ 
+-        #[cfg(any(target_os = "linux", target_os = "android"))]
++        #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
+         if interest.is_priority() {
+             ready |= Ready::PRIORITY;
+             ready |= Ready::READ_CLOSED;
+@@ -314,7 +314,7 @@
+             .field("is_write_closed", &self.is_write_closed())
+             .field("is_error", &self.is_error());
+ 
+-        #[cfg(any(target_os = "linux", target_os = "android"))]
++        #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
+         fmt.field("is_priority", &self.is_priority());
+ 
+         fmt.finish()
+--- a/src/io/stderr.rs
++++ b/src/io/stderr.rs
+@@ -91,7 +91,7 @@
+     }
+ }
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "fullrust"))]
+ mod sys {
+     use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, RawFd};
+ 
+--- a/src/io/stdin.rs
++++ b/src/io/stdin.rs
+@@ -52,7 +52,7 @@
+     }
+ }
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "fullrust"))]
+ mod sys {
+     use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, RawFd};
+ 
+--- a/src/io/stdout.rs
++++ b/src/io/stdout.rs
+@@ -179,7 +179,7 @@
+     }
+ }
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "fullrust"))]
+ mod sys {
+     use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, RawFd};
+ 
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -488,7 +488,7 @@
+     feature = "taskdump",
+     not(doc),
+     not(all(
+-        target_os = "linux",
++        any(target_os = "linux", target_os = "fullrust"),
+         any(
+             target_arch = "aarch64",
+             target_arch = "x86",
+@@ -519,6 +519,25 @@
+ #[doc(hidden)]
+ pub mod macros;
+ 
++// fullrust: no libc crate; tokio's Linux paths run on this private raw-syscall
++// stand-in, which has no C `errno` (hence `last_os_error!`).
++#[cfg(target_os = "fullrust")]
++mod fullrust_libc;
++#[cfg(not(target_os = "fullrust"))]
++#[allow(unused_macros)]
++macro_rules! last_os_error {
++    () => {
++        std::io::Error::last_os_error()
++    };
++}
++#[cfg(target_os = "fullrust")]
++#[allow(unused_macros)]
++macro_rules! last_os_error {
++    () => {
++        crate::fullrust_libc::last_os_error()
++    };
++}
++
+ cfg_fs! {
+     pub mod fs;
+ }
+@@ -644,15 +663,15 @@
+ // local re-exports of platform specific things, allowing for decent
+ // documentation to be shimmed in on docs.rs
+ 
+-#[cfg(all(docsrs, unix))]
++#[cfg(all(docsrs, any(unix, target_os = "fullrust")))]
+ pub mod doc;
+ 
+ #[cfg(any(feature = "net", feature = "fs"))]
+-#[cfg(all(docsrs, unix))]
++#[cfg(all(docsrs, any(unix, target_os = "fullrust")))]
+ #[allow(unused)]
+ pub(crate) use self::doc::os;
+ 
+-#[cfg(not(all(docsrs, unix)))]
++#[cfg(not(all(docsrs, any(unix, target_os = "fullrust"))))]
+ #[allow(unused)]
+ pub(crate) use std::os;
+ 
+--- a/src/macros/cfg.rs
++++ b/src/macros/cfg.rs
+@@ -51,7 +51,7 @@
+ macro_rules! cfg_unix {
+     ($($item:item)*) => {
+         $(
+-            #[cfg(any(all(doc, docsrs), unix))]
++            #[cfg(any(all(doc, docsrs), any(unix, target_os = "fullrust")))]
+             #[cfg_attr(docsrs, doc(cfg(unix)))]
+             $item
+         )*
 @@ -63,7 +63,7 @@
  macro_rules! cfg_unix_or_wasi {
      ($($item:item)*) => {
          $(
 -            #[cfg(any(all(doc, docsrs), unix, target_os = "wasi"))]
-+            #[cfg(any(all(doc, docsrs), unix, target_os = "wasi", target_os = "fullrust"))]
++            #[cfg(any(all(doc, docsrs), any(unix, target_os = "fullrust"), target_os = "wasi"))]
              #[cfg_attr(docsrs, doc(cfg(any(unix, target_os = "wasi"))))]
              $item
          )*
-@@ -378,6 +378,18 @@
+@@ -151,8 +151,8 @@
+         $(
+             #[cfg(any(
+                 feature = "net",
+-                all(unix, feature = "process"),
+-                all(unix, feature = "signal"),
++                all(any(unix, target_os = "fullrust"), feature = "process"),
++                all(any(unix, target_os = "fullrust"), feature = "signal"),
+                 all(
+                     tokio_unstable,
+                     feature = "io-uring",
+@@ -183,8 +183,8 @@
+         $(
+             #[cfg(any(
+                 feature = "net",
+-                all(unix, feature = "process"),
+-                all(unix, feature = "signal"),
++                all(any(unix, target_os = "fullrust"), feature = "process"),
++                all(any(unix, target_os = "fullrust"), feature = "signal"),
+                 all(
+                     tokio_unstable,
+                     feature = "io-uring",
+@@ -203,8 +203,8 @@
+         $(
+             #[cfg(not(any(
+                 feature = "net",
+-                all(unix, feature = "process"),
+-                all(unix, feature = "signal"),
++                all(any(unix, target_os = "fullrust"), feature = "process"),
++                all(any(unix, target_os = "fullrust"), feature = "signal"),
+                 all(
+                     tokio_unstable,
+                     feature = "io-uring",
+@@ -374,7 +374,7 @@
+ macro_rules! cfg_net_unix {
+     ($($item:item)*) => {
+         $(
+-            #[cfg(all(unix, feature = "net"))]
++            #[cfg(all(any(unix, target_os = "fullrust"), feature = "net"))]
              #[cfg_attr(docsrs, doc(cfg(all(unix, feature = "net"))))]
              $item
          )*
-+    }
-+}
-+
-+/// Like `cfg_net_unix!`, but also for `fullrust`: file-descriptor-level APIs
-+/// (e.g. `AsyncFd`) that don't need `std::os::unix`.
-+macro_rules! cfg_net_unix_fd {
-+    ($($item:item)*) => {
-+        $(
-+            #[cfg(all(any(unix, target_os = "fullrust"), feature = "net"))]
-+            #[cfg_attr(docsrs, doc(cfg(all(unix, feature = "net"))))]
-+            $item
-+        )*
+@@ -405,7 +405,7 @@
+ 
+ macro_rules! cfg_process_driver {
+     ($($item:item)*) => {
+-        #[cfg(unix)]
++        #[cfg(any(unix, target_os = "fullrust"))]
+         #[cfg(not(loom))]
+         cfg_process! { $($item)* }
+     }
+@@ -414,7 +414,7 @@
+ macro_rules! cfg_not_process_driver {
+     ($($item:item)*) => {
+         $(
+-            #[cfg(not(all(unix, not(loom), feature = "process")))]
++            #[cfg(not(all(any(unix, target_os = "fullrust"), not(loom), feature = "process")))]
+             $item
+         )*
+     }
+@@ -435,7 +435,7 @@
+ macro_rules! cfg_signal_internal {
+     ($($item:item)*) => {
+         $(
+-            #[cfg(any(feature = "signal", all(unix, feature = "process")))]
++            #[cfg(any(feature = "signal", all(any(unix, target_os = "fullrust"), feature = "process")))]
+             #[cfg(not(loom))]
+             $item
+         )*
+@@ -444,7 +444,7 @@
+ 
+ macro_rules! cfg_signal_internal_and_unix {
+     ($($item:item)*) => {
+-        #[cfg(unix)]
++        #[cfg(any(unix, target_os = "fullrust"))]
+         cfg_signal_internal! { $($item)* }
      }
  }
- 
-diff -ruN a/src/net/tcp/listener.rs b/src/net/tcp/listener.rs
---- a/src/net/tcp/listener.rs	2026-09-29 13:31:06.393208893 +0900
-+++ b/src/net/tcp/listener.rs	2026-09-29 13:31:06.400359368 +0900
-@@ -289,7 +289,7 @@
-                 .map(|raw_socket| unsafe { std::net::TcpListener::from_raw_socket(raw_socket) })
-         }
- 
--        #[cfg(target_os = "wasi")]
-+        #[cfg(any(target_os = "wasi", target_os = "fullrust"))]
+@@ -452,7 +452,7 @@
+ macro_rules! cfg_not_signal_internal {
+     ($($item:item)*) => {
+         $(
+-            #[cfg(any(loom, not(unix), not(any(feature = "signal", all(unix, feature = "process")))))]
++            #[cfg(any(loom, not(any(unix, target_os = "fullrust")), not(any(feature = "signal", all(any(unix, target_os = "fullrust"), feature = "process")))))]
+             $item
+         )*
+     }
+--- a/src/net/tcp/listener.rs
++++ b/src/net/tcp/listener.rs
+@@ -271,7 +271,7 @@
+     /// [`std::net::TcpListener`]: std::net::TcpListener
+     /// [`set_nonblocking`]: fn@std::net::TcpListener::set_nonblocking
+     pub fn into_std(self) -> io::Result<std::net::TcpListener> {
+-        #[cfg(unix)]
++        #[cfg(any(unix, target_os = "fullrust"))]
          {
-             use std::os::fd::{FromRawFd, IntoRawFd};
+             use std::os::unix::io::{FromRawFd, IntoRawFd};
              self.io
-@@ -404,10 +404,13 @@
+@@ -404,7 +404,7 @@
      }
  }
  
@@ -103,29 +997,33 @@ diff -ruN a/src/net/tcp/listener.rs b/src/net/tcp/listener.rs
 +#[cfg(any(unix, target_os = "fullrust"))]
  mod sys {
      use super::TcpListener;
-+    #[cfg(unix)]
      use std::os::unix::prelude::*;
-+    #[cfg(target_os = "fullrust")]
-+    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
+--- a/src/net/tcp/socket.rs
++++ b/src/net/tcp/socket.rs
+@@ -2,6 +2,8 @@
  
-     impl AsRawFd for TcpListener {
-         fn as_raw_fd(&self) -> RawFd {
-diff -ruN a/src/net/tcp/socket.rs b/src/net/tcp/socket.rs
---- a/src/net/tcp/socket.rs	2026-09-29 13:31:06.393208893 +0900
-+++ b/src/net/tcp/socket.rs	2026-09-29 13:31:06.400359368 +0900
-@@ -169,6 +169,7 @@
+ use std::fmt;
+ use std::io;
++#[cfg(target_os = "fullrust")]
++use crate::fullrust_libc as libc;
+ use std::net::SocketAddr;
+ 
+ #[cfg(not(windows))]
+@@ -168,7 +170,7 @@
+             target_os = "freebsd",
              target_os = "fuchsia",
              target_os = "illumos",
-             target_os = "linux",
-+            target_os = "fullrust",
+-            target_os = "linux",
++            any(target_os = "linux", target_os = "fullrust"),
              target_os = "netbsd",
              target_os = "openbsd",
              target_os = "wasi",
-@@ -182,6 +183,7 @@
+@@ -181,7 +183,7 @@
+             target_os = "freebsd",
              target_os = "fuchsia",
              target_os = "illumos",
-             target_os = "linux",
-+            target_os = "fullrust",
+-            target_os = "linux",
++            any(target_os = "linux", target_os = "fullrust"),
              target_os = "netbsd",
              target_os = "openbsd",
              target_os = "wasi",
@@ -138,15 +1036,6 @@ diff -ruN a/src/net/tcp/socket.rs b/src/net/tcp/socket.rs
          not(target_os = "solaris"),
          not(target_os = "illumos"),
          not(target_os = "cygwin"),
-@@ -291,7 +293,7 @@
-     #[cfg_attr(
-         docsrs,
-         doc(cfg(all(
--            unix,
-+            any(unix, target_os = "fullrust"),
-             not(target_os = "solaris"),
-             not(target_os = "illumos"),
-             not(target_os = "cygwin"),
 @@ -329,7 +331,7 @@
      /// }
      /// ```
@@ -156,54 +1045,81 @@ diff -ruN a/src/net/tcp/socket.rs b/src/net/tcp/socket.rs
          not(target_os = "solaris"),
          not(target_os = "illumos"),
          not(target_os = "cygwin"),
-@@ -338,7 +340,7 @@
+@@ -530,7 +532,7 @@
+         target_os = "dragonfly",
+         target_os = "freebsd",
+         target_os = "fuchsia",
+-        target_os = "linux",
++        any(target_os = "linux", target_os = "fullrust"),
+         target_os = "macos",
+         target_os = "netbsd",
+         target_os = "openbsd",
+@@ -568,7 +570,7 @@
+         target_os = "dragonfly",
+         target_os = "freebsd",
+         target_os = "fuchsia",
+-        target_os = "linux",
++        any(target_os = "linux", target_os = "fullrust"),
+         target_os = "macos",
+         target_os = "netbsd",
+         target_os = "openbsd",
+@@ -718,7 +720,7 @@
+     /// Gets the value for the `SO_BINDTODEVICE` option on this socket
+     ///
+     /// This value gets the socket binded device's interface name.
+-    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux",))]
++    #[cfg(any(target_os = "android", target_os = "fuchsia", any(target_os = "linux", target_os = "fullrust"),))]
      #[cfg_attr(
          docsrs,
-         doc(cfg(all(
--            unix,
-+            any(unix, target_os = "fullrust"),
-             not(target_os = "solaris"),
-             not(target_os = "illumos"),
-             not(target_os = "cygwin"),
-@@ -840,10 +842,15 @@
-     /// ```
-     pub async fn connect(self, addr: SocketAddr) -> io::Result<TcpStream> {
-         if let Err(err) = self.inner.connect(&addr.into()) {
--            #[cfg(not(windows))]
-+            #[cfg(not(any(windows, target_os = "fullrust")))]
-             if err.raw_os_error() != Some(libc::EINPROGRESS) {
-                 return Err(err);
-             }
-+            // No libc on fullrust; Linux `EINPROGRESS` is 115.
-+            #[cfg(target_os = "fullrust")]
-+            if err.raw_os_error() != Some(115) {
-+                return Err(err);
-+            }
-             #[cfg(windows)]
-             if err.kind() != io::ErrorKind::WouldBlock {
-                 return Err(err);
-@@ -994,7 +1001,7 @@
+         doc(cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux",)))
+@@ -734,7 +736,7 @@
+     /// works for some socket types, particularly `AF_INET` sockets.
+     ///
+     /// If `interface` is `None` or an empty string it removes the binding.
+-    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
++    #[cfg(any(target_os = "android", target_os = "fuchsia", any(target_os = "linux", target_os = "fullrust")))]
+     #[cfg_attr(
+         docsrs,
+         doc(cfg(all(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))))
+@@ -994,7 +996,7 @@
  
  // These trait implementations can't be build on Windows, so we completely
  // ignore them, even when building documentation.
 -#[cfg(any(unix, target_os = "wasi"))]
-+#[cfg(any(unix, target_os = "wasi", target_os = "fullrust"))]
++#[cfg(any(any(unix, target_os = "fullrust"), target_os = "wasi"))]
  cfg_unix_or_wasi! {
      impl AsRawFd for TcpSocket {
          fn as_raw_fd(&self) -> RawFd {
-diff -ruN a/src/net/tcp/stream.rs b/src/net/tcp/stream.rs
---- a/src/net/tcp/stream.rs	2026-09-29 13:31:06.393208893 +0900
-+++ b/src/net/tcp/stream.rs	2026-09-29 13:31:06.400359368 +0900
-@@ -272,7 +272,7 @@
-                 .map(|raw_socket| unsafe { std::net::TcpStream::from_raw_socket(raw_socket) })
-         }
- 
--        #[cfg(target_os = "wasi")]
-+        #[cfg(any(target_os = "wasi", target_os = "fullrust"))]
+--- a/src/net/tcp/stream.rs
++++ b/src/net/tcp/stream.rs
+@@ -254,7 +254,7 @@
+     /// [`std::net::TcpStream`]: std::net::TcpStream
+     /// [`set_nonblocking`]: fn@std::net::TcpStream::set_nonblocking
+     pub fn into_std(self) -> io::Result<std::net::TcpStream> {
+-        #[cfg(unix)]
++        #[cfg(any(unix, target_os = "fullrust"))]
          {
-             use std::os::fd::{FromRawFd, IntoRawFd};
+             use std::os::unix::io::{FromRawFd, IntoRawFd};
              self.io
-@@ -1529,10 +1529,13 @@
+@@ -1196,7 +1196,7 @@
+     /// # }
+     /// ```
+     #[cfg(any(
+-        target_os = "linux",
++        any(target_os = "linux", target_os = "fullrust"),
+         target_os = "android",
+         target_os = "fuchsia",
+         target_os = "cygwin",
+@@ -1236,7 +1236,7 @@
+     /// # }
+     /// ```
+     #[cfg(any(
+-        target_os = "linux",
++        any(target_os = "linux", target_os = "fullrust"),
+         target_os = "android",
+         target_os = "fuchsia",
+         target_os = "cygwin",
+@@ -1529,7 +1529,7 @@
      }
  }
  
@@ -211,22 +1127,664 @@ diff -ruN a/src/net/tcp/stream.rs b/src/net/tcp/stream.rs
 +#[cfg(any(unix, target_os = "fullrust"))]
  mod sys {
      use super::TcpStream;
-+    #[cfg(unix)]
      use std::os::unix::prelude::*;
-+    #[cfg(target_os = "fullrust")]
-+    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
+--- a/src/net/udp.rs
++++ b/src/net/udp.rs
+@@ -1983,7 +1983,7 @@
+         target_os = "dragonfly",
+         target_os = "freebsd",
+         target_os = "fuchsia",
+-        target_os = "linux",
++        any(target_os = "linux", target_os = "fullrust"),
+         target_os = "macos",
+         target_os = "netbsd",
+         target_os = "openbsd",
+@@ -2021,7 +2021,7 @@
+         target_os = "dragonfly",
+         target_os = "freebsd",
+         target_os = "fuchsia",
+-        target_os = "linux",
++        any(target_os = "linux", target_os = "fullrust"),
+         target_os = "macos",
+         target_os = "netbsd",
+         target_os = "openbsd",
+@@ -2216,7 +2216,7 @@
+     /// Gets the value for the `SO_BINDTODEVICE` option on this socket
+     ///
+     /// This value gets the socket-bound device's interface name.
+-    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux",))]
++    #[cfg(any(target_os = "android", target_os = "fuchsia", any(target_os = "linux", target_os = "fullrust"),))]
+     #[cfg_attr(
+         docsrs,
+         doc(cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux",)))
+@@ -2232,7 +2232,7 @@
+     /// works for some socket types, particularly `AF_INET` sockets.
+     ///
+     /// If `interface` is `None` or an empty string it removes the binding.
+-    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
++    #[cfg(any(target_os = "android", target_os = "fuchsia", any(target_os = "linux", target_os = "fullrust")))]
+     #[cfg_attr(
+         docsrs,
+         doc(cfg(all(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))))
+--- a/src/net/unix/listener.rs
++++ b/src/net/unix/listener.rs
+@@ -6,9 +6,9 @@
+ use std::io;
+ #[cfg(target_os = "android")]
+ use std::os::android::net::SocketAddrExt;
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "fullrust"))]
+ use std::os::linux::net::SocketAddrExt;
+-#[cfg(any(target_os = "linux", target_os = "android"))]
++#[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
+ use std::os::unix::ffi::OsStrExt;
+ use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd};
+ use std::os::unix::net::{self, SocketAddr as StdSocketAddr};
+@@ -78,7 +78,7 @@
+         P: AsRef<Path>,
+     {
+         // For now, we handle abstract socket paths on linux here.
+-        #[cfg(any(target_os = "linux", target_os = "android"))]
++        #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
+         let addr = {
+             let os_str_bytes = path.as_ref().as_os_str().as_bytes();
+             if os_str_bytes.starts_with(b"\0") {
+@@ -87,7 +87,7 @@
+                 StdSocketAddr::from_pathname(path)?
+             }
+         };
+-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
++        #[cfg(not(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android")))]
+         let addr = StdSocketAddr::from_pathname(path)?;
  
-     impl AsRawFd for TcpStream {
-         fn as_raw_fd(&self) -> RawFd {
-diff -ruN a/src/runtime/io/driver.rs b/src/runtime/io/driver.rs
---- a/src/runtime/io/driver.rs	2026-09-29 13:31:06.393779744 +0900
-+++ b/src/runtime/io/driver.rs	2026-09-29 13:31:06.400944932 +0900
-@@ -77,7 +77,7 @@
-     pub(super) is_shutdown: bool,
+         let addr = SocketAddr::from(addr);
+--- a/src/net/unix/pipe.rs
++++ b/src/net/unix/pipe.rs
+@@ -3,6 +3,8 @@
+ use crate::io::interest::Interest;
+ use crate::io::{AsyncRead, AsyncWrite, PollEvented, ReadBuf, Ready};
+ 
++#[cfg(target_os = "fullrust")]
++use crate::fullrust_libc as libc;
+ use mio::unix::pipe as mio_pipe;
+ use std::fs::File;
+ use std::io::{self, Read, Write};
+@@ -120,7 +122,7 @@
+ /// ```
+ #[derive(Clone, Debug)]
+ pub struct OpenOptions {
+-    #[cfg(any(target_os = "linux", target_os = "android"))]
++    #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
+     read_write: bool,
+     unchecked: bool,
+ }
+@@ -131,7 +133,7 @@
+     /// All options are initially set to `false`.
+     pub fn new() -> OpenOptions {
+         OpenOptions {
+-            #[cfg(any(target_os = "linux", target_os = "android"))]
++            #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
+             read_write: false,
+             unchecked: false,
+         }
+@@ -168,7 +170,7 @@
+     ///     .read_write(true)
+     ///     .open_receiver("path/to/a/fifo");
+     /// ```
+-    #[cfg(any(target_os = "linux", target_os = "android"))]
++    #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
+     #[cfg_attr(docsrs, doc(cfg(any(target_os = "linux", target_os = "android"))))]
+     pub fn read_write(&mut self, value: bool) -> &mut Self {
+         self.read_write = value;
+@@ -264,7 +266,7 @@
+             .write(pipe_end == PipeEnd::Sender)
+             .custom_flags(libc::O_NONBLOCK);
+ 
+-        #[cfg(any(target_os = "linux", target_os = "android"))]
++        #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
+         if self.read_write {
+             options.read(true).write(true);
+         }
+@@ -1490,7 +1492,7 @@
+     let r = unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) };
+ 
+     if r == -1 {
+-        Err(io::Error::last_os_error())
++        Err(last_os_error!())
+     } else {
+         Ok((stat.st_mode as libc::mode_t & libc::S_IFMT) == libc::S_IFIFO)
+     }
+@@ -1499,9 +1501,9 @@
+ /// Gets file descriptor's flags by fcntl.
+ fn get_file_flags(fd: BorrowedFd<'_>) -> io::Result<libc::c_int> {
+     // Safety: it's safe to use `fcntl` to read flags of a valid, open file descriptor.
+-    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
++    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL, 0) };
+     if flags < 0 {
+-        Err(io::Error::last_os_error())
++        Err(last_os_error!())
+     } else {
+         Ok(flags)
+     }
+@@ -1528,7 +1530,7 @@
+         // open file descriptor.
+         let ret = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags) };
+         if ret < 0 {
+-            return Err(io::Error::last_os_error());
++            return Err(last_os_error!());
+         }
+     }
+ 
+@@ -1538,9 +1540,9 @@
+ /// Removes `O_NONBLOCK` from fd's flags.
+ fn set_blocking<T: AsRawFd>(fd: &T) -> io::Result<()> {
+     // Safety: it's safe to use `fcntl` to read flags of a valid, open file descriptor.
+-    let previous = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
++    let previous = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL, 0) };
+     if previous == -1 {
+-        return Err(io::Error::last_os_error());
++        return Err(last_os_error!());
+     }
+ 
+     let new = previous & !libc::O_NONBLOCK;
+@@ -1549,7 +1551,7 @@
+     // open file descriptor.
+     let r = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, new) };
+     if r == -1 {
+-        Err(io::Error::last_os_error())
++        Err(last_os_error!())
+     } else {
+         Ok(())
+     }
+--- a/src/net/unix/socket.rs
++++ b/src/net/unix/socket.rs
+@@ -1,4 +1,6 @@
+ use std::io;
++#[cfg(target_os = "fullrust")]
++use crate::fullrust_libc as libc;
+ use std::path::Path;
+ 
+ use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd};
+@@ -127,7 +129,7 @@
+             target_os = "freebsd",
+             target_os = "fuchsia",
+             target_os = "illumos",
+-            target_os = "linux",
++            any(target_os = "linux", target_os = "fullrust"),
+             target_os = "netbsd",
+             target_os = "openbsd"
+         ))]
+@@ -139,7 +141,7 @@
+             target_os = "freebsd",
+             target_os = "fuchsia",
+             target_os = "illumos",
+-            target_os = "linux",
++            any(target_os = "linux", target_os = "fullrust"),
+             target_os = "netbsd",
+             target_os = "openbsd"
+         )))]
+--- a/src/net/unix/socketaddr.rs
++++ b/src/net/unix/socketaddr.rs
+@@ -35,12 +35,12 @@
+     ///
+     ///
+     /// [`SocketAddrExt`]: std::os::linux::net::SocketAddrExt
+-    #[cfg(any(target_os = "linux", target_os = "android"))]
++    #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
+     #[cfg_attr(docsrs, doc(cfg(any(target_os = "linux", target_os = "android"))))]
+     pub fn as_abstract_name(&self) -> Option<&[u8]> {
+         #[cfg(target_os = "android")]
+         use std::os::android::net::SocketAddrExt;
+-        #[cfg(target_os = "linux")]
++        #[cfg(any(target_os = "linux", target_os = "fullrust"))]
+         use std::os::linux::net::SocketAddrExt;
+ 
+         self.0.as_abstract_name()
+--- a/src/net/unix/stream.rs
++++ b/src/net/unix/stream.rs
+@@ -11,9 +11,9 @@
+ use std::net::Shutdown;
+ #[cfg(target_os = "android")]
+ use std::os::android::net::SocketAddrExt;
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "fullrust"))]
+ use std::os::linux::net::SocketAddrExt;
+-#[cfg(any(target_os = "linux", target_os = "android"))]
++#[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
+ use std::os::unix::ffi::OsStrExt;
+ use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd};
+ use std::os::unix::net::{self, SocketAddr as StdSocketAddr};
+@@ -83,7 +83,7 @@
+         P: AsRef<Path>,
+     {
+         // On linux, abstract socket paths need to be considered.
+-        #[cfg(any(target_os = "linux", target_os = "android"))]
++        #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
+         let addr = {
+             let os_str_bytes = path.as_ref().as_os_str().as_bytes();
+             if os_str_bytes.starts_with(b"\0") {
+@@ -92,7 +92,7 @@
+                 StdSocketAddr::from_pathname(path)?
+             }
+         };
+-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
++        #[cfg(not(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android")))]
+         let addr = StdSocketAddr::from_pathname(path)?;
+ 
+         let addr = SocketAddr::from(addr);
+--- a/src/net/unix/ucred.rs
++++ b/src/net/unix/ucred.rs
+@@ -34,7 +34,7 @@
  }
  
--cfg_net_unix!(
-+cfg_net_unix_fd!(
-     impl ReadyEvent {
-         pub(crate) fn with_ready(&self, ready: Ready) -> Self {
-             Self {
+ #[cfg(any(
+-    target_os = "linux",
++    any(target_os = "linux", target_os = "fullrust"),
+     target_os = "redox",
+     target_os = "android",
+     target_os = "openbsd",
+@@ -79,7 +79,7 @@
+ pub(crate) use self::impl_nto::get_peer_cred;
+ 
+ #[cfg(any(
+-    target_os = "linux",
++    any(target_os = "linux", target_os = "fullrust"),
+     target_os = "redox",
+     target_os = "android",
+     target_os = "openbsd",
+@@ -89,13 +89,15 @@
+ pub(crate) mod impl_linux {
+     use crate::net::unix::{self, UnixStream};
+ 
++    #[cfg(target_os = "fullrust")]
++    use crate::fullrust_libc as libc;
+     use libc::{c_void, getsockopt, socklen_t, SOL_SOCKET, SO_PEERCRED};
+     use std::{io, mem};
+ 
+     #[cfg(target_os = "openbsd")]
+     use libc::sockpeercred as ucred;
+     #[cfg(any(
+-        target_os = "linux",
++        any(target_os = "linux", target_os = "fullrust"),
+         target_os = "redox",
+         target_os = "android",
+         target_os = "haiku",
+@@ -137,7 +139,7 @@
+                     pid: Some(ucred.pid as unix::pid_t),
+                 })
+             } else {
+-                Err(io::Error::last_os_error())
++                Err(last_os_error!())
+             }
+         }
+     }
+--- a/src/process/mod.rs
++++ b/src/process/mod.rs
+@@ -227,10 +227,10 @@
+ //! [`Child`]: crate::process::Child
+ 
+ #[path = "unix/mod.rs"]
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "fullrust"))]
+ mod imp;
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "fullrust"))]
+ pub(crate) mod unix {
+     pub(crate) use super::imp::*;
+ }
+@@ -252,7 +252,7 @@
+ use std::process::{Child as StdChild, Command as StdCommand, ExitStatus, Output, Stdio};
+ use std::task::{ready, Context, Poll};
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "fullrust"))]
+ use std::os::unix::process::CommandExt;
+ #[cfg(windows)]
+ use std::os::windows::process::CommandExt;
+@@ -681,7 +681,7 @@
+     /// Sets the child process's user ID. This translates to a
+     /// `setuid` call in the child process. Failure in the `setuid`
+     /// call will cause the spawn to fail.
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "fullrust"))]
+     #[cfg_attr(docsrs, doc(cfg(unix)))]
+     pub fn uid(&mut self, id: u32) -> &mut Command {
+         #[cfg(target_os = "nto")]
+@@ -692,7 +692,7 @@
+ 
+     /// Similar to `uid` but sets the group ID of the child process. This has
+     /// the same semantics as the `uid` field.
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "fullrust"))]
+     #[cfg_attr(docsrs, doc(cfg(unix)))]
+     pub fn gid(&mut self, id: u32) -> &mut Command {
+         #[cfg(target_os = "nto")]
+@@ -705,7 +705,7 @@
+     ///
+     /// Set the first process argument, `argv[0]`, to something other than the
+     /// default executable path.
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "fullrust"))]
+     #[cfg_attr(docsrs, doc(cfg(unix)))]
+     pub fn arg0<S>(&mut self, arg: S) -> &mut Command
+     where
+@@ -744,7 +744,7 @@
+     /// When this closure is run, aspects such as the stdio file descriptors and
+     /// working directory have successfully been changed, so output to these
+     /// locations may not appear where intended.
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "fullrust"))]
+     #[cfg_attr(docsrs, doc(cfg(unix)))]
+     pub unsafe fn pre_exec<F>(&mut self, f: F) -> &mut Command
+     where
+@@ -785,7 +785,7 @@
+     /// ```
+     ///
+     /// [signal handler]: crate::signal
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "fullrust"))]
+     #[cfg_attr(docsrs, doc(cfg(unix)))]
+     pub fn process_group(&mut self, pgroup: i32) -> &mut Command {
+         self.std.process_group(pgroup);
+@@ -1620,7 +1620,7 @@
+     }
+ }
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "fullrust"))]
+ #[cfg_attr(docsrs, doc(cfg(unix)))]
+ mod sys {
+     use std::{
+--- a/src/process/unix/mod.rs
++++ b/src/process/unix/mod.rs
+@@ -27,7 +27,7 @@
+ mod reap;
+ use reap::Reaper;
+ 
+-#[cfg(all(target_os = "linux", feature = "rt"))]
++#[cfg(all(any(target_os = "linux", target_os = "fullrust"), feature = "rt"))]
+ mod pidfd_reaper;
+ 
+ use crate::io::{AsyncRead, AsyncWrite, PollEvented, ReadBuf};
+@@ -36,6 +36,8 @@
+ use crate::runtime::signal::Handle as SignalHandle;
+ use crate::signal::unix::{signal, Signal, SignalKind};
+ 
++#[cfg(target_os = "fullrust")]
++use crate::fullrust_libc as libc;
+ use mio::event::Source;
+ use mio::unix::SourceFd;
+ use std::fmt;
+@@ -105,7 +107,7 @@
+ #[must_use = "futures do nothing unless polled"]
+ pub(crate) enum Child {
+     SignalReaper(Reaper<StdChild, GlobalOrphanQueue, Signal>),
+-    #[cfg(all(target_os = "linux", feature = "rt"))]
++    #[cfg(all(any(target_os = "linux", target_os = "fullrust"), feature = "rt"))]
+     PidfdReaper(pidfd_reaper::PidfdReaper<StdChild, GlobalOrphanQueue>),
+ }
+ 
+@@ -120,7 +122,7 @@
+     let stdout = child.stdout.take().map(stdio).transpose()?;
+     let stderr = child.stderr.take().map(stdio).transpose()?;
+ 
+-    #[cfg(all(target_os = "linux", feature = "rt"))]
++    #[cfg(all(any(target_os = "linux", target_os = "fullrust"), feature = "rt"))]
+     match pidfd_reaper::PidfdReaper::new(child, GlobalOrphanQueue) {
+         Ok(pidfd_reaper) => {
+             return Ok(SpawnedChild {
+@@ -148,7 +150,7 @@
+     pub(crate) fn id(&self) -> u32 {
+         match self {
+             Self::SignalReaper(signal_reaper) => signal_reaper.id(),
+-            #[cfg(all(target_os = "linux", feature = "rt"))]
++            #[cfg(all(any(target_os = "linux", target_os = "fullrust"), feature = "rt"))]
+             Self::PidfdReaper(pidfd_reaper) => pidfd_reaper.id(),
+         }
+     }
+@@ -156,7 +158,7 @@
+     fn std_child(&mut self) -> &mut StdChild {
+         match self {
+             Self::SignalReaper(signal_reaper) => signal_reaper.inner_mut(),
+-            #[cfg(all(target_os = "linux", feature = "rt"))]
++            #[cfg(all(any(target_os = "linux", target_os = "fullrust"), feature = "rt"))]
+             Self::PidfdReaper(pidfd_reaper) => pidfd_reaper.inner_mut(),
+         }
+     }
+@@ -178,7 +180,7 @@
+     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+         match Pin::into_inner(self) {
+             Self::SignalReaper(signal_reaper) => Pin::new(signal_reaper).poll(cx),
+-            #[cfg(all(target_os = "linux", feature = "rt"))]
++            #[cfg(all(any(target_os = "linux", target_os = "fullrust"), feature = "rt"))]
+             Self::PidfdReaper(pidfd_reaper) => Pin::new(pidfd_reaper).poll(cx),
+         }
+     }
+@@ -342,9 +344,9 @@
+ fn set_nonblocking<T: AsRawFd>(fd: &mut T, nonblocking: bool) -> io::Result<()> {
+     unsafe {
+         let fd = fd.as_raw_fd();
+-        let previous = libc::fcntl(fd, libc::F_GETFL);
++        let previous = libc::fcntl(fd, libc::F_GETFL, 0);
+         if previous == -1 {
+-            return Err(io::Error::last_os_error());
++            return Err(last_os_error!());
+         }
+ 
+         let new = if nonblocking {
+@@ -355,7 +357,7 @@
+ 
+         let r = libc::fcntl(fd, libc::F_SETFL, new);
+         if r == -1 {
+-            return Err(io::Error::last_os_error());
++            return Err(last_os_error!());
+         }
+     }
+ 
+--- a/src/process/unix/pidfd_reaper.rs
++++ b/src/process/unix/pidfd_reaper.rs
+@@ -6,6 +6,8 @@
+     },
+ };
+ 
++#[cfg(target_os = "fullrust")]
++use crate::fullrust_libc as libc;
+ use libc::{syscall, SYS_pidfd_open, ENOSYS, PIDFD_NONBLOCK};
+ use mio::{event::Source, unix::SourceFd};
+ use std::{
+@@ -39,7 +41,7 @@
+         // which takes two parameter: pidfd_open(fd: c_int, flag: c_int)
+         let fd = unsafe { syscall(SYS_pidfd_open, pid, PIDFD_NONBLOCK) };
+         if fd == -1 {
+-            let errno = io::Error::last_os_error().raw_os_error().unwrap();
++            let errno = last_os_error!().raw_os_error().unwrap();
+ 
+             if errno == ENOSYS {
+                 NO_PIDFD_SUPPORT.store(true, Relaxed)
+--- a/src/runtime/builder.rs
++++ b/src/runtime/builder.rs
+@@ -376,8 +376,8 @@
+     pub fn enable_all(&mut self) -> &mut Self {
+         #[cfg(any(
+             feature = "net",
+-            all(unix, feature = "process"),
+-            all(unix, feature = "signal")
++            all(any(unix, target_os = "fullrust"), feature = "process"),
++            all(any(unix, target_os = "fullrust"), feature = "signal")
+         ))]
+         self.enable_io();
+ 
+--- a/src/runtime/driver.rs
++++ b/src/runtime/driver.rs
+@@ -23,7 +23,7 @@
+     pub(crate) io: IoHandle,
+ 
+     /// Signal driver handle
+-    #[cfg_attr(any(not(unix), loom), allow(dead_code))]
++    #[cfg_attr(any(not(any(unix, target_os = "fullrust")), loom), allow(dead_code))]
+     pub(crate) signal: SignalHandle,
+ 
+     /// Time driver handle
+--- a/src/runtime/scheduler/mod.rs
++++ b/src/runtime/scheduler/mod.rs
+@@ -305,8 +305,8 @@
+ cfg_not_rt! {
+     #[cfg(any(
+         feature = "net",
+-        all(unix, feature = "process"),
+-        all(unix, feature = "signal"),
++        all(any(unix, target_os = "fullrust"), feature = "process"),
++        all(any(unix, target_os = "fullrust"), feature = "signal"),
+         feature = "time",
+     ))]
+     impl Handle {
+--- a/src/signal/ctrl_c.rs
++++ b/src/signal/ctrl_c.rs
+@@ -1,4 +1,4 @@
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "fullrust"))]
+ use super::unix::{self as os_impl};
+ #[cfg(windows)]
+ use super::windows::{self as os_impl};
+--- a/src/signal/mod.rs
++++ b/src/signal/mod.rs
+@@ -50,7 +50,7 @@
+ #[cfg(feature = "signal")]
+ pub use ctrl_c::ctrl_c;
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "fullrust"))]
+ pub(crate) mod registry;
+ 
+ pub mod unix;
+--- a/src/signal/registry.rs
++++ b/src/signal/registry.rs
+@@ -136,7 +136,7 @@
+         self.registry.broadcast()
+     }
+ 
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "fullrust"))]
+     pub(crate) fn storage(&self) -> &OsStorage {
+         &self.registry.storage
+     }
+--- a/src/signal/unix.rs
++++ b/src/signal/unix.rs
+@@ -3,7 +3,7 @@
+ //! This module is only defined on Unix platforms and contains the primary
+ //! `Signal` type for receiving notifications of signals.
+ 
+-#![cfg(unix)]
++#![cfg(any(unix, target_os = "fullrust"))]
+ #![cfg_attr(docsrs, doc(cfg(all(unix, feature = "signal"))))]
+ 
+ use crate::runtime::scheduler;
+@@ -12,15 +12,17 @@
+ use crate::signal::RxFuture;
+ use crate::sync::watch;
+ 
++#[cfg(target_os = "fullrust")]
++use crate::fullrust_libc::{self as libc, signal_hook_registry};
+ use mio::net::UnixStream;
+ use std::io::{self, Error, ErrorKind, Write};
+ use std::sync::OnceLock;
+ use std::task::{Context, Poll};
+ 
+-#[cfg(not(any(target_os = "linux", target_os = "illumos")))]
++#[cfg(not(any(any(target_os = "linux", target_os = "fullrust"), target_os = "illumos")))]
+ pub(crate) struct OsStorage([SignalInfo; 33]);
+ 
+-#[cfg(any(target_os = "linux", target_os = "illumos"))]
++#[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "illumos"))]
+ pub(crate) struct OsStorage(Box<[SignalInfo]>);
+ 
+ impl OsStorage {
+@@ -32,13 +34,13 @@
+ impl Default for OsStorage {
+     fn default() -> Self {
+         // There are reliable signals ranging from 1 to 33 available on every Unix platform.
+-        #[cfg(not(any(target_os = "linux", target_os = "illumos")))]
++        #[cfg(not(any(any(target_os = "linux", target_os = "fullrust"), target_os = "illumos")))]
+         let inner = std::array::from_fn(|_| SignalInfo::default());
+ 
+         // On Linux and illumos, there are additional real-time signals
+         // available. (This is also likely true on Solaris, but this should be
+         // verified before being enabled.)
+-        #[cfg(any(target_os = "linux", target_os = "illumos"))]
++        #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "illumos"))]
+         let inner = std::iter::repeat_with(SignalInfo::default)
+             .take(libc::SIGRTMAX() as usize)
+             .collect();
+--- a/src/sync/mod.rs
++++ b/src/sync/mod.rs
+@@ -504,7 +504,7 @@
+         pub(crate) use mutex::Mutex;
+     }
+ 
+-    #[cfg(any(feature = "rt", feature = "signal", all(unix, feature = "process")))]
++    #[cfg(any(feature = "rt", feature = "signal", all(any(unix, target_os = "fullrust"), feature = "process")))]
+     pub(crate) mod notify;
+ 
+     #[cfg(any(feature = "rt", all(windows, feature = "process")))]
+@@ -515,7 +515,7 @@
+         pub(crate) use task::AtomicWaker;
+     }
+ 
+-    #[cfg(any(feature = "signal", all(unix, feature = "process")))]
++    #[cfg(any(feature = "signal", all(any(unix, target_os = "fullrust"), feature = "process")))]
+     pub(crate) mod watch;
+ }
+ 
+--- a/src/util/blocking_check.rs
++++ b/src/util/blocking_check.rs
+@@ -1,7 +1,7 @@
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "fullrust"))]
+ use std::os::fd::AsFd;
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "fullrust"))]
+ #[allow(unused_variables)]
+ #[track_caller]
+ pub(crate) fn check_socket_for_blocking<S: AsFd>(s: &S) -> crate::io::Result<()> {
+@@ -20,7 +20,7 @@
+     Ok(())
+ }
+ 
+-#[cfg(not(unix))]
++#[cfg(not(any(unix, target_os = "fullrust")))]
+ #[allow(unused_variables)]
+ pub(crate) fn check_socket_for_blocking<S>(s: &S) -> crate::io::Result<()> {
+     // we cannot retrieve the nonblocking status on windows
+--- a/src/util/linked_list.rs
++++ b/src/util/linked_list.rs
+@@ -246,7 +246,7 @@
+ #[cfg(any(
+     feature = "fs",
+     feature = "rt",
+-    all(unix, feature = "process"),
++    all(any(unix, target_os = "fullrust"), feature = "process"),
+     feature = "signal",
+     feature = "sync",
+ ))]
+--- a/src/util/memchr.rs
++++ b/src/util/memchr.rs
+@@ -3,12 +3,15 @@
+ //! When nothing pulls in libc, then just use a trivial implementation. Note
+ //! that we only depend on libc on unix.
+ 
+-#[cfg(not(all(unix, feature = "libc")))]
++#[cfg(not(all(any(unix, target_os = "fullrust"), feature = "libc")))]
+ fn memchr_inner(needle: u8, haystack: &[u8]) -> Option<usize> {
+     haystack.iter().position(|val| needle == *val)
+ }
+ 
+-#[cfg(all(unix, feature = "libc"))]
++#[cfg(all(target_os = "fullrust", feature = "libc"))]
++use crate::fullrust_libc as libc;
++
++#[cfg(all(any(unix, target_os = "fullrust"), feature = "libc"))]
+ fn memchr_inner(needle: u8, haystack: &[u8]) -> Option<usize> {
+     let start = haystack.as_ptr();
+ 

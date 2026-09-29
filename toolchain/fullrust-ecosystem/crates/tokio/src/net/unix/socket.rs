@@ -1,4 +1,6 @@
 use std::io;
+#[cfg(target_os = "fullrust")]
+use crate::fullrust_libc as libc;
 use std::path::Path;
 
 use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd};
@@ -127,7 +129,7 @@ impl UnixSocket {
             target_os = "freebsd",
             target_os = "fuchsia",
             target_os = "illumos",
-            target_os = "linux",
+            any(target_os = "linux", target_os = "fullrust"),
             target_os = "netbsd",
             target_os = "openbsd"
         ))]
@@ -139,7 +141,7 @@ impl UnixSocket {
             target_os = "freebsd",
             target_os = "fuchsia",
             target_os = "illumos",
-            target_os = "linux",
+            any(target_os = "linux", target_os = "fullrust"),
             target_os = "netbsd",
             target_os = "openbsd"
         )))]

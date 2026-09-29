@@ -51,7 +51,7 @@ macro_rules! cfg_windows {
 macro_rules! cfg_unix {
     ($($item:item)*) => {
         $(
-            #[cfg(any(all(doc, docsrs), unix))]
+            #[cfg(any(all(doc, docsrs), any(unix, target_os = "fullrust")))]
             #[cfg_attr(docsrs, doc(cfg(unix)))]
             $item
         )*
@@ -63,7 +63,7 @@ macro_rules! cfg_unix {
 macro_rules! cfg_unix_or_wasi {
     ($($item:item)*) => {
         $(
-            #[cfg(any(all(doc, docsrs), unix, target_os = "wasi", target_os = "fullrust"))]
+            #[cfg(any(all(doc, docsrs), any(unix, target_os = "fullrust"), target_os = "wasi"))]
             #[cfg_attr(docsrs, doc(cfg(any(unix, target_os = "wasi"))))]
             $item
         )*
@@ -151,8 +151,8 @@ macro_rules! cfg_io_driver {
         $(
             #[cfg(any(
                 feature = "net",
-                all(unix, feature = "process"),
-                all(unix, feature = "signal"),
+                all(any(unix, target_os = "fullrust"), feature = "process"),
+                all(any(unix, target_os = "fullrust"), feature = "signal"),
                 all(
                     tokio_unstable,
                     feature = "io-uring",
@@ -183,8 +183,8 @@ macro_rules! cfg_io_driver_impl {
         $(
             #[cfg(any(
                 feature = "net",
-                all(unix, feature = "process"),
-                all(unix, feature = "signal"),
+                all(any(unix, target_os = "fullrust"), feature = "process"),
+                all(any(unix, target_os = "fullrust"), feature = "signal"),
                 all(
                     tokio_unstable,
                     feature = "io-uring",
@@ -203,8 +203,8 @@ macro_rules! cfg_not_io_driver {
         $(
             #[cfg(not(any(
                 feature = "net",
-                all(unix, feature = "process"),
-                all(unix, feature = "signal"),
+                all(any(unix, target_os = "fullrust"), feature = "process"),
+                all(any(unix, target_os = "fullrust"), feature = "signal"),
                 all(
                     tokio_unstable,
                     feature = "io-uring",
@@ -374,18 +374,6 @@ macro_rules! cfg_net_or_uring {
 macro_rules! cfg_net_unix {
     ($($item:item)*) => {
         $(
-            #[cfg(all(unix, feature = "net"))]
-            #[cfg_attr(docsrs, doc(cfg(all(unix, feature = "net"))))]
-            $item
-        )*
-    }
-}
-
-/// Like `cfg_net_unix!`, but also for `fullrust`: file-descriptor-level APIs
-/// (e.g. `AsyncFd`) that don't need `std::os::unix`.
-macro_rules! cfg_net_unix_fd {
-    ($($item:item)*) => {
-        $(
             #[cfg(all(any(unix, target_os = "fullrust"), feature = "net"))]
             #[cfg_attr(docsrs, doc(cfg(all(unix, feature = "net"))))]
             $item
@@ -417,7 +405,7 @@ macro_rules! cfg_process {
 
 macro_rules! cfg_process_driver {
     ($($item:item)*) => {
-        #[cfg(unix)]
+        #[cfg(any(unix, target_os = "fullrust"))]
         #[cfg(not(loom))]
         cfg_process! { $($item)* }
     }
@@ -426,7 +414,7 @@ macro_rules! cfg_process_driver {
 macro_rules! cfg_not_process_driver {
     ($($item:item)*) => {
         $(
-            #[cfg(not(all(unix, not(loom), feature = "process")))]
+            #[cfg(not(all(any(unix, target_os = "fullrust"), not(loom), feature = "process")))]
             $item
         )*
     }
@@ -447,7 +435,7 @@ macro_rules! cfg_signal {
 macro_rules! cfg_signal_internal {
     ($($item:item)*) => {
         $(
-            #[cfg(any(feature = "signal", all(unix, feature = "process")))]
+            #[cfg(any(feature = "signal", all(any(unix, target_os = "fullrust"), feature = "process")))]
             #[cfg(not(loom))]
             $item
         )*
@@ -456,7 +444,7 @@ macro_rules! cfg_signal_internal {
 
 macro_rules! cfg_signal_internal_and_unix {
     ($($item:item)*) => {
-        #[cfg(unix)]
+        #[cfg(any(unix, target_os = "fullrust"))]
         cfg_signal_internal! { $($item)* }
     }
 }
@@ -464,7 +452,7 @@ macro_rules! cfg_signal_internal_and_unix {
 macro_rules! cfg_not_signal_internal {
     ($($item:item)*) => {
         $(
-            #[cfg(any(loom, not(unix), not(any(feature = "signal", all(unix, feature = "process")))))]
+            #[cfg(any(loom, not(any(unix, target_os = "fullrust")), not(any(feature = "signal", all(any(unix, target_os = "fullrust"), feature = "process")))))]
             $item
         )*
     }

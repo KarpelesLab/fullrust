@@ -50,7 +50,7 @@ mod ctrl_c;
 #[cfg(feature = "signal")]
 pub use ctrl_c::ctrl_c;
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fullrust"))]
 pub(crate) mod registry;
 
 pub mod unix;

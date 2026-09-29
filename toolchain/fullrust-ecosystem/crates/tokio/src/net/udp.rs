@@ -1983,7 +1983,7 @@ impl UdpSocket {
         target_os = "dragonfly",
         target_os = "freebsd",
         target_os = "fuchsia",
-        target_os = "linux",
+        any(target_os = "linux", target_os = "fullrust"),
         target_os = "macos",
         target_os = "netbsd",
         target_os = "openbsd",
@@ -2021,7 +2021,7 @@ impl UdpSocket {
         target_os = "dragonfly",
         target_os = "freebsd",
         target_os = "fuchsia",
-        target_os = "linux",
+        any(target_os = "linux", target_os = "fullrust"),
         target_os = "macos",
         target_os = "netbsd",
         target_os = "openbsd",
@@ -2216,7 +2216,7 @@ impl UdpSocket {
     /// Gets the value for the `SO_BINDTODEVICE` option on this socket
     ///
     /// This value gets the socket-bound device's interface name.
-    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux",))]
+    #[cfg(any(target_os = "android", target_os = "fuchsia", any(target_os = "linux", target_os = "fullrust"),))]
     #[cfg_attr(
         docsrs,
         doc(cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux",)))
@@ -2232,7 +2232,7 @@ impl UdpSocket {
     /// works for some socket types, particularly `AF_INET` sockets.
     ///
     /// If `interface` is `None` or an empty string it removes the binding.
-    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    #[cfg(any(target_os = "android", target_os = "fuchsia", any(target_os = "linux", target_os = "fullrust")))]
     #[cfg_attr(
         docsrs,
         doc(cfg(all(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))))

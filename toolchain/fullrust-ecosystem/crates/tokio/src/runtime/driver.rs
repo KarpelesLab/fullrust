@@ -23,7 +23,7 @@ pub(crate) struct Handle {
     pub(crate) io: IoHandle,
 
     /// Signal driver handle
-    #[cfg_attr(any(not(unix), loom), allow(dead_code))]
+    #[cfg_attr(any(not(any(unix, target_os = "fullrust")), loom), allow(dead_code))]
     pub(crate) signal: SignalHandle,
 
     /// Time driver handle

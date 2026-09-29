@@ -271,7 +271,7 @@ impl TcpListener {
     /// [`std::net::TcpListener`]: std::net::TcpListener
     /// [`set_nonblocking`]: fn@std::net::TcpListener::set_nonblocking
     pub fn into_std(self) -> io::Result<std::net::TcpListener> {
-        #[cfg(unix)]
+        #[cfg(any(unix, target_os = "fullrust"))]
         {
             use std::os::unix::io::{FromRawFd, IntoRawFd};
             self.io
@@ -289,7 +289,7 @@ impl TcpListener {
                 .map(|raw_socket| unsafe { std::net::TcpListener::from_raw_socket(raw_socket) })
         }
 
-        #[cfg(any(target_os = "wasi", target_os = "fullrust"))]
+        #[cfg(target_os = "wasi")]
         {
             use std::os::fd::{FromRawFd, IntoRawFd};
             self.io
@@ -407,10 +407,7 @@ impl fmt::Debug for TcpListener {
 #[cfg(any(unix, target_os = "fullrust"))]
 mod sys {
     use super::TcpListener;
-    #[cfg(unix)]
     use std::os::unix::prelude::*;
-    #[cfg(target_os = "fullrust")]
-    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 
     impl AsRawFd for TcpListener {
         fn as_raw_fd(&self) -> RawFd {

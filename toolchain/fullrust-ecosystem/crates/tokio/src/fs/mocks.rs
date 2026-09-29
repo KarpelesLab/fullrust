@@ -2,7 +2,7 @@
 use mockall::mock;
 
 use crate::sync::oneshot;
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, target_os = "fullrust")))]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::{
     cell::RefCell,
@@ -49,12 +49,12 @@ mock! {
     impl std::os::windows::io::FromRawHandle for File {
         unsafe fn from_raw_handle(h: std::os::windows::io::RawHandle) -> Self;
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "fullrust"))]
     impl std::os::unix::io::AsRawFd for File {
         fn as_raw_fd(&self) -> std::os::unix::io::RawFd;
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "fullrust"))]
     impl std::os::unix::io::FromRawFd for File {
         unsafe fn from_raw_fd(h: std::os::unix::io::RawFd) -> Self;
     }
@@ -102,7 +102,7 @@ impl Write for &'_ MockFile {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, target_os = "fullrust")))]
 impl From<MockFile> for OwnedFd {
     #[inline]
     fn from(file: MockFile) -> OwnedFd {
@@ -110,7 +110,7 @@ impl From<MockFile> for OwnedFd {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, target_os = "fullrust")))]
 impl From<OwnedFd> for MockFile {
     #[inline]
     fn from(file: OwnedFd) -> MockFile {

@@ -305,8 +305,8 @@ cfg_rt! {
 cfg_not_rt! {
     #[cfg(any(
         feature = "net",
-        all(unix, feature = "process"),
-        all(unix, feature = "signal"),
+        all(any(unix, target_os = "fullrust"), feature = "process"),
+        all(any(unix, target_os = "fullrust"), feature = "signal"),
         feature = "time",
     ))]
     impl Handle {

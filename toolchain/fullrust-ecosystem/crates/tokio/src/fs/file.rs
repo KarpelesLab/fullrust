@@ -897,21 +897,21 @@ impl fmt::Debug for File {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fullrust"))]
 impl From<std::os::fd::OwnedFd> for File {
     fn from(fd: std::os::fd::OwnedFd) -> Self {
         Self::from_std(StdFile::from(fd))
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fullrust"))]
 impl std::os::unix::io::AsRawFd for File {
     fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
         self.std.as_raw_fd()
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fullrust"))]
 impl std::os::unix::io::AsFd for File {
     fn as_fd(&self) -> std::os::unix::io::BorrowedFd<'_> {
         unsafe {
@@ -920,7 +920,7 @@ impl std::os::unix::io::AsFd for File {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fullrust"))]
 impl std::os::unix::io::FromRawFd for File {
     unsafe fn from_raw_fd(fd: std::os::unix::io::RawFd) -> Self {
         // Safety: exactly the same safety contract as

@@ -3,6 +3,8 @@
 use crate::io::interest::Interest;
 use crate::io::{AsyncRead, AsyncWrite, PollEvented, ReadBuf, Ready};
 
+#[cfg(target_os = "fullrust")]
+use crate::fullrust_libc as libc;
 use mio::unix::pipe as mio_pipe;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -120,7 +122,7 @@ pub fn pipe() -> io::Result<(Sender, Receiver)> {
 /// ```
 #[derive(Clone, Debug)]
 pub struct OpenOptions {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
     read_write: bool,
     unchecked: bool,
 }
@@ -131,7 +133,7 @@ impl OpenOptions {
     /// All options are initially set to `false`.
     pub fn new() -> OpenOptions {
         OpenOptions {
-            #[cfg(any(target_os = "linux", target_os = "android"))]
+            #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
             read_write: false,
             unchecked: false,
         }
@@ -168,7 +170,7 @@ impl OpenOptions {
     ///     .read_write(true)
     ///     .open_receiver("path/to/a/fifo");
     /// ```
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
     #[cfg_attr(docsrs, doc(cfg(any(target_os = "linux", target_os = "android"))))]
     pub fn read_write(&mut self, value: bool) -> &mut Self {
         self.read_write = value;
@@ -264,7 +266,7 @@ impl OpenOptions {
             .write(pipe_end == PipeEnd::Sender)
             .custom_flags(libc::O_NONBLOCK);
 
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(any(any(target_os = "linux", target_os = "fullrust"), target_os = "android"))]
         if self.read_write {
             options.read(true).write(true);
         }
@@ -1490,7 +1492,7 @@ fn is_pipe(fd: BorrowedFd<'_>) -> io::Result<bool> {
     let r = unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) };
 
     if r == -1 {
-        Err(io::Error::last_os_error())
+        Err(last_os_error!())
     } else {
         Ok((stat.st_mode as libc::mode_t & libc::S_IFMT) == libc::S_IFIFO)
     }
@@ -1499,9 +1501,9 @@ fn is_pipe(fd: BorrowedFd<'_>) -> io::Result<bool> {
 /// Gets file descriptor's flags by fcntl.
 fn get_file_flags(fd: BorrowedFd<'_>) -> io::Result<libc::c_int> {
     // Safety: it's safe to use `fcntl` to read flags of a valid, open file descriptor.
-    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL, 0) };
     if flags < 0 {
-        Err(io::Error::last_os_error())
+        Err(last_os_error!())
     } else {
         Ok(flags)
     }
@@ -1528,7 +1530,7 @@ fn set_nonblocking(fd: BorrowedFd<'_>, current_flags: libc::c_int) -> io::Result
         // open file descriptor.
         let ret = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags) };
         if ret < 0 {
-            return Err(io::Error::last_os_error());
+            return Err(last_os_error!());
         }
     }
 
@@ -1538,9 +1540,9 @@ fn set_nonblocking(fd: BorrowedFd<'_>, current_flags: libc::c_int) -> io::Result
 /// Removes `O_NONBLOCK` from fd's flags.
 fn set_blocking<T: AsRawFd>(fd: &T) -> io::Result<()> {
     // Safety: it's safe to use `fcntl` to read flags of a valid, open file descriptor.
-    let previous = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    let previous = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL, 0) };
     if previous == -1 {
-        return Err(io::Error::last_os_error());
+        return Err(last_os_error!());
     }
 
     let new = previous & !libc::O_NONBLOCK;
@@ -1549,7 +1551,7 @@ fn set_blocking<T: AsRawFd>(fd: &T) -> io::Result<()> {
     // open file descriptor.
     let r = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, new) };
     if r == -1 {
-        Err(io::Error::last_os_error())
+        Err(last_os_error!())
     } else {
         Ok(())
     }
