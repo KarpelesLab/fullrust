@@ -350,6 +350,17 @@ not wrap (`syscall0..syscall6 -> io::Result<usize>`, `nr::*` syscall numbers,
 `errno::*`). Covered by `test-osunix` (which also builds on
 `x86_64-unknown-linux-gnu` for parity) and `test-syscall`.
 
+This surface is carried on every version 1.88–1.98, and each version exposes
+exactly the `os::unix`/`os::linux` API that version's Linux std has. Per-version
+glue in the fullrust pal: ≤1.93 use `sys_common::{AsInner,…}` and `AnonPipe` as
+the child pipe type (1.94+ use `ChildPipe = FileDesc`); ≤1.91 define
+`StdioPipes` in `sys::process`, call `Socket::new_raw`, and take `u32`
+`deferaccept`; ≤1.90 keep `Thread` in `sys/pal` and use `cfg_if!` dispatchers;
+1.96+ route `parent_id` through `sys::process::getppid`; 1.97 adds
+`ChildExt::{send_process_group_signal, kill_process_group}`; 1.98 needs
+`BorrowedCursor<'_, u8>`, `PidFd` via `sys::process`, and explicit
+`expose_provenance()` on syscall pointer arguments.
+
 ## Version matrix
 
 The goal is to track `1.88 … 1.98` and observe how `std::sys::pal` shifts across
