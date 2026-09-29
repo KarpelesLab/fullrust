@@ -36,7 +36,7 @@ cd "$RUST"
 excludes=()
 for sm in "${SUBMODULES[@]}"; do excludes+=(":(exclude)$sm"); done
 git add -A
-git diff --cached HEAD -- . "${excludes[@]}" > "$PATCH"
+git diff --abbrev=9 --cached HEAD -- . "${excludes[@]}" > "$PATCH"
 git reset -q
 
 # 2. Each patched submodule: tracked edits + new files, path-prefixed so the
@@ -45,7 +45,7 @@ for sm in "${SUBMODULES[@]}"; do
   [[ -e "$sm/.git" ]] || { echo "submodule $sm not checked out" >&2; exit 1; }
   ( cd "$sm"
     git add -N .
-    git diff HEAD --src-prefix="a/$sm/" --dst-prefix="b/$sm/" >> "$PATCH"
+    git diff --abbrev=9 HEAD --src-prefix="a/$sm/" --dst-prefix="b/$sm/" >> "$PATCH"
     git reset -q )
 done
 
