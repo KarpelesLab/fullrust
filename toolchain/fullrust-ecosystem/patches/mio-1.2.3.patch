@@ -1,21 +1,22 @@
 # fullrust support for mio 1.2.3 — route target_os = "fullrust" through mio's
-# own unix backend (epoll selector, eventfd waker, net/tcp/udp, pipe, SourceFd)
-# exactly as on Linux: cfg broadenings + a private raw-syscall `libc` shim
-# (src/sys/unix/libc.rs) standing in for the libc crate. No libc dependency.
-# UDS (UnixStream/Listener/Datagram) stays gated out: it wraps std::os::unix::net.
+# own unix backend (epoll selector, eventfd waker, net/tcp/udp, Unix-domain
+# sockets incl. abstract names, pipe incl. From<ChildStdin/Stdout/Stderr>,
+# SourceFd) exactly as on Linux: cfg broadenings + a private raw-syscall `libc`
+# shim (src/sys/unix/libc.rs) standing in for the libc crate. No libc
+# dependency. UDS and the child-pipe conversions use fullrust std's
+# std::os::unix / std::os::linux, which match Linux.
 # Applied on top of crates.io mio 1.2.3 (vendored in crates/mio/).
-diff -ruN a/Cargo.toml b/Cargo.toml
---- a/Cargo.toml	2026-09-29 13:30:48.616598750 +0900
-+++ b/Cargo.toml	2026-09-29 13:30:48.618524272 +0900
+
+--- a/Cargo.toml
++++ b/Cargo.toml
 @@ -150,4 +150,5 @@
  check-cfg = [
      "cfg(mio_unsupported_force_poll_poll)",
      "cfg(mio_unsupported_force_waker_pipe)",
 +    'cfg(target_os, values("fullrust"))',
  ]
-diff -ruN a/src/interest.rs b/src/interest.rs
---- a/src/interest.rs	2026-09-29 13:30:48.616759258 +0900
-+++ b/src/interest.rs	2026-09-29 13:30:48.618726384 +0900
+--- a/src/interest.rs
++++ b/src/interest.rs
 @@ -48,7 +48,7 @@
      pub const LIO: Interest = Interest(unsafe { NonZeroU8::new_unchecked(LIO) });
  
@@ -34,9 +35,8 @@ diff -ruN a/src/interest.rs b/src/interest.rs
          {
              if self.is_priority() {
                  if one {
-diff -ruN a/src/io_source.rs b/src/io_source.rs
---- a/src/io_source.rs	2026-09-29 13:30:48.616759258 +0900
-+++ b/src/io_source.rs	2026-09-29 13:30:48.618726384 +0900
+--- a/src/io_source.rs
++++ b/src/io_source.rs
 @@ -1,5 +1,5 @@
  use std::ops::{Deref, DerefMut};
 -#[cfg(any(unix, target_os = "wasi"))]
@@ -52,9 +52,8 @@ diff -ruN a/src/io_source.rs b/src/io_source.rs
      target_os = "hermit",
      all(target_os = "wasi", not(target_env = "p1"))
  ))]
-diff -ruN a/src/lib.rs b/src/lib.rs
---- a/src/lib.rs	2026-09-29 13:30:48.616759258 +0900
-+++ b/src/lib.rs	2026-09-29 13:30:48.618726384 +0900
+--- a/src/lib.rs
++++ b/src/lib.rs
 @@ -72,8 +72,8 @@
  #[cfg(not(any(target_os = "horizon", target_os = "wasi")))]
  pub use waker::Waker;
@@ -66,9 +65,8 @@ diff -ruN a/src/lib.rs b/src/lib.rs
  pub mod unix {
      //! Unix only extensions.
  
-diff -ruN a/src/macros.rs b/src/macros.rs
---- a/src/macros.rs	2026-09-29 13:30:48.616759258 +0900
-+++ b/src/macros.rs	2026-09-29 13:30:48.618726384 +0900
+--- a/src/macros.rs
++++ b/src/macros.rs
 @@ -51,8 +51,8 @@
  macro_rules! cfg_io_source {
      ($($item:item)*) => {
@@ -80,9 +78,20 @@ diff -ruN a/src/macros.rs b/src/macros.rs
              $item
          )*
      }
-diff -ruN a/src/net/tcp/listener.rs b/src/net/tcp/listener.rs
---- a/src/net/tcp/listener.rs	2026-09-29 13:30:48.616888417 +0900
-+++ b/src/net/tcp/listener.rs	2026-09-29 13:30:48.618919573 +0900
+--- a/src/net/mod.rs
++++ b/src/net/mod.rs
+@@ -33,7 +33,7 @@
+ #[cfg(not(all(target_os = "wasi", target_env = "p1")))]
+ pub use self::udp::UdpSocket;
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "fullrust"))]
+ mod uds;
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "fullrust"))]
+ pub use self::uds::{UnixDatagram, UnixListener, UnixStream};
+--- a/src/net/tcp/listener.rs
++++ b/src/net/tcp/listener.rs
 @@ -1,5 +1,5 @@
  use std::net::{self, SocketAddr};
 -#[cfg(any(unix, target_os = "wasi"))]
@@ -166,9 +175,8 @@ diff -ruN a/src/net/tcp/listener.rs b/src/net/tcp/listener.rs
              {
                  net::TcpListener::from_raw_fd(listener.into_raw_fd())
              }
-diff -ruN a/src/net/tcp/stream.rs b/src/net/tcp/stream.rs
---- a/src/net/tcp/stream.rs	2026-09-29 13:30:48.616888417 +0900
-+++ b/src/net/tcp/stream.rs	2026-09-29 13:30:48.618919573 +0900
+--- a/src/net/tcp/stream.rs
++++ b/src/net/tcp/stream.rs
 @@ -1,7 +1,7 @@
  use std::fmt;
  use std::io::{self, IoSlice, IoSliceMut, Read, Write};
@@ -246,9 +254,8 @@ diff -ruN a/src/net/tcp/stream.rs b/src/net/tcp/stream.rs
              {
                  net::TcpStream::from_raw_fd(stream.into_raw_fd())
              }
-diff -ruN a/src/net/udp.rs b/src/net/udp.rs
---- a/src/net/udp.rs	2026-09-29 13:30:48.616888417 +0900
-+++ b/src/net/udp.rs	2026-09-29 13:30:48.618967396 +0900
+--- a/src/net/udp.rs
++++ b/src/net/udp.rs
 @@ -8,7 +8,7 @@
  //! [portability guidelines]: ../struct.Poll.html#portability
  
@@ -317,9 +324,8 @@ diff -ruN a/src/net/udp.rs b/src/net/udp.rs
              {
                  net::UdpSocket::from_raw_fd(socket.into_raw_fd())
              }
-diff -ruN a/src/poll.rs b/src/poll.rs
---- a/src/poll.rs	2026-09-29 13:30:48.616941800 +0900
-+++ b/src/poll.rs	2026-09-29 13:30:48.618967396 +0900
+--- a/src/poll.rs
++++ b/src/poll.rs
 @@ -1,5 +1,5 @@
  #[cfg(all(
 -    unix,
@@ -363,9 +369,8 @@ diff -ruN a/src/poll.rs b/src/poll.rs
          not(mio_unsupported_force_poll_poll),
          not(any(
              target_os = "aix",
-diff -ruN a/src/sys/mod.rs b/src/sys/mod.rs
---- a/src/sys/mod.rs	2026-09-29 13:30:48.617011307 +0900
-+++ b/src/sys/mod.rs	2026-09-29 13:30:48.619059859 +0900
+--- a/src/sys/mod.rs
++++ b/src/sys/mod.rs
 @@ -52,6 +52,7 @@
  
  #[cfg(any(
@@ -383,10 +388,16 @@ diff -ruN a/src/sys/mod.rs b/src/sys/mod.rs
      cfg_any_os_ext! {
          mod unix;
          #[cfg(feature = "os-ext")]
-diff -ruN a/src/sys/shell/mod.rs b/src/sys/shell/mod.rs
---- a/src/sys/shell/mod.rs	2026-09-29 13:30:48.617038619 +0900
-+++ b/src/sys/shell/mod.rs	2026-09-29 13:30:48.619083836 +0900
-@@ -21,7 +21,7 @@
+--- a/src/sys/shell/mod.rs
++++ b/src/sys/shell/mod.rs
+@@ -15,13 +15,13 @@
+ cfg_net! {
+     pub(crate) mod tcp;
+     pub(crate) mod udp;
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "fullrust"))]
+     pub(crate) mod uds;
+ }
  
  cfg_io_source! {
      use std::io;
@@ -413,9 +424,8 @@ diff -ruN a/src/sys/shell/mod.rs b/src/sys/shell/mod.rs
      impl IoSourceState {
          pub fn register(
              &mut self,
-diff -ruN a/src/sys/shell/selector.rs b/src/sys/shell/selector.rs
---- a/src/sys/shell/selector.rs	2026-09-29 13:30:48.617038619 +0900
-+++ b/src/sys/shell/selector.rs	2026-09-29 13:30:48.619083836 +0900
+--- a/src/sys/shell/selector.rs
++++ b/src/sys/shell/selector.rs
 @@ -1,5 +1,5 @@
  use std::io;
 -#[cfg(unix)]
@@ -449,9 +459,8 @@ diff -ruN a/src/sys/shell/selector.rs b/src/sys/shell/selector.rs
  impl AsRawFd for Selector {
      fn as_raw_fd(&self) -> RawFd {
          os_required!()
-diff -ruN a/src/sys/shell/tcp.rs b/src/sys/shell/tcp.rs
---- a/src/sys/shell/tcp.rs	2026-09-29 13:30:48.617038619 +0900
-+++ b/src/sys/shell/tcp.rs	2026-09-29 13:30:48.619083836 +0900
+--- a/src/sys/shell/tcp.rs
++++ b/src/sys/shell/tcp.rs
 @@ -21,7 +21,7 @@
      os_required!();
  }
@@ -461,15 +470,14 @@ diff -ruN a/src/sys/shell/tcp.rs b/src/sys/shell/tcp.rs
  pub(crate) fn set_reuseaddr(_: &net::TcpListener, _: bool) -> io::Result<()> {
      os_required!();
  }
-diff -ruN a/src/sys/unix/libc.rs b/src/sys/unix/libc.rs
---- a/src/sys/unix/libc.rs	1970-01-01 09:00:00.000000000 +0900
-+++ b/src/sys/unix/libc.rs	2026-09-29 13:30:48.619391261 +0900
-@@ -0,0 +1,316 @@
+--- /dev/null
++++ b/src/sys/unix/libc.rs
+@@ -0,0 +1,324 @@
 +//! A private, minimal stand-in for the `libc` crate on the `fullrust` target.
 +//!
 +//! `fullrust` (`x86_64-unknown-linux-fullrust`) is the Linux kernel ABI with no
 +//! C library, so mio's ordinary Linux code paths (epoll selector, eventfd
-+//! waker, `net`/`tcp`/`udp`, `pipe`) are compiled unchanged and resolve their
++//! waker, `net`/`tcp`/`udp`/`uds`, `pipe`) are compiled unchanged and resolve their
 +//! `libc::…` paths to this module instead. It supplies exactly the types,
 +//! constants and functions those paths use, with Linux x86_64 layouts and
 +//! values, implemented as raw `syscall` instructions.
@@ -542,6 +550,13 @@ diff -ruN a/src/sys/unix/libc.rs b/src/sys/unix/libc.rs
 +
 +#[repr(C)]
 +#[derive(Clone, Copy)]
++pub(crate) struct sockaddr_un {
++    pub sun_family: sa_family_t,
++    pub sun_path: [c_char; 108],
++}
++
++#[repr(C)]
++#[derive(Clone, Copy)]
 +pub(crate) struct sockaddr_storage {
 +    pub ss_family: sa_family_t,
 +    __ss_pad1: [u8; 6],
@@ -564,6 +579,7 @@ diff -ruN a/src/sys/unix/libc.rs b/src/sys/unix/libc.rs
 +    assert!(core::mem::size_of::<sockaddr>() == 16);
 +    assert!(core::mem::size_of::<sockaddr_in>() == 16);
 +    assert!(core::mem::size_of::<sockaddr_in6>() == 28);
++    assert!(core::mem::size_of::<sockaddr_un>() == 110);
 +    assert!(core::mem::size_of::<sockaddr_storage>() == 128);
 +    assert!(core::mem::align_of::<sockaddr_storage>() == 8);
 +};
@@ -781,9 +797,8 @@ diff -ruN a/src/sys/unix/libc.rs b/src/sys/unix/libc.rs
 +) -> c_int {
 +    sys4(NR_EPOLL_WAIT, i(epfd), events as usize, i(maxevents), i(timeout)) as c_int
 +}
-diff -ruN a/src/sys/unix/mod.rs b/src/sys/unix/mod.rs
---- a/src/sys/unix/mod.rs	2026-09-29 13:30:48.617121257 +0900
-+++ b/src/sys/unix/mod.rs	2026-09-29 13:30:48.619391261 +0900
+--- a/src/sys/unix/mod.rs
++++ b/src/sys/unix/mod.rs
 @@ -1,6 +1,7 @@
  /// Helper macro to execute a system call that returns an `io::Result`.
  //
@@ -834,18 +849,8 @@ diff -ruN a/src/sys/unix/mod.rs b/src/sys/unix/mod.rs
          )
      ), path = "waker/eventfd.rs")]
      #[cfg_attr(all(
-@@ -133,7 +155,7 @@
- 
-         pub(crate) mod tcp;
-         pub(crate) mod udp;
--        #[cfg(not(any(target_os = "hermit", target_os = "wasi")))]
-+        #[cfg(not(any(target_os = "hermit", target_os = "wasi", target_os = "fullrust")))]
-         pub(crate) mod uds;
-     }
- 
-diff -ruN a/src/sys/unix/net.rs b/src/sys/unix/net.rs
---- a/src/sys/unix/net.rs	2026-09-29 13:30:48.617121257 +0900
-+++ b/src/sys/unix/net.rs	2026-09-29 13:30:48.619166814 +0900
+--- a/src/sys/unix/net.rs
++++ b/src/sys/unix/net.rs
 @@ -1,3 +1,5 @@
 +#[cfg(target_os = "fullrust")]
 +use crate::sys::unix::libc;
@@ -860,9 +865,8 @@ diff -ruN a/src/sys/unix/net.rs b/src/sys/unix/net.rs
          target_os = "netbsd",
          target_os = "openbsd",
          target_os = "solaris",
-diff -ruN a/src/sys/unix/pipe.rs b/src/sys/unix/pipe.rs
---- a/src/sys/unix/pipe.rs	2026-09-29 13:30:48.617121257 +0900
-+++ b/src/sys/unix/pipe.rs	2026-09-29 13:30:48.619391261 +0900
+--- a/src/sys/unix/pipe.rs
++++ b/src/sys/unix/pipe.rs
 @@ -4,6 +4,8 @@
  
  use std::io;
@@ -883,42 +887,7 @@ diff -ruN a/src/sys/unix/pipe.rs b/src/sys/unix/pipe.rs
      #[cfg(any(
          target_os = "aix",
          target_os = "haiku",
-@@ -69,6 +75,7 @@
- use std::fs::File;
- use std::io::{IoSlice, IoSliceMut, Read, Write};
- use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
-+#[cfg(not(target_os = "fullrust"))]
- use std::process::{ChildStderr, ChildStdin, ChildStdout};
- 
- use crate::io_source::IoSource;
-@@ -354,6 +361,8 @@
- /// # Notes
- ///
- /// The underlying pipe is **not** set to non-blocking.
-+// fullrust std has no `IntoRawFd` for child stdio handles (yet).
-+#[cfg(not(target_os = "fullrust"))]
- impl From<ChildStdin> for Sender {
-     fn from(stdin: ChildStdin) -> Sender {
-         // Safety: `ChildStdin` is guaranteed to be a valid file descriptor.
-@@ -531,6 +540,8 @@
- /// # Notes
- ///
- /// The underlying pipe is **not** set to non-blocking.
-+// fullrust std has no `IntoRawFd` for child stdio handles (yet).
-+#[cfg(not(target_os = "fullrust"))]
- impl From<ChildStdout> for Receiver {
-     fn from(stdout: ChildStdout) -> Receiver {
-         // Safety: `ChildStdout` is guaranteed to be a valid file descriptor.
-@@ -541,6 +552,8 @@
- /// # Notes
- ///
- /// The underlying pipe is **not** set to non-blocking.
-+// fullrust std has no `IntoRawFd` for child stdio handles (yet).
-+#[cfg(not(target_os = "fullrust"))]
- impl From<ChildStderr> for Receiver {
-     fn from(stderr: ChildStderr) -> Receiver {
-         // Safety: `ChildStderr` is guaranteed to be a valid file descriptor.
-@@ -588,7 +601,7 @@
+@@ -588,7 +594,7 @@
      }
  }
  
@@ -927,7 +896,7 @@ diff -ruN a/src/sys/unix/pipe.rs b/src/sys/unix/pipe.rs
  fn set_nonblocking(fd: RawFd, nonblocking: bool) -> io::Result<()> {
      let value = nonblocking as libc::c_int;
      if unsafe { libc::ioctl(fd, libc::FIONBIO, &value) } == -1 {
-@@ -598,6 +611,12 @@
+@@ -598,6 +604,12 @@
      }
  }
  
@@ -940,9 +909,8 @@ diff -ruN a/src/sys/unix/pipe.rs b/src/sys/unix/pipe.rs
  #[cfg(any(target_os = "aix", target_os = "illumos", target_os = "solaris", target_os = "vita"))]
  fn set_nonblocking(fd: RawFd, nonblocking: bool) -> io::Result<()> {
      let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-diff -ruN a/src/sys/unix/selector/epoll.rs b/src/sys/unix/selector/epoll.rs
---- a/src/sys/unix/selector/epoll.rs	2026-09-29 13:30:48.617168229 +0900
-+++ b/src/sys/unix/selector/epoll.rs	2026-09-29 13:30:48.619190821 +0900
+--- a/src/sys/unix/selector/epoll.rs
++++ b/src/sys/unix/selector/epoll.rs
 @@ -1,3 +1,5 @@
 +#[cfg(target_os = "fullrust")]
 +use crate::sys::unix::libc;
@@ -959,9 +927,8 @@ diff -ruN a/src/sys/unix/selector/epoll.rs b/src/sys/unix/selector/epoll.rs
      use crate::sys::Event;
      use crate::Token;
  
-diff -ruN a/src/sys/unix/tcp.rs b/src/sys/unix/tcp.rs
---- a/src/sys/unix/tcp.rs	2026-09-29 13:30:48.617168229 +0900
-+++ b/src/sys/unix/tcp.rs	2026-09-29 13:30:48.619190821 +0900
+--- a/src/sys/unix/tcp.rs
++++ b/src/sys/unix/tcp.rs
 @@ -1,3 +1,5 @@
 +#[cfg(target_os = "fullrust")]
 +use crate::sys::unix::libc;
@@ -976,18 +943,92 @@ diff -ruN a/src/sys/unix/tcp.rs b/src/sys/unix/tcp.rs
          target_os = "netbsd",
          target_os = "openbsd",
          target_os = "solaris",
-diff -ruN a/src/sys/unix/udp.rs b/src/sys/unix/udp.rs
---- a/src/sys/unix/udp.rs	2026-09-29 13:30:48.617168229 +0900
-+++ b/src/sys/unix/udp.rs	2026-09-29 13:30:48.619190821 +0900
+--- a/src/sys/unix/udp.rs
++++ b/src/sys/unix/udp.rs
 @@ -1,3 +1,5 @@
 +#[cfg(target_os = "fullrust")]
 +use crate::sys::unix::libc;
  use std::io;
  use std::mem;
  use std::net::{self, SocketAddr};
-diff -ruN a/src/sys/unix/waker/eventfd.rs b/src/sys/unix/waker/eventfd.rs
---- a/src/sys/unix/waker/eventfd.rs	2026-09-29 13:30:48.617376250 +0900
-+++ b/src/sys/unix/waker/eventfd.rs	2026-09-29 13:30:48.619391261 +0900
+--- a/src/sys/unix/uds/datagram.rs
++++ b/src/sys/unix/uds/datagram.rs
+@@ -1,4 +1,6 @@
+ use std::io;
++#[cfg(target_os = "fullrust")]
++use crate::sys::unix::libc;
+ use std::os::fd::{AsRawFd, FromRawFd};
+ use std::os::unix::net::{self, SocketAddr};
+ 
+--- a/src/sys/unix/uds/listener.rs
++++ b/src/sys/unix/uds/listener.rs
+@@ -4,6 +4,8 @@
+ use std::os::unix::net::{self, SocketAddr};
+ use std::path::Path;
+ use std::{io, mem};
++#[cfg(target_os = "fullrust")]
++use crate::sys::unix::libc;
+ 
+ use crate::net::UnixStream;
+ use crate::sys::unix::net::new_socket;
+@@ -28,6 +30,7 @@
+     let backlog = 128;
+     #[cfg(any(
+         target_os = "linux",
++        target_os = "fullrust",
+         target_os = "freebsd",
+         target_os = "openbsd",
+         target_vendor = "apple"
+@@ -35,6 +38,7 @@
+     let backlog = -1;
+     #[cfg(not(any(
+         target_os = "linux",
++        target_os = "fullrust",
+         target_os = "freebsd",
+         target_os = "openbsd",
+         target_vendor = "apple",
+--- a/src/sys/unix/uds/mod.rs
++++ b/src/sys/unix/uds/mod.rs
+@@ -1,7 +1,9 @@
+ #[cfg(target_os = "android")]
+ use std::os::android::net::SocketAddrExt;
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "fullrust"))]
+ use std::os::linux::net::SocketAddrExt;
++#[cfg(target_os = "fullrust")]
++use crate::sys::unix::libc;
+ use std::os::unix::ffi::OsStrExt;
+ use std::os::unix::io::FromRawFd;
+ use std::os::unix::net::SocketAddr;
+@@ -42,7 +44,7 @@
+     let mut offset = 0;
+     let addr = match address.as_pathname() {
+         Some(path) => path.as_os_str().as_bytes(),
+-        #[cfg(any(target_os = "android", target_os = "linux"))]
++        #[cfg(any(target_os = "android", target_os = "linux", target_os = "fullrust"))]
+         None => match address.as_abstract_name() {
+             Some(name) => {
+                 offset += 1;
+@@ -50,7 +52,7 @@
+             }
+             None => UNNAMED_ADDRESS,
+         },
+-        #[cfg(not(any(target_os = "android", target_os = "linux")))]
++        #[cfg(not(any(target_os = "android", target_os = "linux", target_os = "fullrust")))]
+         None => UNNAMED_ADDRESS,
+     };
+ 
+--- a/src/sys/unix/uds/stream.rs
++++ b/src/sys/unix/uds/stream.rs
+@@ -1,4 +1,6 @@
+ use std::io;
++#[cfg(target_os = "fullrust")]
++use crate::sys::unix::libc;
+ use std::os::fd::FromRawFd;
+ use std::os::unix::net::{self, SocketAddr};
+ 
+--- a/src/sys/unix/waker/eventfd.rs
++++ b/src/sys/unix/waker/eventfd.rs
 @@ -1,3 +1,5 @@
 +#[cfg(target_os = "fullrust")]
 +use crate::sys::unix::libc;

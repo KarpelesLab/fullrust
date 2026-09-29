@@ -1,4 +1,6 @@
 use std::io;
+#[cfg(target_os = "fullrust")]
+use crate::sys::unix::libc;
 use std::os::fd::FromRawFd;
 use std::os::unix::net::{self, SocketAddr};
 

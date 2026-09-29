@@ -75,7 +75,6 @@ cfg_os_ext! {
 use std::fs::File;
 use std::io::{IoSlice, IoSliceMut, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
-#[cfg(not(target_os = "fullrust"))]
 use std::process::{ChildStderr, ChildStdin, ChildStdout};
 
 use crate::io_source::IoSource;
@@ -361,8 +360,6 @@ impl Write for &Sender {
 /// # Notes
 ///
 /// The underlying pipe is **not** set to non-blocking.
-// fullrust std has no `IntoRawFd` for child stdio handles (yet).
-#[cfg(not(target_os = "fullrust"))]
 impl From<ChildStdin> for Sender {
     fn from(stdin: ChildStdin) -> Sender {
         // Safety: `ChildStdin` is guaranteed to be a valid file descriptor.
@@ -540,8 +537,6 @@ impl Read for &Receiver {
 /// # Notes
 ///
 /// The underlying pipe is **not** set to non-blocking.
-// fullrust std has no `IntoRawFd` for child stdio handles (yet).
-#[cfg(not(target_os = "fullrust"))]
 impl From<ChildStdout> for Receiver {
     fn from(stdout: ChildStdout) -> Receiver {
         // Safety: `ChildStdout` is guaranteed to be a valid file descriptor.
@@ -552,8 +547,6 @@ impl From<ChildStdout> for Receiver {
 /// # Notes
 ///
 /// The underlying pipe is **not** set to non-blocking.
-// fullrust std has no `IntoRawFd` for child stdio handles (yet).
-#[cfg(not(target_os = "fullrust"))]
 impl From<ChildStderr> for Receiver {
     fn from(stderr: ChildStderr) -> Receiver {
         // Safety: `ChildStderr` is guaranteed to be a valid file descriptor.

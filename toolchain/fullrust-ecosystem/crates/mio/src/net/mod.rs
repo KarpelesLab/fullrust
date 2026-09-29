@@ -33,7 +33,7 @@ mod udp;
 #[cfg(not(all(target_os = "wasi", target_env = "p1")))]
 pub use self::udp::UdpSocket;
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fullrust"))]
 mod uds;
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fullrust"))]
 pub use self::uds::{UnixDatagram, UnixListener, UnixStream};

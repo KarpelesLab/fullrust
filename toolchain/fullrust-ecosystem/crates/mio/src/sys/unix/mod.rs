@@ -155,7 +155,7 @@ cfg_os_poll! {
 
         pub(crate) mod tcp;
         pub(crate) mod udp;
-        #[cfg(not(any(target_os = "hermit", target_os = "wasi", target_os = "fullrust")))]
+        #[cfg(not(any(target_os = "hermit", target_os = "wasi")))]
         pub(crate) mod uds;
     }
 

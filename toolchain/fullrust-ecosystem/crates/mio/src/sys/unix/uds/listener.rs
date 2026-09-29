@@ -4,6 +4,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::{self, SocketAddr};
 use std::path::Path;
 use std::{io, mem};
+#[cfg(target_os = "fullrust")]
+use crate::sys::unix::libc;
 
 use crate::net::UnixStream;
 use crate::sys::unix::net::new_socket;
@@ -28,6 +30,7 @@ pub(crate) fn bind_addr(address: &SocketAddr) -> io::Result<net::UnixListener> {
     let backlog = 128;
     #[cfg(any(
         target_os = "linux",
+        target_os = "fullrust",
         target_os = "freebsd",
         target_os = "openbsd",
         target_vendor = "apple"
@@ -35,6 +38,7 @@ pub(crate) fn bind_addr(address: &SocketAddr) -> io::Result<net::UnixListener> {
     let backlog = -1;
     #[cfg(not(any(
         target_os = "linux",
+        target_os = "fullrust",
         target_os = "freebsd",
         target_os = "openbsd",
         target_vendor = "apple",

@@ -2,7 +2,7 @@
 //!
 //! `fullrust` (`x86_64-unknown-linux-fullrust`) is the Linux kernel ABI with no
 //! C library, so mio's ordinary Linux code paths (epoll selector, eventfd
-//! waker, `net`/`tcp`/`udp`, `pipe`) are compiled unchanged and resolve their
+//! waker, `net`/`tcp`/`udp`/`uds`, `pipe`) are compiled unchanged and resolve their
 //! `libc::…` paths to this module instead. It supplies exactly the types,
 //! constants and functions those paths use, with Linux x86_64 layouts and
 //! values, implemented as raw `syscall` instructions.
@@ -75,6 +75,13 @@ pub(crate) struct sockaddr_in6 {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+pub(crate) struct sockaddr_un {
+    pub sun_family: sa_family_t,
+    pub sun_path: [c_char; 108],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 pub(crate) struct sockaddr_storage {
     pub ss_family: sa_family_t,
     __ss_pad1: [u8; 6],
@@ -97,6 +104,7 @@ const _: () = {
     assert!(core::mem::size_of::<sockaddr>() == 16);
     assert!(core::mem::size_of::<sockaddr_in>() == 16);
     assert!(core::mem::size_of::<sockaddr_in6>() == 28);
+    assert!(core::mem::size_of::<sockaddr_un>() == 110);
     assert!(core::mem::size_of::<sockaddr_storage>() == 128);
     assert!(core::mem::align_of::<sockaddr_storage>() == 8);
 };
