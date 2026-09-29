@@ -21,9 +21,15 @@ on:
     branches: [master]
     paths:
       - "action.yml"
-      - "toolchain/docker/**"
-      - "toolchain/fullrust-ecosystem/**"
+      - "toolchain/test-ecosystem/**"
       - ".github/workflows/action-selftest.yml"
+  # Changes to the image (docker/, the ecosystem forks) are tested AFTER the
+  # images are rebuilt: triggering on the push itself raced the rebuild and ran
+  # against the previous images, failing spuriously.
+  workflow_run:
+    workflows: ["fullrust image"]
+    types: [completed]
+    branches: [master]
 
 permissions:
   contents: read
@@ -33,6 +39,7 @@ jobs:
   composite-action:
     name: composite action (${{ matrix.image }})
     runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -77,6 +84,7 @@ jobs:
   ecosystem:
     name: ecosystem forks (${{ matrix.image }})
     runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -117,6 +125,7 @@ jobs:
   container-job:
     name: container job (raw cargo build in :latest)
     runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     container:
       image: ghcr.io/karpeleslab/fullrust:latest
     steps:
