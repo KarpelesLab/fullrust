@@ -7127,10 +7127,10 @@ index 00000000..8ee3776b
 +}
 diff --git a/library/std/src/sys/pal/fullrust/tls.rs b/library/std/src/sys/pal/fullrust/tls.rs
 new file mode 100644
-index 00000000..6c7d7d3a
+index 00000000..66486ebd
 --- /dev/null
 +++ b/library/std/src/sys/pal/fullrust/tls.rs
-@@ -0,0 +1,253 @@
+@@ -0,0 +1,267 @@
 +//! Native ELF thread-local storage (`%fs`-based, variant II) for the fullrust
 +//! target — the libc-free equivalent of glibc/musl's `__init_tls`/`__copy_tls`.
 +//!
@@ -7276,24 +7276,33 @@ index 00000000..6c7d7d3a
 +fn build_block() -> (*mut Tcb, *mut u8, usize) {
 +    let memsz = TLS_MEMSZ.load(Ordering::Relaxed);
 +    let filesz = TLS_FILESZ.load(Ordering::Relaxed);
-+    let align = TLS_ALIGN.load(Ordering::Relaxed).max(16);
++    // `p_align` is the PT_TLS alignment as the LINKER saw it: variant-II offsets
++    // are `sym_off - round_up(memsz, p_align)`, so `tls_size` must round by the
++    // same value or every #[thread_local] is shifted. `tp_align` over-aligns the
++    // TCB/TP for general x86-64 safety without perturbing those offsets.
++    let p_align = TLS_ALIGN.load(Ordering::Relaxed).max(1);
++    let tp_align = p_align.max(16);
 +    let image_addr = TLS_IMAGE.load(Ordering::Relaxed);
 +    let image = ptr::with_exposed_provenance::<u8>(image_addr);
 +
 +    // TLS data occupies `tls_size` bytes just below TP; the TCB sits at TP.
-+    let tls_size = round_up(memsz, align);
++    let tls_size = round_up(memsz, p_align);
 +    let total = tls_size + TCB_SIZE;
-+    let map_len = round_up(total + align, PAGE);
++    let map_len = round_up(total + tp_align, PAGE);
 +    let raw = mmap(map_len);
 +    if raw.is_null() {
 +        return (ptr::null_mut(), ptr::null_mut(), 0);
 +    }
 +
-+    // Align the TLS block base up to `align`; TP lands `tls_size` above it (and
-+    // is therefore also `align`-aligned, since `tls_size` is a multiple).
-+    let base = ptr::with_exposed_provenance_mut::<u8>(round_up(raw.expose_provenance(), align));
++    // Put TP at a `tp_align`-aligned address at least `tls_size` into the mapping;
++    // the block base = TP - tls_size is then p_align-aligned (tls_size is a
++    // p_align multiple), so each thread-local lands exactly where the linker
++    // placed it. Deriving base from TP (not TP from a rounded base) is what keeps
++    // `tls_size` equal to the linker's `round_up(memsz, p_align)`.
++    let tp_addr = round_up(raw.expose_provenance() + tls_size, tp_align);
++    let base = ptr::with_exposed_provenance_mut::<u8>(tp_addr - tls_size);
 +    // SAFETY: `base + tls_size + TCB_SIZE <= raw + map_len` by construction.
-+    let tp = unsafe { base.add(tls_size) } as *mut Tcb;
++    let tp = ptr::with_exposed_provenance_mut::<u8>(tp_addr) as *mut Tcb;
 +
 +    // Copy the `.tdata` init image into [base, base+filesz); the rest of the
 +    // block (`.tbss` and rounding pad) is already zero from the fresh mapping.
@@ -7361,7 +7370,12 @@ index 00000000..6c7d7d3a
 +                TLS_IMAGE.store(vaddr, Ordering::Relaxed);
 +                TLS_FILESZ.store(filesz, Ordering::Relaxed);
 +                TLS_MEMSZ.store(memsz, Ordering::Relaxed);
-+                TLS_ALIGN.store(align.max(16), Ordering::Relaxed);
++                // Keep the REAL PT_TLS alignment — the linker computes variant-II
++                // thread-local offsets against `round_up(memsz, p_align)`, so the
++                // runtime must round by the same value (build_block over-aligns TP
++                // separately). Forcing 16 here shifts every #[thread_local] by 8
++                // whenever memsz isn't a multiple of 16 (e.g. Rust 1.90's 104).
++                TLS_ALIGN.store(align.max(1), Ordering::Relaxed);
 +                break;
 +            }
 +        }
