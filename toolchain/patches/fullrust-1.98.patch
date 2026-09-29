@@ -2179,6 +2179,21 @@ index 89856516b..b608bb37e 100644
      target_family = "windows" => {
          mod windows;
          pub use windows::*;
+diff --git a/library/std/src/sys/exit.rs b/library/std/src/sys/exit.rs
+index 53fb92ba0..ab72bd128 100644
+--- a/library/std/src/sys/exit.rs
++++ b/library/std/src/sys/exit.rs
+@@ -82,6 +82,10 @@ pub fn exit(code: i32) -> ! {
+         target_os = "motor" => {
+             moto_rt::process::exit(code)
+         }
++        target_os = "fullrust" => {
++            // Raw `exit_group(2)`: no libc `atexit` machinery exists to run.
++            crate::sys::pal::os::exit(code)
++        }
+         all(target_vendor = "fortanix", target_env = "sgx") => {
+             crate::sys::pal::abi::exit_with_code(code as _)
+         }
 diff --git a/library/std/src/sys/fs/fullrust.rs b/library/std/src/sys/fs/fullrust.rs
 new file mode 100644
 index 000000000..5b09c93e9
