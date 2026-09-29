@@ -19,24 +19,30 @@
 //! abort-stubs. (On the `build-std` path `alloc` is recompiled without
 //! unwinding and these go unused / are stripped.)
 
-use core::ffi::c_int;
+use core::ffi::{c_int, c_void};
+
+// These use the exact C signatures (`*mut c_void`, not `*mut u8`): rustc checks
+// definitions of these runtime symbols against them
+// (`suspicious_runtime_symbol_definitions`). The bodies work on bytes.
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+pub unsafe extern "C" fn memcpy(dest: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
+    let (d, s) = (dest as *mut u8, src as *const u8);
     let mut i = 0;
     while i < n {
-        *dest.add(i) = *src.add(i);
+        *d.add(i) = *s.add(i);
         i += 1;
     }
     dest
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
-    if (dest as usize) < (src as usize) {
+pub unsafe extern "C" fn memmove(dest: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
+    let (d, s) = (dest as *mut u8, src as *const u8);
+    if (d as usize) < (s as usize) {
         let mut i = 0;
         while i < n {
-            *dest.add(i) = *src.add(i);
+            *d.add(i) = *s.add(i);
             i += 1;
         }
     } else {
@@ -44,25 +50,27 @@ pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mu
         let mut i = n;
         while i > 0 {
             i -= 1;
-            *dest.add(i) = *src.add(i);
+            *d.add(i) = *s.add(i);
         }
     }
     dest
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn memset(dest: *mut u8, c: c_int, n: usize) -> *mut u8 {
+pub unsafe extern "C" fn memset(dest: *mut c_void, c: c_int, n: usize) -> *mut c_void {
+    let d = dest as *mut u8;
     let byte = c as u8;
     let mut i = 0;
     while i < n {
-        *dest.add(i) = byte;
+        *d.add(i) = byte;
         i += 1;
     }
     dest
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn memcmp(a: *const u8, b: *const u8, n: usize) -> c_int {
+pub unsafe extern "C" fn memcmp(a: *const c_void, b: *const c_void, n: usize) -> c_int {
+    let (a, b) = (a as *const u8, b as *const u8);
     let mut i = 0;
     while i < n {
         let (x, y) = (*a.add(i), *b.add(i));
@@ -75,7 +83,7 @@ pub unsafe extern "C" fn memcmp(a: *const u8, b: *const u8, n: usize) -> c_int {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn bcmp(a: *const u8, b: *const u8, n: usize) -> c_int {
+pub unsafe extern "C" fn bcmp(a: *const c_void, b: *const c_void, n: usize) -> c_int {
     memcmp(a, b, n)
 }
 

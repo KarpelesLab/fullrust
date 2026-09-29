@@ -191,28 +191,46 @@ fn ensure_sysroot(host: &str, lld: &Path, target_path: &Path) -> PathBuf {
             &target_path.to_string_lossy(),
             "-Zbuild-std=core,alloc,compiler_builtins",
             "-Zjson-target-spec",
+            // Ask cargo where it put each artifact instead of guessing its
+            // directory layout (newer cargo moved rlibs out of `deps/`).
+            "--message-format=json-render-diagnostics",
         ])
-        .status();
-    match status {
-        Ok(s) if s.success() => {}
+        .stderr(std::process::Stdio::inherit())
+        .output();
+    let out = match status {
+        Ok(o) if o.status.success() => o.stdout,
         _ => fail("failed to build the fullrust sysroot std"),
-    }
+    };
 
     // 3. Assemble the sysroot: our target rlibs + symlinked host pieces.
     let lib = sysroot.join("lib");
     let target_lib = lib.join("rustlib").join(TARGET_STEM).join("lib");
     let _ = std::fs::create_dir_all(&target_lib);
-    let built = proj
-        .join("target")
-        .join(TARGET_STEM)
-        .join("release")
-        .join("deps");
+    // Newer cargo: each crate's full metadata lives in a hashed `.rmeta` whose
+    // sibling hashed `.rlib` holds only a stub (the root crate's reported
+    // `libstd.rlib` is an unhashed uplifted copy — skip it). Copy each reported
+    // `.rmeta` with its sibling `.rlib`. Older cargo embeds full metadata and
+    // reports no `.rmeta`: fall back to the reported `.rlib`s.
+    let artifacts = rlib_artifacts(&String::from_utf8_lossy(&out));
+    let rmetas: Vec<&PathBuf> = artifacts
+        .iter()
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("rmeta"))
+        .collect();
+    let mut to_copy: Vec<PathBuf> = Vec::new();
+    if rmetas.is_empty() {
+        to_copy.extend(artifacts.iter().cloned());
+    } else {
+        for m in rmetas {
+            to_copy.push(m.clone());
+            to_copy.push(m.with_extension("rlib"));
+        }
+    }
     let mut copied = 0;
-    if let Ok(entries) = std::fs::read_dir(&built) {
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|s| s.to_str()) == Some("rlib") {
-                let _ = std::fs::copy(&p, target_lib.join(p.file_name().unwrap()));
+    for p in &to_copy {
+        if let Some(name) = p.file_name() {
+            if std::fs::copy(p, target_lib.join(name)).is_ok()
+                && p.extension().and_then(|e| e.to_str()) == Some("rlib")
+            {
                 copied += 1;
             }
         }
@@ -251,6 +269,34 @@ fn resolve_lld(toolchain: &str, host: &str) -> PathBuf {
         fail(&format!("ld.lld not found at {}", lld.display()));
     }
     lld
+}
+
+/// The `.rlib` and `.rmeta` paths from cargo's `--message-format=json` output:
+/// the `filenames` of each `compiler-artifact` message. Both are needed: newer
+/// cargo builds rlibs with only a metadata stub and keeps the full metadata in
+/// the sibling `.rmeta`, which rustc then requires next to the rlib in the
+/// sysroot. Minimal string scan (paths
+/// here are cargo-generated and contain no escaped characters) so the tool
+/// stays dependency-free.
+fn rlib_artifacts(json: &str) -> Vec<PathBuf> {
+    let mut rlibs = Vec::new();
+    for line in json.lines() {
+        if !line.contains("\"reason\":\"compiler-artifact\"") {
+            continue;
+        }
+        let Some(start) = line.find("\"filenames\":[") else {
+            continue;
+        };
+        let rest = &line[start + "\"filenames\":[".len()..];
+        let Some(end) = rest.find(']') else { continue };
+        for f in rest[..end].split(',') {
+            let f = f.trim().trim_matches('"');
+            if f.ends_with(".rlib") || f.ends_with(".rmeta") {
+                rlibs.push(PathBuf::from(f));
+            }
+        }
+    }
+    rlibs
 }
 
 fn cache_dir() -> PathBuf {
