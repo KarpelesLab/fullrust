@@ -39,54 +39,43 @@ fn check(name: &str, cond: bool) {
 }
 
 // --- raw syscalls: std::os::fullrust::syscall on fullrust, asm on gnu --------
+// Both expose `syscallN(nr, ..) -> io::Result<usize>` and `nr::<NAME>`.
 #[cfg(target_os = "fullrust")]
 mod sc {
-    pub use std::os::fullrust::syscall::nr::*;
-    pub use std::os::fullrust::syscall::{
-        syscall0, syscall1, syscall2, syscall3, syscall6, syscall_result,
-    };
+    pub use std::os::fullrust::syscall::{nr, syscall0, syscall1, syscall2, syscall3, syscall6};
 }
 #[cfg(not(target_os = "fullrust"))]
-#[allow(non_upper_case_globals, dead_code)]
+#[allow(dead_code)]
 mod sc {
     use std::arch::asm;
-    pub const SYS_getpid: usize = 39;
-    pub const SYS_gettid: usize = 186;
-    pub const SYS_getuid: usize = 102;
-    pub const SYS_getgid: usize = 104;
-    pub const SYS_setsid: usize = 112;
-    pub const SYS_getsid: usize = 124;
-    pub const SYS_mmap: usize = 9;
-    pub const SYS_munmap: usize = 11;
-    pub const SYS_ioctl: usize = 16;
-    pub unsafe fn syscall0(n: usize) -> isize {
-        syscall6(n, 0, 0, 0, 0, 0, 0)
+    use std::io;
+    pub mod nr {
+        pub const GETPID: usize = 39;
+        pub const GETTID: usize = 186;
+        pub const GETUID: usize = 102;
+        pub const GETGID: usize = 104;
+        pub const SETSID: usize = 112;
+        pub const MMAP: usize = 9;
+        pub const MUNMAP: usize = 11;
+        pub const IOCTL: usize = 16;
     }
-    pub unsafe fn syscall1(n: usize, a: usize) -> isize {
-        syscall6(n, a, 0, 0, 0, 0, 0)
-    }
-    pub unsafe fn syscall2(n: usize, a: usize, b: usize) -> isize {
-        syscall6(n, a, b, 0, 0, 0, 0)
-    }
-    pub unsafe fn syscall3(n: usize, a: usize, b: usize, c: usize) -> isize {
-        syscall6(n, a, b, c, 0, 0, 0)
-    }
-    pub unsafe fn syscall6(n: usize, a: usize, b: usize, c: usize, d: usize, e: usize, f: usize) -> isize {
+    pub unsafe fn syscall6(n: usize, a: usize, b: usize, c: usize, d: usize, e: usize, f: usize) -> io::Result<usize> {
         let r: isize;
         asm!("syscall", inlateout("rax") n as isize => r, in("rdi") a, in("rsi") b, in("rdx") c,
              in("r10") d, in("r8") e, in("r9") f, lateout("rcx") _, lateout("r11") _, options(nostack));
-        r
+        if (-4095..0).contains(&r) { Err(io::Error::from_raw_os_error(-r as i32)) } else { Ok(r as usize) }
     }
-    pub fn syscall_result(r: isize) -> std::io::Result<usize> {
-        if (-4095..0).contains(&r) { Err(std::io::Error::from_raw_os_error(-r as i32)) } else { Ok(r as usize) }
-    }
+    pub unsafe fn syscall0(n: usize) -> io::Result<usize> { syscall6(n, 0, 0, 0, 0, 0, 0) }
+    pub unsafe fn syscall1(n: usize, a: usize) -> io::Result<usize> { syscall6(n, a, 0, 0, 0, 0, 0) }
+    pub unsafe fn syscall2(n: usize, a: usize, b: usize) -> io::Result<usize> { syscall6(n, a, b, 0, 0, 0, 0) }
+    pub unsafe fn syscall3(n: usize, a: usize, b: usize, c: usize) -> io::Result<usize> { syscall6(n, a, b, c, 0, 0, 0) }
 }
 
 fn getuid() -> u32 {
-    unsafe { sc::syscall0(sc::SYS_getuid) as u32 }
+    unsafe { sc::syscall0(sc::nr::GETUID).unwrap() as u32 }
 }
 fn getgid() -> u32 {
-    unsafe { sc::syscall0(sc::SYS_getgid) as u32 }
+    unsafe { sc::syscall0(sc::nr::GETGID).unwrap() as u32 }
 }
 
 /// Fields of /proc/<pid>/stat after the `(comm)`: returns (pid, pgrp, session).
@@ -311,7 +300,7 @@ fn main() {
     cmd.arg("/proc/self/stat");
     unsafe {
         cmd.pre_exec(|| {
-            sc::syscall_result(sc::syscall0(sc::SYS_setsid)).map(drop)
+            sc::syscall0(sc::nr::SETSID).map(drop)
         });
     }
     let out = cmd.output().unwrap();
@@ -370,7 +359,7 @@ fn main() {
     // ---------------------------------------------------------------- thread
     let (tx, rx) = std::sync::mpsc::channel();
     let h = std::thread::spawn(move || {
-        tx.send(unsafe { sc::syscall0(sc::SYS_gettid) } as u64).unwrap();
+        tx.send(unsafe { sc::syscall0(sc::nr::GETTID) }.unwrap() as u64).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
     });
     let tid = rx.recv().unwrap();
@@ -382,12 +371,12 @@ fn main() {
     h.join().unwrap();
 
     // ---------------------------------------------------------------- raw syscalls
-    let pid = sc::syscall_result(unsafe { sc::syscall0(sc::SYS_getpid) }).unwrap();
+    let pid = unsafe { sc::syscall0(sc::nr::GETPID) }.unwrap();
     check("syscall0(getpid) == process::id", pid as u32 == my_pid);
     let len = 8192usize;
-    let addr = sc::syscall_result(unsafe {
-        sc::syscall6(sc::SYS_mmap, 0, len, 0x3 /*RW*/, 0x22 /*PRIVATE|ANON*/, -1isize as usize, 0)
-    });
+    let addr = unsafe {
+        sc::syscall6(sc::nr::MMAP, 0, len, 0x3 /*RW*/, 0x22 /*PRIVATE|ANON*/, -1isize as usize, 0)
+    };
     let ok = match addr {
         Ok(a) => {
             let p = a as *mut u8;
@@ -396,7 +385,7 @@ fn main() {
                 p.add(len - 1).write(0xCD);
                 let v = (p.read(), p.add(len - 1).read());
                 v == (0xAB, 0xCD)
-                    && sc::syscall_result(sc::syscall2(sc::SYS_munmap, a, len)).is_ok()
+                    && sc::syscall2(sc::nr::MUNMAP, a, len).is_ok()
             }
         }
         Err(_) => false,
@@ -406,14 +395,22 @@ fn main() {
     pw.write_all(b"12345").unwrap();
     let mut avail: i32 = 0;
     const FIONREAD: usize = 0x541B;
-    let r = sc::syscall_result(unsafe {
-        sc::syscall3(sc::SYS_ioctl, pr.as_raw_fd() as usize, FIONREAD, &mut avail as *mut i32 as usize)
-    });
+    let r = unsafe {
+        sc::syscall3(sc::nr::IOCTL, pr.as_raw_fd() as usize, FIONREAD, &mut avail as *mut i32 as usize)
+    };
     check("syscall3(ioctl FIONREAD) on a pipe", r.is_ok() && avail == 5);
-    let e = sc::syscall_result(unsafe { sc::syscall1(sc::SYS_munmap, 1) });
-    check("syscall_result maps -errno to io::Error", e.is_err());
-    let e = sc::syscall_result(unsafe { sc::syscall3(sc::SYS_ioctl, 999_999, FIONREAD, 0) }).unwrap_err();
-    check("syscall_result EBADF", e.raw_os_error() == Some(9));
+    let e = unsafe { sc::syscall1(sc::nr::MUNMAP, 1) };
+    check("syscall maps -errno to io::Error", e.is_err());
+    let e = unsafe { sc::syscall3(sc::nr::IOCTL, 999_999, FIONREAD, 0) }.unwrap_err();
+    check("syscall EBADF", e.raw_os_error() == Some(9));
+    #[cfg(target_os = "fullrust")]
+    {
+        // The os::fullrust aliases are the os::unix items (one trait identity).
+        use std::os::fullrust::process::CommandExt as FrCommandExt;
+        let out = FrCommandExt::arg0(&mut Command::new("/bin/sh"), "fr0").args(["-c", "echo $0"]).output().unwrap();
+        check("os::fullrust::process::CommandExt (alias)", String::from_utf8_lossy(&out.stdout).trim() == "fr0");
+        check("os::fullrust::syscall::errno table", std::os::fullrust::syscall::errno::EBADF == 9);
+    }
 
     // last_os_error is meaningful after a failing std-internal libc-style call
     let e = UnixStream::connect(dir.join("nope")).unwrap_err();

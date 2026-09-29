@@ -342,11 +342,13 @@ fullrust pal:
 - `linux::{fs, net (SocketAddrExt, UnixSocketExt, TcpStreamExt), process
   (PidFd via pidfd_open/waitid/pidfd_send_signal, create_pidfd), raw}`.
 
-**`std::os::fullrust::syscall`** is the escape hatch for everything else:
-`unsafe fn syscall0..syscall6(nr, args…) -> isize` (raw kernel return, `-errno`
-on failure), `syscall_result(isize) -> io::Result<usize>`, and `nr::SYS_*`, the
-complete x86-64 syscall table (Linux 6.x `syscall_64.tbl`). Covered by
-`test-osunix` (which also builds on `x86_64-unknown-linux-gnu` for parity).
+The older fullrust-specific paths keep working as aliases of the same items:
+`std::os::fullrust::{ffi, io, process}` re-export `std::os::unix::{ffi, io,
+process}` (one trait identity, so importing both never conflicts), and
+**`std::os::fullrust::syscall`** stays the escape hatch for everything std does
+not wrap (`syscall0..syscall6 -> io::Result<usize>`, `nr::*` syscall numbers,
+`errno::*`). Covered by `test-osunix` (which also builds on
+`x86_64-unknown-linux-gnu` for parity) and `test-syscall`.
 
 ## Version matrix
 

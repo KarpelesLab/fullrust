@@ -395,10 +395,10 @@ index 00000000..206a907a
 +pub use crate::os::fd::*;
 diff --git a/library/std/src/os/fullrust/mod.rs b/library/std/src/os/fullrust/mod.rs
 new file mode 100644
-index 00000000..a6ad7f40
+index 00000000..0c102e36
 --- /dev/null
 +++ b/library/std/src/os/fullrust/mod.rs
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,42 @@
 +//! Platform-specific extensions to `std` for the `fullrust` target.
 +//!
 +//! `fullrust` is a libc-free, fully static Linux-ABI target that is
@@ -407,16 +407,17 @@ index 00000000..a6ad7f40
 +//! speaks the ordinary Unix file-descriptor ABI, so — exactly like the other
 +//! non-unix fd targets (`hermit`, `wasi`) — it re-exports [`std::os::fd`] here
 +//! under `std::os::fullrust::io`, giving crates the usual
-+//! `AsFd`/`AsRawFd`/`OwnedFd` interop.
++//! `AsFd`/`AsRawFd`/`OwnedFd` interop without pulling in the `unix` module.
 +//!
 +//! For source compatibility with ordinary Linux Rust code, std *also* provides
 +//! [`std::os::unix`] and [`std::os::linux`] on this target, with the same APIs
 +//! as on `x86_64-unknown-linux-gnu` (backed by raw syscalls) — even though
 +//! `cfg(unix)` is false. Code written as `#[cfg(any(unix, target_os =
 +//! "fullrust"))] use std::os::unix::...;` therefore works unchanged.
++//! [`ffi`], [`io`] and [`process`] here are re-exports of those same items.
 +//!
-+//! [`syscall`] is the escape hatch for everything std does not wrap: raw
-+//! `syscall0`..`syscall6` plus the complete x86-64 syscall number table.
++//! [`syscall`] exposes the raw Linux syscall primitives (plus the complete
++//! x86-64 syscall number and errno tables) for anything std doesn't wrap.
 +//!
 +//! [`std::os::fd`]: crate::os::fd
 +//! [`std::os::unix`]: crate::os::unix
@@ -427,6 +428,7 @@ index 00000000..a6ad7f40
 +
 +pub mod ffi;
 +pub mod io;
++pub mod process;
 +pub mod syscall;
 +
 +/// A prelude for conveniently writing platform-specific code.
@@ -439,130 +441,475 @@ index 00000000..a6ad7f40
 +    #[stable(feature = "rust1", since = "1.0.0")]
 +    pub use super::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 +}
-diff --git a/library/std/src/os/fullrust/syscall.rs b/library/std/src/os/fullrust/syscall.rs
+diff --git a/library/std/src/os/fullrust/process.rs b/library/std/src/os/fullrust/process.rs
 new file mode 100644
-index 00000000..2f05b439
+index 00000000..68bf7af2
 --- /dev/null
-+++ b/library/std/src/os/fullrust/syscall.rs
-@@ -0,0 +1,923 @@
-+//! Raw Linux system calls — the escape hatch for anything std does not wrap.
++++ b/library/std/src/os/fullrust/process.rs
+@@ -0,0 +1,24 @@
++//! `fullrust`-specific extensions to primitives in the [`std::process`] module.
 +//!
-+//! `fullrust` has no libc, so there is no `libc::syscall`. This module is the
-+//! direct equivalent: `syscall0` … `syscall6` issue the x86-64 `syscall`
-+//! instruction with the given number and arguments and return the **raw kernel
-+//! result** — a non-negative value on success, or `-errno` (in `-4095..=-1`) on
-+//! failure. [`syscall_result`] turns that into an [`io::Result`]. The
-+//! [`nr`] submodule lists every x86-64 syscall number (`SYS_*`, the same names
-+//! as `libc::SYS_*`), generated from the Linux 6.x `syscall_64.tbl`.
-+//!
-+//! Arguments are passed as `usize`; cast pointers with `as usize` and signed
-+//! values with `as isize as usize` (e.g. `-1` fd for `mmap`).
++//! These are the very same items as [`std::os::unix::process`] (re-exported,
++//! not copies), which std also provides on fullrust — so code importing either
++//! path sees one `CommandExt`/`ExitStatusExt` with the full Linux surface
++//! (`exec`, `pre_exec`, `arg0`, `uid`/`gid`/`groups`, `process_group`, …).
 +//!
 +//! ```no_run
-+//! use std::os::fullrust::syscall::{nr, syscall0, syscall_result};
++//! use std::os::fullrust::process::CommandExt;
++//! use std::process::Command;
 +//!
-+//! let pid = syscall_result(unsafe { syscall0(nr::SYS_getpid) }).unwrap();
-+//! assert_eq!(pid as u32, std::process::id());
++//! // Replace the current process image (`execve`), keeping our pid.
++//! let err = Command::new("/bin/sh").arg0("sh").args(["-c", "echo hi"]).exec();
++//! // `exec` only returns on failure.
++//! panic!("exec failed: {err}");
 +//! ```
++//!
++//! [`std::process`]: crate::process
++//! [`std::os::unix::process`]: crate::os::unix::process
++
++#![stable(feature = "rust1", since = "1.0.0")]
++
++#[stable(feature = "rust1", since = "1.0.0")]
++pub use crate::os::unix::process::{CommandExt, ExitStatusExt, parent_id};
+diff --git a/library/std/src/os/fullrust/syscall/errno.rs b/library/std/src/os/fullrust/syscall/errno.rs
+new file mode 100644
+index 00000000..48c78bd4
+--- /dev/null
++++ b/library/std/src/os/fullrust/syscall/errno.rs
+@@ -0,0 +1,279 @@
++//! Linux `errno` values, for matching against [`io::Error::raw_os_error`].
++//!
++//! ```no_run
++//! use std::os::fullrust::syscall::errno;
++//!
++//! let err = std::fs::File::open("/nonexistent").unwrap_err();
++//! assert_eq!(err.raw_os_error(), Some(errno::ENOENT));
++//! ```
++//!
++//! [`io::Error::raw_os_error`]: crate::io::Error::raw_os_error
++
++#![stable(feature = "fullrust_syscall", since = "1.88.0")]
++
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EPERM: i32 = 1;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENOENT: i32 = 2;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ESRCH: i32 = 3;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EINTR: i32 = 4;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EIO: i32 = 5;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENXIO: i32 = 6;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const E2BIG: i32 = 7;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENOEXEC: i32 = 8;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EBADF: i32 = 9;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ECHILD: i32 = 10;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EAGAIN: i32 = 11;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENOMEM: i32 = 12;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EACCES: i32 = 13;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EFAULT: i32 = 14;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENOTBLK: i32 = 15;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EBUSY: i32 = 16;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EEXIST: i32 = 17;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EXDEV: i32 = 18;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENODEV: i32 = 19;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENOTDIR: i32 = 20;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EISDIR: i32 = 21;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EINVAL: i32 = 22;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENFILE: i32 = 23;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EMFILE: i32 = 24;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENOTTY: i32 = 25;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ETXTBSY: i32 = 26;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EFBIG: i32 = 27;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENOSPC: i32 = 28;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ESPIPE: i32 = 29;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EROFS: i32 = 30;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EMLINK: i32 = 31;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EPIPE: i32 = 32;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EDOM: i32 = 33;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ERANGE: i32 = 34;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EDEADLK: i32 = 35;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENAMETOOLONG: i32 = 36;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENOLCK: i32 = 37;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENOSYS: i32 = 38;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENOTEMPTY: i32 = 39;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ELOOP: i32 = 40;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EWOULDBLOCK: i32 = 11;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENOMSG: i32 = 42;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EIDRM: i32 = 43;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ECHRNG: i32 = 44;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EL2NSYNC: i32 = 45;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EL3HLT: i32 = 46;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EL3RST: i32 = 47;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ELNRNG: i32 = 48;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EUNATCH: i32 = 49;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENOCSI: i32 = 50;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EL2HLT: i32 = 51;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EBADE: i32 = 52;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EBADR: i32 = 53;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EXFULL: i32 = 54;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENOANO: i32 = 55;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EBADRQC: i32 = 56;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EBADSLT: i32 = 57;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EDEADLOCK: i32 = 35;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EBFONT: i32 = 59;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENOSTR: i32 = 60;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENODATA: i32 = 61;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ETIME: i32 = 62;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENOSR: i32 = 63;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENONET: i32 = 64;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENOPKG: i32 = 65;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EREMOTE: i32 = 66;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENOLINK: i32 = 67;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EADV: i32 = 68;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ESRMNT: i32 = 69;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ECOMM: i32 = 70;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EPROTO: i32 = 71;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EMULTIHOP: i32 = 72;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EDOTDOT: i32 = 73;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EBADMSG: i32 = 74;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EOVERFLOW: i32 = 75;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENOTUNIQ: i32 = 76;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EBADFD: i32 = 77;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EREMCHG: i32 = 78;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ELIBACC: i32 = 79;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ELIBBAD: i32 = 80;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ELIBSCN: i32 = 81;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ELIBMAX: i32 = 82;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ELIBEXEC: i32 = 83;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EILSEQ: i32 = 84;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ERESTART: i32 = 85;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ESTRPIPE: i32 = 86;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EUSERS: i32 = 87;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENOTSOCK: i32 = 88;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EDESTADDRREQ: i32 = 89;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EMSGSIZE: i32 = 90;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EPROTOTYPE: i32 = 91;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENOPROTOOPT: i32 = 92;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EPROTONOSUPPORT: i32 = 93;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ESOCKTNOSUPPORT: i32 = 94;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EOPNOTSUPP: i32 = 95;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EPFNOSUPPORT: i32 = 96;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EAFNOSUPPORT: i32 = 97;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EADDRINUSE: i32 = 98;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EADDRNOTAVAIL: i32 = 99;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENETDOWN: i32 = 100;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENETUNREACH: i32 = 101;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENETRESET: i32 = 102;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ECONNABORTED: i32 = 103;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ECONNRESET: i32 = 104;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENOBUFS: i32 = 105;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EISCONN: i32 = 106;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENOTCONN: i32 = 107;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ESHUTDOWN: i32 = 108;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ETOOMANYREFS: i32 = 109;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ETIMEDOUT: i32 = 110;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ECONNREFUSED: i32 = 111;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EHOSTDOWN: i32 = 112;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EHOSTUNREACH: i32 = 113;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EALREADY: i32 = 114;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EINPROGRESS: i32 = 115;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ESTALE: i32 = 116;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EUCLEAN: i32 = 117;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENOTNAM: i32 = 118;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENAVAIL: i32 = 119;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EISNAM: i32 = 120;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EREMOTEIO: i32 = 121;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EDQUOT: i32 = 122;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENOMEDIUM: i32 = 123;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EMEDIUMTYPE: i32 = 124;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ECANCELED: i32 = 125;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENOKEY: i32 = 126;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EKEYEXPIRED: i32 = 127;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EKEYREVOKED: i32 = 128;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EKEYREJECTED: i32 = 129;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EOWNERDEAD: i32 = 130;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ENOTRECOVERABLE: i32 = 131;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ERFKILL: i32 = 132;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EHWPOISON: i32 = 133;
+diff --git a/library/std/src/os/fullrust/syscall/mod.rs b/library/std/src/os/fullrust/syscall/mod.rs
+new file mode 100644
+index 00000000..bfa66a2a
+--- /dev/null
++++ b/library/std/src/os/fullrust/syscall/mod.rs
+@@ -0,0 +1,159 @@
++//! Raw Linux system calls.
++//!
++//! `fullrust` has no libc, so this is the direct way to reach a kernel
++//! interface std doesn't wrap: the same `syscall`-instruction primitives std's
++//! own platform layer is built on. Each `syscallN` takes the syscall number
++//! (see [`nr`]) and `N` register-sized arguments, and decodes the kernel's
++//! return convention: a value in `-4095..=-1` becomes an [`io::Error`] carrying
++//! that errno (see [`errno`]), anything else is returned as `Ok`.
++//!
++//! Pass pointers as `ptr as usize` and file descriptors / signed values as
++//! `fd as usize` (sign-extended, which is what the kernel expects).
++//!
++//! ```no_run
++//! use std::os::fullrust::syscall::{self, nr};
++//!
++//! let pid = unsafe { syscall::syscall0(nr::GETPID) }.unwrap();
++//! let msg = b"hello\n";
++//! unsafe { syscall::syscall3(nr::WRITE, 1, msg.as_ptr() as usize, msg.len()) }.unwrap();
++//! # let _ = pid;
++//! ```
++//!
++//! Replacing the process image with `execve(2)` directly:
++//!
++//! ```no_run
++//! use std::os::fullrust::syscall::{self, nr};
++//! use std::ptr;
++//!
++//! let path = c"/bin/echo";
++//! let argv = [c"echo".as_ptr(), c"hi".as_ptr(), ptr::null()];
++//! let envp = [c"PATH=/bin".as_ptr(), ptr::null()];
++//! // Only returns on failure.
++//! let err = unsafe {
++//!     syscall::syscall3(
++//!         nr::EXECVE,
++//!         path.as_ptr() as usize,
++//!         argv.as_ptr() as usize,
++//!         envp.as_ptr() as usize,
++//!     )
++//! }
++//! .unwrap_err();
++//! eprintln!("execve failed: {err}");
++//! ```
++//!
++//! For spawning or replacing processes, prefer [`std::process::Command`] with
++//! [`CommandExt`](crate::os::fullrust::process::CommandExt) (`exec`, `pre_exec`,
++//! `uid`, …), which handles `PATH` lookup, the environment and stdio for you.
 +//!
 +//! # Safety
 +//!
-+//! Every function here is `unsafe`: the kernel will read and write whatever
-+//! memory the arguments point at, and some syscalls (`exit`, `clone`,
-+//! `munmap`, `close`, …) can break invariants std relies on (e.g. closing an fd
-+//! still owned by a `File`, or unmapping memory in use). Prefer std APIs, or a
-+//! typed wrapper crate, where one exists.
++//! A syscall can do anything the kernel allows: write through the pointers it
++//! is given, unmap memory, close file descriptors std owns, change signal
++//! dispositions std relies on, or create threads std doesn't know about (raw
++//! `clone`). The caller must uphold whatever that particular syscall requires.
 +
-+#![stable(feature = "fullrust_syscall", since = "1.0.0")]
++#![stable(feature = "fullrust_syscall", since = "1.88.0")]
 +
-+use crate::arch::asm;
 +use crate::io;
++use crate::sys::sysc;
 +
-+/// Issue syscall `nr` with no arguments. Returns the raw kernel result
-+/// (`-errno` on failure).
-+#[stable(feature = "fullrust_syscall", since = "1.0.0")]
++pub mod errno;
++pub mod nr;
++
++/// Decode a raw syscall return (`-errno` in `-4095..=-1` is an error).
 +#[inline]
-+pub unsafe fn syscall0(nr: usize) -> isize {
-+    let r: isize;
-+    unsafe {
-+        asm!("syscall", inlateout("rax") nr as isize => r,
-+             lateout("rcx") _, lateout("r11") _, options(nostack, preserves_flags));
-+    }
-+    r
++fn cvt(ret: usize) -> io::Result<usize> {
++    sysc::ret(ret).map_err(io::Error::from_raw_os_error)
 +}
 +
-+/// Issue syscall `nr` with one argument. Returns the raw kernel result
-+/// (`-errno` on failure).
-+#[stable(feature = "fullrust_syscall", since = "1.0.0")]
++/// Performs system call `nr` with no arguments.
++///
++/// # Safety
++/// See the [module-level safety notes](self#safety).
 +#[inline]
-+pub unsafe fn syscall1(nr: usize, a1: usize) -> isize {
-+    let r: isize;
-+    unsafe {
-+        asm!("syscall", inlateout("rax") nr as isize => r, in("rdi") a1,
-+             lateout("rcx") _, lateout("r11") _, options(nostack, preserves_flags));
-+    }
-+    r
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub unsafe fn syscall0(nr: usize) -> io::Result<usize> {
++    // The pal has no 0-argument form; an unused register argument is harmless.
++    cvt(unsafe { sysc::syscall1(nr, 0) })
 +}
 +
-+/// Issue syscall `nr` with two arguments. Returns the raw kernel result
-+/// (`-errno` on failure).
-+#[stable(feature = "fullrust_syscall", since = "1.0.0")]
++/// Performs system call `nr` with one argument.
++///
++/// # Safety
++/// See the [module-level safety notes](self#safety).
 +#[inline]
-+pub unsafe fn syscall2(nr: usize, a1: usize, a2: usize) -> isize {
-+    let r: isize;
-+    unsafe {
-+        asm!("syscall", inlateout("rax") nr as isize => r, in("rdi") a1, in("rsi") a2,
-+             lateout("rcx") _, lateout("r11") _, options(nostack, preserves_flags));
-+    }
-+    r
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub unsafe fn syscall1(nr: usize, a1: usize) -> io::Result<usize> {
++    cvt(unsafe { sysc::syscall1(nr, a1) })
 +}
 +
-+/// Issue syscall `nr` with three arguments. Returns the raw kernel result
-+/// (`-errno` on failure).
-+#[stable(feature = "fullrust_syscall", since = "1.0.0")]
++/// Performs system call `nr` with two arguments.
++///
++/// # Safety
++/// See the [module-level safety notes](self#safety).
 +#[inline]
-+pub unsafe fn syscall3(nr: usize, a1: usize, a2: usize, a3: usize) -> isize {
-+    let r: isize;
-+    unsafe {
-+        asm!("syscall", inlateout("rax") nr as isize => r, in("rdi") a1, in("rsi") a2,
-+             in("rdx") a3,
-+             lateout("rcx") _, lateout("r11") _, options(nostack, preserves_flags));
-+    }
-+    r
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub unsafe fn syscall2(nr: usize, a1: usize, a2: usize) -> io::Result<usize> {
++    cvt(unsafe { sysc::syscall2(nr, a1, a2) })
 +}
 +
-+/// Issue syscall `nr` with four arguments. Returns the raw kernel result
-+/// (`-errno` on failure).
-+#[stable(feature = "fullrust_syscall", since = "1.0.0")]
++/// Performs system call `nr` with three arguments.
++///
++/// # Safety
++/// See the [module-level safety notes](self#safety).
 +#[inline]
-+pub unsafe fn syscall4(nr: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> isize {
-+    let r: isize;
-+    unsafe {
-+        asm!("syscall", inlateout("rax") nr as isize => r, in("rdi") a1, in("rsi") a2,
-+             in("rdx") a3, in("r10") a4,
-+             lateout("rcx") _, lateout("r11") _, options(nostack, preserves_flags));
-+    }
-+    r
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub unsafe fn syscall3(nr: usize, a1: usize, a2: usize, a3: usize) -> io::Result<usize> {
++    cvt(unsafe { sysc::syscall3(nr, a1, a2, a3) })
 +}
 +
-+/// Issue syscall `nr` with five arguments. Returns the raw kernel result
-+/// (`-errno` on failure).
-+#[stable(feature = "fullrust_syscall", since = "1.0.0")]
++/// Performs system call `nr` with four arguments.
++///
++/// # Safety
++/// See the [module-level safety notes](self#safety).
 +#[inline]
-+pub unsafe fn syscall5(nr: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> isize {
-+    let r: isize;
-+    unsafe {
-+        asm!("syscall", inlateout("rax") nr as isize => r, in("rdi") a1, in("rsi") a2,
-+             in("rdx") a3, in("r10") a4, in("r8") a5,
-+             lateout("rcx") _, lateout("r11") _, options(nostack, preserves_flags));
-+    }
-+    r
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub unsafe fn syscall4(
++    nr: usize,
++    a1: usize,
++    a2: usize,
++    a3: usize,
++    a4: usize,
++) -> io::Result<usize> {
++    cvt(unsafe { sysc::syscall4(nr, a1, a2, a3, a4) })
 +}
 +
-+/// Issue syscall `nr` with six arguments. Returns the raw kernel result
-+/// (`-errno` on failure).
-+#[stable(feature = "fullrust_syscall", since = "1.0.0")]
++/// Performs system call `nr` with five arguments.
++///
++/// # Safety
++/// See the [module-level safety notes](self#safety).
 +#[inline]
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub unsafe fn syscall5(
++    nr: usize,
++    a1: usize,
++    a2: usize,
++    a3: usize,
++    a4: usize,
++    a5: usize,
++) -> io::Result<usize> {
++    cvt(unsafe { sysc::syscall5(nr, a1, a2, a3, a4, a5) })
++}
++
++/// Performs system call `nr` with six arguments.
++///
++/// # Safety
++/// See the [module-level safety notes](self#safety).
++#[inline]
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
 +pub unsafe fn syscall6(
 +    nr: usize,
 +    a1: usize,
@@ -571,803 +918,791 @@ index 00000000..2f05b439
 +    a4: usize,
 +    a5: usize,
 +    a6: usize,
-+) -> isize {
-+    let r: isize;
-+    unsafe {
-+        asm!("syscall", inlateout("rax") nr as isize => r, in("rdi") a1, in("rsi") a2,
-+             in("rdx") a3, in("r10") a4, in("r8") a5, in("r9") a6,
-+             lateout("rcx") _, lateout("r11") _, options(nostack, preserves_flags));
-+    }
-+    r
++) -> io::Result<usize> {
++    cvt(unsafe { sysc::syscall6(nr, a1, a2, a3, a4, a5, a6) })
 +}
+diff --git a/library/std/src/os/fullrust/syscall/nr.rs b/library/std/src/os/fullrust/syscall/nr.rs
+new file mode 100644
+index 00000000..4386c40d
+--- /dev/null
++++ b/library/std/src/os/fullrust/syscall/nr.rs
+@@ -0,0 +1,776 @@
++//! x86-64 Linux syscall numbers, for use with the [`syscall0`]…[`syscall6`]
++//! functions. Names are the kernel's `__NR_*` names, upper-cased
++//! (`__NR_execve` → [`EXECVE`]).
++//!
++//! These are the stable kernel ABI numbers from the Linux UAPI headers; a
++//! syscall newer than the running kernel fails with `ENOSYS`.
++//!
++//! [`syscall0`]: super::syscall0
++//! [`syscall6`]: super::syscall6
 +
-+/// Convert a raw syscall return into an [`io::Result`]: values in
-+/// `-4095..=-1` become `Err(io::Error::from_raw_os_error(errno))`, anything
-+/// else is `Ok(ret as usize)` (so large pointer results such as an `mmap`
-+/// address pass through intact).
-+#[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+#[inline]
-+pub fn syscall_result(ret: isize) -> io::Result<usize> {
-+    if (-4095..0).contains(&ret) {
-+        Err(io::Error::from_raw_os_error(-ret as i32))
-+    } else {
-+        Ok(ret as usize)
-+    }
-+}
++#![stable(feature = "fullrust_syscall", since = "1.88.0")]
 +
-+/// x86-64 Linux system call numbers (`SYS_<name>`, as in `libc::SYS_<name>`),
-+/// generated from the Linux 6.x `arch/x86/entry/syscalls/syscall_64.tbl`
-+/// (`common` + `64` ABI entries; the x32 entries are omitted).
-+#[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+#[allow(non_upper_case_globals)]
-+pub mod nr {
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_read: usize = 0;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_write: usize = 1;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_open: usize = 2;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_close: usize = 3;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_stat: usize = 4;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_fstat: usize = 5;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_lstat: usize = 6;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_poll: usize = 7;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_lseek: usize = 8;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_mmap: usize = 9;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_mprotect: usize = 10;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_munmap: usize = 11;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_brk: usize = 12;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_rt_sigaction: usize = 13;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_rt_sigprocmask: usize = 14;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_rt_sigreturn: usize = 15;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_ioctl: usize = 16;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_pread64: usize = 17;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_pwrite64: usize = 18;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_readv: usize = 19;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_writev: usize = 20;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_access: usize = 21;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_pipe: usize = 22;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_select: usize = 23;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_sched_yield: usize = 24;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_mremap: usize = 25;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_msync: usize = 26;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_mincore: usize = 27;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_madvise: usize = 28;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_shmget: usize = 29;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_shmat: usize = 30;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_shmctl: usize = 31;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_dup: usize = 32;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_dup2: usize = 33;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_pause: usize = 34;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_nanosleep: usize = 35;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_getitimer: usize = 36;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_alarm: usize = 37;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_setitimer: usize = 38;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_getpid: usize = 39;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_sendfile: usize = 40;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_socket: usize = 41;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_connect: usize = 42;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_accept: usize = 43;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_sendto: usize = 44;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_recvfrom: usize = 45;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_sendmsg: usize = 46;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_recvmsg: usize = 47;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_shutdown: usize = 48;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_bind: usize = 49;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_listen: usize = 50;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_getsockname: usize = 51;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_getpeername: usize = 52;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_socketpair: usize = 53;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_setsockopt: usize = 54;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_getsockopt: usize = 55;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_clone: usize = 56;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_fork: usize = 57;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_vfork: usize = 58;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_execve: usize = 59;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_exit: usize = 60;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_wait4: usize = 61;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_kill: usize = 62;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_uname: usize = 63;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_semget: usize = 64;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_semop: usize = 65;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_semctl: usize = 66;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_shmdt: usize = 67;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_msgget: usize = 68;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_msgsnd: usize = 69;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_msgrcv: usize = 70;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_msgctl: usize = 71;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_fcntl: usize = 72;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_flock: usize = 73;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_fsync: usize = 74;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_fdatasync: usize = 75;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_truncate: usize = 76;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_ftruncate: usize = 77;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_getdents: usize = 78;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_getcwd: usize = 79;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_chdir: usize = 80;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_fchdir: usize = 81;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_rename: usize = 82;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_mkdir: usize = 83;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_rmdir: usize = 84;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_creat: usize = 85;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_link: usize = 86;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_unlink: usize = 87;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_symlink: usize = 88;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_readlink: usize = 89;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_chmod: usize = 90;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_fchmod: usize = 91;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_chown: usize = 92;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_fchown: usize = 93;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_lchown: usize = 94;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_umask: usize = 95;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_gettimeofday: usize = 96;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_getrlimit: usize = 97;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_getrusage: usize = 98;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_sysinfo: usize = 99;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_times: usize = 100;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_ptrace: usize = 101;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_getuid: usize = 102;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_syslog: usize = 103;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_getgid: usize = 104;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_setuid: usize = 105;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_setgid: usize = 106;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_geteuid: usize = 107;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_getegid: usize = 108;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_setpgid: usize = 109;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_getppid: usize = 110;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_getpgrp: usize = 111;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_setsid: usize = 112;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_setreuid: usize = 113;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_setregid: usize = 114;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_getgroups: usize = 115;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_setgroups: usize = 116;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_setresuid: usize = 117;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_getresuid: usize = 118;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_setresgid: usize = 119;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_getresgid: usize = 120;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_getpgid: usize = 121;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_setfsuid: usize = 122;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_setfsgid: usize = 123;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_getsid: usize = 124;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_capget: usize = 125;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_capset: usize = 126;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_rt_sigpending: usize = 127;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_rt_sigtimedwait: usize = 128;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_rt_sigqueueinfo: usize = 129;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_rt_sigsuspend: usize = 130;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_sigaltstack: usize = 131;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_utime: usize = 132;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_mknod: usize = 133;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_uselib: usize = 134;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_personality: usize = 135;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_ustat: usize = 136;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_statfs: usize = 137;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_fstatfs: usize = 138;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_sysfs: usize = 139;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_getpriority: usize = 140;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_setpriority: usize = 141;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_sched_setparam: usize = 142;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_sched_getparam: usize = 143;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_sched_setscheduler: usize = 144;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_sched_getscheduler: usize = 145;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_sched_get_priority_max: usize = 146;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_sched_get_priority_min: usize = 147;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_sched_rr_get_interval: usize = 148;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_mlock: usize = 149;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_munlock: usize = 150;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_mlockall: usize = 151;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_munlockall: usize = 152;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_vhangup: usize = 153;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_modify_ldt: usize = 154;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_pivot_root: usize = 155;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS__sysctl: usize = 156;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_prctl: usize = 157;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_arch_prctl: usize = 158;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_adjtimex: usize = 159;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_setrlimit: usize = 160;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_chroot: usize = 161;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_sync: usize = 162;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_acct: usize = 163;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_settimeofday: usize = 164;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_mount: usize = 165;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_umount2: usize = 166;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_swapon: usize = 167;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_swapoff: usize = 168;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_reboot: usize = 169;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_sethostname: usize = 170;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_setdomainname: usize = 171;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_iopl: usize = 172;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_ioperm: usize = 173;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_create_module: usize = 174;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_init_module: usize = 175;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_delete_module: usize = 176;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_get_kernel_syms: usize = 177;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_query_module: usize = 178;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_quotactl: usize = 179;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_nfsservctl: usize = 180;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_getpmsg: usize = 181;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_putpmsg: usize = 182;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_afs_syscall: usize = 183;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_tuxcall: usize = 184;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_security: usize = 185;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_gettid: usize = 186;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_readahead: usize = 187;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_setxattr: usize = 188;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_lsetxattr: usize = 189;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_fsetxattr: usize = 190;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_getxattr: usize = 191;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_lgetxattr: usize = 192;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_fgetxattr: usize = 193;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_listxattr: usize = 194;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_llistxattr: usize = 195;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_flistxattr: usize = 196;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_removexattr: usize = 197;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_lremovexattr: usize = 198;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_fremovexattr: usize = 199;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_tkill: usize = 200;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_time: usize = 201;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_futex: usize = 202;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_sched_setaffinity: usize = 203;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_sched_getaffinity: usize = 204;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_set_thread_area: usize = 205;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_io_setup: usize = 206;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_io_destroy: usize = 207;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_io_getevents: usize = 208;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_io_submit: usize = 209;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_io_cancel: usize = 210;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_get_thread_area: usize = 211;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_lookup_dcookie: usize = 212;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_epoll_create: usize = 213;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_epoll_ctl_old: usize = 214;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_epoll_wait_old: usize = 215;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_remap_file_pages: usize = 216;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_getdents64: usize = 217;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_set_tid_address: usize = 218;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_restart_syscall: usize = 219;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_semtimedop: usize = 220;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_fadvise64: usize = 221;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_timer_create: usize = 222;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_timer_settime: usize = 223;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_timer_gettime: usize = 224;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_timer_getoverrun: usize = 225;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_timer_delete: usize = 226;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_clock_settime: usize = 227;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_clock_gettime: usize = 228;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_clock_getres: usize = 229;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_clock_nanosleep: usize = 230;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_exit_group: usize = 231;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_epoll_wait: usize = 232;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_epoll_ctl: usize = 233;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_tgkill: usize = 234;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_utimes: usize = 235;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_vserver: usize = 236;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_mbind: usize = 237;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_set_mempolicy: usize = 238;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_get_mempolicy: usize = 239;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_mq_open: usize = 240;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_mq_unlink: usize = 241;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_mq_timedsend: usize = 242;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_mq_timedreceive: usize = 243;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_mq_notify: usize = 244;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_mq_getsetattr: usize = 245;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_kexec_load: usize = 246;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_waitid: usize = 247;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_add_key: usize = 248;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_request_key: usize = 249;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_keyctl: usize = 250;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_ioprio_set: usize = 251;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_ioprio_get: usize = 252;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_inotify_init: usize = 253;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_inotify_add_watch: usize = 254;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_inotify_rm_watch: usize = 255;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_migrate_pages: usize = 256;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_openat: usize = 257;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_mkdirat: usize = 258;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_mknodat: usize = 259;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_fchownat: usize = 260;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_futimesat: usize = 261;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_newfstatat: usize = 262;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_unlinkat: usize = 263;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_renameat: usize = 264;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_linkat: usize = 265;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_symlinkat: usize = 266;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_readlinkat: usize = 267;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_fchmodat: usize = 268;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_faccessat: usize = 269;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_pselect6: usize = 270;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_ppoll: usize = 271;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_unshare: usize = 272;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_set_robust_list: usize = 273;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_get_robust_list: usize = 274;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_splice: usize = 275;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_tee: usize = 276;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_sync_file_range: usize = 277;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_vmsplice: usize = 278;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_move_pages: usize = 279;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_utimensat: usize = 280;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_epoll_pwait: usize = 281;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_signalfd: usize = 282;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_timerfd_create: usize = 283;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_eventfd: usize = 284;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_fallocate: usize = 285;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_timerfd_settime: usize = 286;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_timerfd_gettime: usize = 287;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_accept4: usize = 288;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_signalfd4: usize = 289;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_eventfd2: usize = 290;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_epoll_create1: usize = 291;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_dup3: usize = 292;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_pipe2: usize = 293;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_inotify_init1: usize = 294;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_preadv: usize = 295;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_pwritev: usize = 296;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_rt_tgsigqueueinfo: usize = 297;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_perf_event_open: usize = 298;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_recvmmsg: usize = 299;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_fanotify_init: usize = 300;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_fanotify_mark: usize = 301;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_prlimit64: usize = 302;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_name_to_handle_at: usize = 303;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_open_by_handle_at: usize = 304;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_clock_adjtime: usize = 305;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_syncfs: usize = 306;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_sendmmsg: usize = 307;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_setns: usize = 308;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_getcpu: usize = 309;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_process_vm_readv: usize = 310;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_process_vm_writev: usize = 311;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_kcmp: usize = 312;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_finit_module: usize = 313;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_sched_setattr: usize = 314;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_sched_getattr: usize = 315;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_renameat2: usize = 316;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_seccomp: usize = 317;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_getrandom: usize = 318;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_memfd_create: usize = 319;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_kexec_file_load: usize = 320;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_bpf: usize = 321;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_execveat: usize = 322;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_userfaultfd: usize = 323;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_membarrier: usize = 324;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_mlock2: usize = 325;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_copy_file_range: usize = 326;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_preadv2: usize = 327;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_pwritev2: usize = 328;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_pkey_mprotect: usize = 329;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_pkey_alloc: usize = 330;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_pkey_free: usize = 331;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_statx: usize = 332;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_io_pgetevents: usize = 333;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_rseq: usize = 334;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_uretprobe: usize = 335;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_uprobe: usize = 336;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_pidfd_send_signal: usize = 424;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_io_uring_setup: usize = 425;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_io_uring_enter: usize = 426;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_io_uring_register: usize = 427;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_open_tree: usize = 428;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_move_mount: usize = 429;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_fsopen: usize = 430;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_fsconfig: usize = 431;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_fsmount: usize = 432;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_fspick: usize = 433;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_pidfd_open: usize = 434;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_clone3: usize = 435;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_close_range: usize = 436;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_openat2: usize = 437;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_pidfd_getfd: usize = 438;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_faccessat2: usize = 439;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_process_madvise: usize = 440;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_epoll_pwait2: usize = 441;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_mount_setattr: usize = 442;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_quotactl_fd: usize = 443;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_landlock_create_ruleset: usize = 444;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_landlock_add_rule: usize = 445;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_landlock_restrict_self: usize = 446;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_memfd_secret: usize = 447;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_process_mrelease: usize = 448;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_futex_waitv: usize = 449;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_set_mempolicy_home_node: usize = 450;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_cachestat: usize = 451;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_fchmodat2: usize = 452;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_map_shadow_stack: usize = 453;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_futex_wake: usize = 454;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_futex_wait: usize = 455;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_futex_requeue: usize = 456;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_statmount: usize = 457;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_listmount: usize = 458;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_lsm_get_self_attr: usize = 459;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_lsm_set_self_attr: usize = 460;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_lsm_list_modules: usize = 461;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_mseal: usize = 462;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_setxattrat: usize = 463;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_getxattrat: usize = 464;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_listxattrat: usize = 465;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_removexattrat: usize = 466;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_open_tree_attr: usize = 467;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_file_getattr: usize = 468;
-+    #[stable(feature = "fullrust_syscall", since = "1.0.0")]
-+    pub const SYS_file_setattr: usize = 469;
-+}
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const READ: usize = 0;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const WRITE: usize = 1;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const OPEN: usize = 2;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const CLOSE: usize = 3;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const STAT: usize = 4;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FSTAT: usize = 5;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const LSTAT: usize = 6;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const POLL: usize = 7;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const LSEEK: usize = 8;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MMAP: usize = 9;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MPROTECT: usize = 10;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MUNMAP: usize = 11;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const BRK: usize = 12;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const RT_SIGACTION: usize = 13;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const RT_SIGPROCMASK: usize = 14;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const RT_SIGRETURN: usize = 15;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const IOCTL: usize = 16;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const PREAD64: usize = 17;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const PWRITE64: usize = 18;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const READV: usize = 19;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const WRITEV: usize = 20;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ACCESS: usize = 21;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const PIPE: usize = 22;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SELECT: usize = 23;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SCHED_YIELD: usize = 24;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MREMAP: usize = 25;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MSYNC: usize = 26;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MINCORE: usize = 27;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MADVISE: usize = 28;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SHMGET: usize = 29;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SHMAT: usize = 30;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SHMCTL: usize = 31;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const DUP: usize = 32;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const DUP2: usize = 33;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const PAUSE: usize = 34;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const NANOSLEEP: usize = 35;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GETITIMER: usize = 36;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ALARM: usize = 37;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SETITIMER: usize = 38;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GETPID: usize = 39;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SENDFILE: usize = 40;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SOCKET: usize = 41;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const CONNECT: usize = 42;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ACCEPT: usize = 43;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SENDTO: usize = 44;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const RECVFROM: usize = 45;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SENDMSG: usize = 46;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const RECVMSG: usize = 47;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SHUTDOWN: usize = 48;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const BIND: usize = 49;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const LISTEN: usize = 50;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GETSOCKNAME: usize = 51;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GETPEERNAME: usize = 52;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SOCKETPAIR: usize = 53;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SETSOCKOPT: usize = 54;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GETSOCKOPT: usize = 55;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const CLONE: usize = 56;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FORK: usize = 57;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const VFORK: usize = 58;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EXECVE: usize = 59;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EXIT: usize = 60;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const WAIT4: usize = 61;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const KILL: usize = 62;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const UNAME: usize = 63;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SEMGET: usize = 64;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SEMOP: usize = 65;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SEMCTL: usize = 66;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SHMDT: usize = 67;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MSGGET: usize = 68;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MSGSND: usize = 69;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MSGRCV: usize = 70;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MSGCTL: usize = 71;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FCNTL: usize = 72;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FLOCK: usize = 73;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FSYNC: usize = 74;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FDATASYNC: usize = 75;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const TRUNCATE: usize = 76;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FTRUNCATE: usize = 77;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GETDENTS: usize = 78;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GETCWD: usize = 79;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const CHDIR: usize = 80;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FCHDIR: usize = 81;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const RENAME: usize = 82;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MKDIR: usize = 83;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const RMDIR: usize = 84;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const CREAT: usize = 85;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const LINK: usize = 86;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const UNLINK: usize = 87;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SYMLINK: usize = 88;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const READLINK: usize = 89;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const CHMOD: usize = 90;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FCHMOD: usize = 91;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const CHOWN: usize = 92;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FCHOWN: usize = 93;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const LCHOWN: usize = 94;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const UMASK: usize = 95;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GETTIMEOFDAY: usize = 96;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GETRLIMIT: usize = 97;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GETRUSAGE: usize = 98;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SYSINFO: usize = 99;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const TIMES: usize = 100;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const PTRACE: usize = 101;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GETUID: usize = 102;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SYSLOG: usize = 103;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GETGID: usize = 104;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SETUID: usize = 105;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SETGID: usize = 106;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GETEUID: usize = 107;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GETEGID: usize = 108;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SETPGID: usize = 109;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GETPPID: usize = 110;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GETPGRP: usize = 111;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SETSID: usize = 112;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SETREUID: usize = 113;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SETREGID: usize = 114;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GETGROUPS: usize = 115;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SETGROUPS: usize = 116;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SETRESUID: usize = 117;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GETRESUID: usize = 118;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SETRESGID: usize = 119;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GETRESGID: usize = 120;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GETPGID: usize = 121;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SETFSUID: usize = 122;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SETFSGID: usize = 123;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GETSID: usize = 124;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const CAPGET: usize = 125;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const CAPSET: usize = 126;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const RT_SIGPENDING: usize = 127;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const RT_SIGTIMEDWAIT: usize = 128;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const RT_SIGQUEUEINFO: usize = 129;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const RT_SIGSUSPEND: usize = 130;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SIGALTSTACK: usize = 131;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const UTIME: usize = 132;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MKNOD: usize = 133;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const USELIB: usize = 134;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const PERSONALITY: usize = 135;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const USTAT: usize = 136;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const STATFS: usize = 137;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FSTATFS: usize = 138;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SYSFS: usize = 139;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GETPRIORITY: usize = 140;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SETPRIORITY: usize = 141;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SCHED_SETPARAM: usize = 142;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SCHED_GETPARAM: usize = 143;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SCHED_SETSCHEDULER: usize = 144;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SCHED_GETSCHEDULER: usize = 145;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SCHED_GET_PRIORITY_MAX: usize = 146;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SCHED_GET_PRIORITY_MIN: usize = 147;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SCHED_RR_GET_INTERVAL: usize = 148;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MLOCK: usize = 149;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MUNLOCK: usize = 150;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MLOCKALL: usize = 151;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MUNLOCKALL: usize = 152;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const VHANGUP: usize = 153;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MODIFY_LDT: usize = 154;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const PIVOT_ROOT: usize = 155;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const _SYSCTL: usize = 156;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const PRCTL: usize = 157;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ARCH_PRCTL: usize = 158;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ADJTIMEX: usize = 159;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SETRLIMIT: usize = 160;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const CHROOT: usize = 161;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SYNC: usize = 162;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ACCT: usize = 163;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SETTIMEOFDAY: usize = 164;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MOUNT: usize = 165;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const UMOUNT2: usize = 166;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SWAPON: usize = 167;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SWAPOFF: usize = 168;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const REBOOT: usize = 169;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SETHOSTNAME: usize = 170;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SETDOMAINNAME: usize = 171;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const IOPL: usize = 172;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const IOPERM: usize = 173;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const CREATE_MODULE: usize = 174;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const INIT_MODULE: usize = 175;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const DELETE_MODULE: usize = 176;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GET_KERNEL_SYMS: usize = 177;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const QUERY_MODULE: usize = 178;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const QUOTACTL: usize = 179;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const NFSSERVCTL: usize = 180;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GETPMSG: usize = 181;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const PUTPMSG: usize = 182;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const AFS_SYSCALL: usize = 183;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const TUXCALL: usize = 184;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SECURITY: usize = 185;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GETTID: usize = 186;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const READAHEAD: usize = 187;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SETXATTR: usize = 188;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const LSETXATTR: usize = 189;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FSETXATTR: usize = 190;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GETXATTR: usize = 191;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const LGETXATTR: usize = 192;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FGETXATTR: usize = 193;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const LISTXATTR: usize = 194;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const LLISTXATTR: usize = 195;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FLISTXATTR: usize = 196;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const REMOVEXATTR: usize = 197;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const LREMOVEXATTR: usize = 198;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FREMOVEXATTR: usize = 199;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const TKILL: usize = 200;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const TIME: usize = 201;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FUTEX: usize = 202;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SCHED_SETAFFINITY: usize = 203;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SCHED_GETAFFINITY: usize = 204;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SET_THREAD_AREA: usize = 205;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const IO_SETUP: usize = 206;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const IO_DESTROY: usize = 207;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const IO_GETEVENTS: usize = 208;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const IO_SUBMIT: usize = 209;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const IO_CANCEL: usize = 210;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GET_THREAD_AREA: usize = 211;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const LOOKUP_DCOOKIE: usize = 212;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EPOLL_CREATE: usize = 213;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EPOLL_CTL_OLD: usize = 214;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EPOLL_WAIT_OLD: usize = 215;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const REMAP_FILE_PAGES: usize = 216;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GETDENTS64: usize = 217;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SET_TID_ADDRESS: usize = 218;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const RESTART_SYSCALL: usize = 219;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SEMTIMEDOP: usize = 220;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FADVISE64: usize = 221;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const TIMER_CREATE: usize = 222;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const TIMER_SETTIME: usize = 223;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const TIMER_GETTIME: usize = 224;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const TIMER_GETOVERRUN: usize = 225;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const TIMER_DELETE: usize = 226;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const CLOCK_SETTIME: usize = 227;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const CLOCK_GETTIME: usize = 228;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const CLOCK_GETRES: usize = 229;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const CLOCK_NANOSLEEP: usize = 230;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EXIT_GROUP: usize = 231;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EPOLL_WAIT: usize = 232;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EPOLL_CTL: usize = 233;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const TGKILL: usize = 234;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const UTIMES: usize = 235;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const VSERVER: usize = 236;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MBIND: usize = 237;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SET_MEMPOLICY: usize = 238;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GET_MEMPOLICY: usize = 239;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MQ_OPEN: usize = 240;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MQ_UNLINK: usize = 241;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MQ_TIMEDSEND: usize = 242;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MQ_TIMEDRECEIVE: usize = 243;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MQ_NOTIFY: usize = 244;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MQ_GETSETATTR: usize = 245;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const KEXEC_LOAD: usize = 246;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const WAITID: usize = 247;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ADD_KEY: usize = 248;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const REQUEST_KEY: usize = 249;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const KEYCTL: usize = 250;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const IOPRIO_SET: usize = 251;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const IOPRIO_GET: usize = 252;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const INOTIFY_INIT: usize = 253;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const INOTIFY_ADD_WATCH: usize = 254;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const INOTIFY_RM_WATCH: usize = 255;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MIGRATE_PAGES: usize = 256;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const OPENAT: usize = 257;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MKDIRAT: usize = 258;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MKNODAT: usize = 259;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FCHOWNAT: usize = 260;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FUTIMESAT: usize = 261;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const NEWFSTATAT: usize = 262;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const UNLINKAT: usize = 263;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const RENAMEAT: usize = 264;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const LINKAT: usize = 265;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SYMLINKAT: usize = 266;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const READLINKAT: usize = 267;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FCHMODAT: usize = 268;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FACCESSAT: usize = 269;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const PSELECT6: usize = 270;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const PPOLL: usize = 271;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const UNSHARE: usize = 272;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SET_ROBUST_LIST: usize = 273;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GET_ROBUST_LIST: usize = 274;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SPLICE: usize = 275;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const TEE: usize = 276;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SYNC_FILE_RANGE: usize = 277;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const VMSPLICE: usize = 278;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MOVE_PAGES: usize = 279;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const UTIMENSAT: usize = 280;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EPOLL_PWAIT: usize = 281;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SIGNALFD: usize = 282;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const TIMERFD_CREATE: usize = 283;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EVENTFD: usize = 284;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FALLOCATE: usize = 285;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const TIMERFD_SETTIME: usize = 286;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const TIMERFD_GETTIME: usize = 287;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const ACCEPT4: usize = 288;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SIGNALFD4: usize = 289;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EVENTFD2: usize = 290;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EPOLL_CREATE1: usize = 291;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const DUP3: usize = 292;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const PIPE2: usize = 293;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const INOTIFY_INIT1: usize = 294;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const PREADV: usize = 295;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const PWRITEV: usize = 296;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const RT_TGSIGQUEUEINFO: usize = 297;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const PERF_EVENT_OPEN: usize = 298;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const RECVMMSG: usize = 299;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FANOTIFY_INIT: usize = 300;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FANOTIFY_MARK: usize = 301;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const PRLIMIT64: usize = 302;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const NAME_TO_HANDLE_AT: usize = 303;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const OPEN_BY_HANDLE_AT: usize = 304;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const CLOCK_ADJTIME: usize = 305;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SYNCFS: usize = 306;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SENDMMSG: usize = 307;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SETNS: usize = 308;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GETCPU: usize = 309;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const PROCESS_VM_READV: usize = 310;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const PROCESS_VM_WRITEV: usize = 311;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const KCMP: usize = 312;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FINIT_MODULE: usize = 313;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SCHED_SETATTR: usize = 314;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SCHED_GETATTR: usize = 315;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const RENAMEAT2: usize = 316;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SECCOMP: usize = 317;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GETRANDOM: usize = 318;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MEMFD_CREATE: usize = 319;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const KEXEC_FILE_LOAD: usize = 320;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const BPF: usize = 321;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EXECVEAT: usize = 322;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const USERFAULTFD: usize = 323;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MEMBARRIER: usize = 324;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MLOCK2: usize = 325;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const COPY_FILE_RANGE: usize = 326;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const PREADV2: usize = 327;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const PWRITEV2: usize = 328;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const PKEY_MPROTECT: usize = 329;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const PKEY_ALLOC: usize = 330;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const PKEY_FREE: usize = 331;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const STATX: usize = 332;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const IO_PGETEVENTS: usize = 333;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const RSEQ: usize = 334;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const URETPROBE: usize = 335;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const PIDFD_SEND_SIGNAL: usize = 424;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const IO_URING_SETUP: usize = 425;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const IO_URING_ENTER: usize = 426;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const IO_URING_REGISTER: usize = 427;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const OPEN_TREE: usize = 428;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MOVE_MOUNT: usize = 429;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FSOPEN: usize = 430;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FSCONFIG: usize = 431;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FSMOUNT: usize = 432;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FSPICK: usize = 433;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const PIDFD_OPEN: usize = 434;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const CLONE3: usize = 435;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const CLOSE_RANGE: usize = 436;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const OPENAT2: usize = 437;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const PIDFD_GETFD: usize = 438;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FACCESSAT2: usize = 439;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const PROCESS_MADVISE: usize = 440;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const EPOLL_PWAIT2: usize = 441;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MOUNT_SETATTR: usize = 442;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const QUOTACTL_FD: usize = 443;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const LANDLOCK_CREATE_RULESET: usize = 444;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const LANDLOCK_ADD_RULE: usize = 445;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const LANDLOCK_RESTRICT_SELF: usize = 446;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MEMFD_SECRET: usize = 447;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const PROCESS_MRELEASE: usize = 448;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FUTEX_WAITV: usize = 449;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SET_MEMPOLICY_HOME_NODE: usize = 450;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const CACHESTAT: usize = 451;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FCHMODAT2: usize = 452;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MAP_SHADOW_STACK: usize = 453;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FUTEX_WAKE: usize = 454;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FUTEX_WAIT: usize = 455;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FUTEX_REQUEUE: usize = 456;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const STATMOUNT: usize = 457;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const LISTMOUNT: usize = 458;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const LSM_GET_SELF_ATTR: usize = 459;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const LSM_SET_SELF_ATTR: usize = 460;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const LSM_LIST_MODULES: usize = 461;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const MSEAL: usize = 462;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const SETXATTRAT: usize = 463;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const GETXATTRAT: usize = 464;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const LISTXATTRAT: usize = 465;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const REMOVEXATTRAT: usize = 466;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const OPEN_TREE_ATTR: usize = 467;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FILE_GETATTR: usize = 468;
++#[stable(feature = "fullrust_syscall", since = "1.88.0")]
++pub const FILE_SETATTR: usize = 469;
 diff --git a/library/std/src/os/linux/fs.rs b/library/std/src/os/linux/fs.rs
 index e52a63bc..4ae92c71 100644
 --- a/library/std/src/os/linux/fs.rs
