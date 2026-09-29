@@ -311,8 +311,42 @@ third-party code runs on the target as static, libc-free ELFs:
 
 The recurring friction is that `cfg(unix)` is `false` on this target, so a crate's
 unix-gated (but otherwise portable) code is invisible unless it also has a
-`not(any(unix, windows))` / `target_os = "fullrust"` path — cf. `std::os::fd` /
-`std::os::unix`, still the main ecosystem gap.
+`target_os = "fullrust"` path. To make that path a pure cfg broadening,
+std provides the Unix/Linux extension API on fullrust:
+
+**`std::os::unix` and `std::os::linux` (Linux-identical APIs).** std's own
+`os/unix`, `os/linux` and `os/net/linux_ext` sources are compiled for fullrust
+unchanged except for their module gates (every `target_os = "linux"` gate there
+becomes `any(target_os = "linux", target_os = "fullrust")`, so fullrust takes
+the Linux branches) — `cfg(unix)` stays false. The `libc::` names that code uses
+come from a std-internal shim, `sys::pal::fullrust::libc` (Linux x86-64 types,
+constants, and raw-syscall functions with the C `-1`+`errno` convention; errno is
+a real `#[thread_local]`), and the `sys` hooks it calls are implemented in the
+fullrust pal:
+
+- `unix::fs`: `PermissionsExt`, `MetadataExt` (FileAttr now carries a Linux
+  `struct stat` synthesized from `statx`, so `linux::fs::MetadataExt::as_raw_stat`
+  works too), `OpenOptionsExt` (`mode`, `custom_flags`), `FileExt`
+  (`pread64`/`pwrite64`/`preadv`/`pwritev`), `FileTypeExt`, `DirEntryExt(2)`,
+  `DirBuilderExt`, `symlink`, `chown`/`fchown`/`lchown`, `chroot`, `mkfifo`.
+- `unix::process`: `CommandExt` (`uid`, `gid`, `groups`, `pre_exec`, `exec`,
+  `arg0`, `process_group`, `chroot`, `setsid`), `ExitStatusExt`, `ChildExt`,
+  fd conversions for `Stdio`/`Child*`, `parent_id`. Spawning now mirrors the unix
+  pal exactly, including the CLOEXEC error pipe (a missing program is
+  `Err(NotFound)`, a failing `pre_exec` closure's error is returned by `spawn`).
+- `unix::net`: `UnixStream`, `UnixListener`, `UnixDatagram`, `SocketAddr`
+  (pathname + abstract), `UCred`/`peer_cred`, `SocketAncillary` (`SCM_RIGHTS`,
+  `SCM_CREDENTIALS`).
+- `unix::{io, ffi, thread, raw, prelude}` (`JoinHandleExt::as_pthread_t` returns
+  the kernel tid — there is no libpthread).
+- `linux::{fs, net (SocketAddrExt, UnixSocketExt, TcpStreamExt), process
+  (PidFd via pidfd_open/waitid/pidfd_send_signal, create_pidfd), raw}`.
+
+**`std::os::fullrust::syscall`** is the escape hatch for everything else:
+`unsafe fn syscall0..syscall6(nr, args…) -> isize` (raw kernel return, `-errno`
+on failure), `syscall_result(isize) -> io::Result<usize>`, and `nr::SYS_*`, the
+complete x86-64 syscall table (Linux 6.x `syscall_64.tbl`). Covered by
+`test-osunix` (which also builds on `x86_64-unknown-linux-gnu` for parity).
 
 ## Version matrix
 
