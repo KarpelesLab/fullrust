@@ -14,10 +14,8 @@ use std::mem::MaybeUninit;
 #[cfg(not(target_os = "nto"))]
 use std::net::Ipv6Addr;
 use std::net::{self, Ipv4Addr, Shutdown};
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fullrust"))]
 use std::os::unix::io::{FromRawFd, IntoRawFd};
-#[cfg(target_os = "fullrust")]
-use std::os::fd::{FromRawFd, IntoRawFd};
 #[cfg(windows)]
 use std::os::windows::io::{FromRawSocket, IntoRawSocket};
 use std::time::Duration;

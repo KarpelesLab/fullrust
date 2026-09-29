@@ -46,13 +46,9 @@ use std::num::NonZeroU32;
 ))]
 use std::num::NonZeroUsize;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
-#[cfg(all(not(target_os = "wasi"), not(target_os = "fullrust")))]
+#[cfg(not(target_os = "wasi"))]
 use std::os::unix::ffi::OsStrExt;
-// fullrust: not `unix`, but std exposes the same OsStr byte view here.
-#[cfg(target_os = "fullrust")]
-use std::os::fullrust::ffi::OsStrExt;
-// fullrust std has no `std::os::unix::net` types to convert to/from.
-#[cfg(all(feature = "all", unix))]
+#[cfg(all(feature = "all", any(unix, target_os = "fullrust")))]
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 #[cfg(not(target_os = "wasi"))]
 use std::path::Path;
@@ -924,7 +920,6 @@ impl SockAddr {
 
     /// Returns this address as Unix `SocketAddr` if it is an `AF_UNIX` pathname
     /// address, otherwise returns `None`.
-    #[cfg(unix)] // fullrust std has no `std::os::unix::net::SocketAddr`.
     pub fn as_unix(&self) -> Option<std::os::unix::net::SocketAddr> {
         let path = self.as_pathname()?;
         // SAFETY: we can represent this as a valid pathname, then so can the
@@ -3086,17 +3081,17 @@ impl FromRawFd for crate::Socket {
     }
 }
 
-#[cfg(all(feature = "all", unix))]
+#[cfg(all(feature = "all", any(unix, target_os = "fullrust")))]
 from!(UnixStream, crate::Socket);
-#[cfg(all(feature = "all", unix))]
+#[cfg(all(feature = "all", any(unix, target_os = "fullrust")))]
 from!(UnixListener, crate::Socket);
-#[cfg(all(feature = "all", unix))]
+#[cfg(all(feature = "all", any(unix, target_os = "fullrust")))]
 from!(UnixDatagram, crate::Socket);
-#[cfg(all(feature = "all", unix))]
+#[cfg(all(feature = "all", any(unix, target_os = "fullrust")))]
 from!(crate::Socket, UnixStream);
-#[cfg(all(feature = "all", unix))]
+#[cfg(all(feature = "all", any(unix, target_os = "fullrust")))]
 from!(crate::Socket, UnixListener);
-#[cfg(all(feature = "all", unix))]
+#[cfg(all(feature = "all", any(unix, target_os = "fullrust")))]
 from!(crate::Socket, UnixDatagram);
 
 #[test]

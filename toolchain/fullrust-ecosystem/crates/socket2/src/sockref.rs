@@ -2,10 +2,8 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::ops::Deref;
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fullrust"))]
 use std::os::unix::io::{AsFd, AsRawFd, FromRawFd};
-#[cfg(target_os = "fullrust")]
-use std::os::fd::{AsFd, AsRawFd, FromRawFd};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawSocket, AsSocket, FromRawSocket};
 
