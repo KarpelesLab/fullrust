@@ -1,9 +1,0 @@
-[package]
-name = "fullrust"
-version = "0.2.0"
-edition = "2021"
-license = "MIT OR Apache-2.0"
-description = "The libc-free runtime for purestd: the process entry point (_start) plus the mem*/unwind/getauxval symbols a freestanding binary needs from crt0/compiler_builtins/the unwinder."
-repository = "https://github.com/KarpelesLab/fullrust"
-keywords = ["no_std", "libc-free", "freestanding", "static", "runtime"]
-categories = ["no-std", "os::linux-apis"]

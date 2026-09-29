@@ -275,6 +275,17 @@ See [`toolchain/README.md`](toolchain/README.md) for the design, the
 syscall-backed platform layer, and how the overlay is built and ported across
 Rust versions.
 
+### Retired: `cargo-fullrust` / `purestd`
+
+fullrust started as a `no_std` runtime crate (`fullrust` on crates.io) plus a
+separate standard library (`purestd`), driven by a `cargo fullrust` subcommand
+(`cargo-fullrust` on crates.io) with nightly `-Z build-std` and an
+`x86_64-fullrust-linux` target JSON. That approach is **retired** and no longer
+maintained: the toolchain above gives unmodified crates the real `std`, and is
+what the action and images ship. If you installed `cargo-fullrust`, switch to the
+[GitHub Action](#use-it-in-a-github-workflow) or the
+[Docker image](#build-locally-with-docker). The old code remains in git history.
+
 ## License
 
 MIT OR Apache-2.0.

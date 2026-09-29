@@ -52,9 +52,8 @@ jobs:
       - name: Create a real proc-macro crate
         run: |
           mkdir -p probe/src
-          # `[workspace]` makes probe its own workspace root, so cargo does not walk
-          # up into this repo's workspace (a test artifact — real consumers build at
-          # their own repo root). Harmless for the composite job (it mounts only probe).
+          # `[workspace]` makes probe its own workspace root, so the probe stays
+          # self-contained whatever sits above it in the checkout.
           printf '[package]\nname = "probe"\nversion = "0.0.0"\nedition = "2021"\n\n[[bin]]\nname = "probe"\npath = "src/main.rs"\n\n[dependencies]\nserde = { version = "1", features = ["derive"] }\nserde_json = "1"\n\n[workspace]\n' > probe/Cargo.toml
           printf 'use serde::Serialize;\n#[derive(Serialize)]\nstruct P { msg: &%sstatic str }\nfn main() { println!("{}", serde_json::to_string(&P { msg: "built by the fullrust action" }).unwrap()); }\n' "'" > probe/src/main.rs
 
@@ -134,9 +133,8 @@ jobs:
       - name: Create a real proc-macro crate
         run: |
           mkdir -p probe/src
-          # `[workspace]` makes probe its own workspace root, so cargo does not walk
-          # up into this repo's workspace (a test artifact — real consumers build at
-          # their own repo root). Harmless for the composite job (it mounts only probe).
+          # `[workspace]` makes probe its own workspace root, so the probe stays
+          # self-contained whatever sits above it in the checkout.
           printf '[package]\nname = "probe"\nversion = "0.0.0"\nedition = "2021"\n\n[[bin]]\nname = "probe"\npath = "src/main.rs"\n\n[dependencies]\nserde = { version = "1", features = ["derive"] }\nserde_json = "1"\n\n[workspace]\n' > probe/Cargo.toml
           printf 'use serde::Serialize;\n#[derive(Serialize)]\nstruct P { msg: &%sstatic str }\nfn main() { println!("{}", serde_json::to_string(&P { msg: "built by the fullrust action" }).unwrap()); }\n' "'" > probe/src/main.rs
 
