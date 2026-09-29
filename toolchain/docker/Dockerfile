@@ -48,7 +48,7 @@ RUN set -eux; \
     mv /opt/fullrust/cargo /usr/local/bin/cargo; \
     chmod +x /usr/local/bin/cargo
 
-# Ecosystem bundle (getrandom 0.2/0.4, socket2 forks) + entrypoint, from the
+# Ecosystem bundle (getrandom, rustix, socket2, mio, tokio forks) + entrypoint, from the
 # repo (context = toolchain/). Generate the cargo config that patches those
 # crates for fullrust: patch KEY = dir name (so two majors of one crate coexist),
 # `package` = the real crate name cargo matches by version.

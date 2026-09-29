@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Thin convenience wrapper for the fullrust toolchain image.
 #
-# rustc, the target, the getrandom/socket2 ecosystem [patch.crates-io], and
+# rustc, the target, the ecosystem [patch.crates-io] (getrandom, rustix, socket2,
+# mio, tokio forks — see toolchain/fullrust-ecosystem), and
 # RUSTC_BOOTSTRAP are all baked into the image env + CARGO_HOME config, so a
 # plain `cargo build` is already a fullrust build (the same build a GitHub
 # `container:` job gets). This wrapper only chooses cargo-vs-verbatim and honors
@@ -12,7 +13,7 @@
 #   docker run --rm -v "$PWD:/src" -it ghcr.io/karpeleslab/fullrust:1.88 bash   # escape hatch
 #
 # Env:
-#   FULLRUST_NO_ECOSYSTEM=1   build against upstream getrandom/socket2 (no patch)
+#   FULLRUST_NO_ECOSYSTEM=1   build against unpatched upstream crates (no ecosystem forks)
 #   CARGO_BUILD_TARGET=…      override the target triple
 set -euo pipefail
 

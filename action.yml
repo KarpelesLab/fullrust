@@ -6,7 +6,8 @@ branding:
 
 # Runs the prebuilt fullrust toolchain image against your checked-out crate. The
 # image ships a patched rustc with the built-in `x86_64-unknown-linux-fullrust`
-# target and the getrandom/socket2 ecosystem patches (auto-applied); your
+# target and the ecosystem forks — getrandom, rustix, socket2, mio, tokio —
+# as an auto-applied [patch.crates-io]; your
 # Cargo.toml is never modified. Any unmodified crate builds into a static,
 # libc-free binary — no attributes, no fullrust dependency.
 
@@ -24,7 +25,7 @@ inputs:
     description: "fullrust toolchain image (override to pin a digest or version)."
     default: "ghcr.io/karpeleslab/fullrust:1.88"
   no-ecosystem:
-    description: "Skip the getrandom/socket2 [patch.crates-io] injection."
+    description: "Skip the ecosystem [patch.crates-io] injection (getrandom, rustix, socket2, mio, tokio forks)."
     default: "false"
 
 runs:

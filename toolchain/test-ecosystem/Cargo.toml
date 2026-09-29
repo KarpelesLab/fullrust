@@ -1,0 +1,11 @@
+[package]
+name = "ecosystem-probe"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }
+rustix = { version = "1", features = ["mm", "process"] }
+socket2 = { version = "0.6", features = ["all"] }
+
+[workspace]

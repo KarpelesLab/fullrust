@@ -11,6 +11,11 @@ name: action selftest
 
 on:
   workflow_dispatch:
+  # Weekly: the ecosystem job resolves fresh from crates.io (no lockfile), so it
+  # goes red as soon as an upstream release outruns a vendored fork — [patch]
+  # only applies when the fork's version is the one cargo resolves.
+  schedule:
+    - cron: "17 5 * * 1"
   pull_request:
   push:
     branches: [master]
@@ -64,6 +69,50 @@ jobs:
           out="$(./"$bin")"
           echo "ran → $out"
           [ "$out" = '{"msg":"built by the fullrust action"}' ]
+
+  # The vendored ecosystem forks + std::os::unix, end to end through the action:
+  # tokio multi-thread TCP echo (mio + socket2 0.6), rustix mmap/getpid,
+  # socket2 and std peer_cred. Resolves fresh (toolchain/test-ecosystem has no
+  # committed lockfile) so a stale fork shows up here.
+  ecosystem:
+    name: ecosystem forks (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - ghcr.io/karpeleslab/fullrust:1.88
+          - ghcr.io/karpeleslab/fullrust:1.98
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build via the composite action
+        uses: ./
+        with:
+          working-directory: toolchain/test-ecosystem
+          image: ${{ matrix.image }}
+          args: --release
+
+      - name: Assert every vendored fork was actually used
+        working-directory: toolchain/test-ecosystem
+        run: |
+          set -euxo pipefail
+          # [patch] silently falls back to crates.io when versions diverge; the
+          # lockfile records a path source (no "source =") for patched crates.
+          for c in tokio mio socket2 rustix; do
+            awk -v c="$c" '$0=="name = \""c"\"" {f=1; next} f && /^source/ {print "::error::"c" came from crates.io, not the fullrust fork"; bad=1} f && /^$/ {f=0} END {exit bad}' Cargo.lock
+          done
+
+      - name: Assert static, libc-free, and runs
+        working-directory: toolchain/test-ecosystem
+        run: |
+          set -euxo pipefail
+          bin=target/x86_64-unknown-linux-fullrust/release/ecosystem-probe
+          if readelf -l "$bin" | grep -qi interp; then echo "::error::dynamic (has PT_INTERP)"; exit 1; fi
+          if readelf -d "$bin" 2>/dev/null | grep -qi needed; then echo "::error::has NEEDED deps"; exit 1; fi
+          out="$(./"$bin")"
+          echo "ran → $out"
+          case "$out" in "ecosystem ok:"*) ;; *) exit 1 ;; esac
 
   container-job:
     name: container job (raw cargo build in :latest)
