@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/KarpelesLab/fullrust/compare/fullrust-v0.2.0...fullrust-v0.2.1) - 2026-09-29
+
+### Other
+
+- Fix CI: mem* C signatures, cargo-fullrust vs newer cargo's artifact layout
+
 ## [0.2.0](https://github.com/KarpelesLab/fullrust/compare/fullrust-v0.1.1...fullrust-v0.2.0) - 2026-09-23
 
 ### Other
