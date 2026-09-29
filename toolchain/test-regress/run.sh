@@ -9,11 +9,14 @@ set -u
 cd "$(dirname "$0")"
 V="${1:?usage: run.sh <minor, e.g. 1.88>}"
 T=x86_64-unknown-linux-fullrust
+# Under run-tests.sh / CI there is no rustup link: it exports RUSTC (the stage1
+# rustc) and CARGO (the bootstrap cargo). Otherwise use the linked toolchain.
+if [ -n "${RUSTC:-}" ] && [ -n "${CARGO:-}" ]; then CARGO_CMD=("$CARGO"); else CARGO_CMD=(cargo "+fullrust-$V"); fi
 fail=0; odd=0
 for variant in plain pad8; do
     flags=""; [ "$variant" = pad8 ] && flags="--cfg tls_pad8"
     rm -rf target
-    RUSTFLAGS="$flags" cargo "+fullrust-$V" build --release --target $T >build.log 2>&1 || {
+    RUSTFLAGS="$flags" "${CARGO_CMD[@]}" build --release --target $T >build.log 2>&1 || {
         echo "FAIL build ($variant)"; cat build.log; exit 1; }
     BIN=target/$T/release/regress-fullrust
     if readelf -d "$BIN" 2>/dev/null | grep -q NEEDED; then echo "FAIL $variant: has NEEDED"; fail=1; fi

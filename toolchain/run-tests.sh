@@ -12,7 +12,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 BUILD="$HERE/rust-$MINOR/build/x86_64-unknown-linux-gnu"
 TARGET="x86_64-unknown-linux-fullrust"
 CRATES=("$@")
-[[ ${#CRATES[@]} -gt 0 ]] || CRATES=(test-hello test-process test-syscall test-osextra)
+[[ ${#CRATES[@]} -gt 0 ]] || CRATES=(test-hello test-process test-syscall test-osextra test-osunix)
 
 export RUSTC="$BUILD/stage1/bin/rustc"
 CARGO="$BUILD/stage0/bin/cargo"
@@ -37,7 +37,13 @@ for crate in "${CRATES[@]}"; do
   if [[ $ok == 1 ]]; then echo "PASS $crate"; else echo "::error::FAIL $crate"; failed+=("$crate"); fi
 done
 
+# Regression checks (TLS layout with PT_TLS size % 16 != 0, process::exit codes):
+# its own script, since it builds two variants and inspects PT_TLS.
+echo "::group::test-regress"
+if CARGO="$CARGO" "$HERE/test-regress/run.sh" "$MINOR"; then echo "PASS test-regress"; else echo "::error::FAIL test-regress"; failed+=(test-regress); fi
+echo "::endgroup::"
+
 if [[ ${#failed[@]} -gt 0 ]]; then
   echo "failed: ${failed[*]}"; exit 1
 fi
-echo "all ${#CRATES[@]} test crates passed"
+echo "all ${#CRATES[@]} test crates + test-regress passed"
