@@ -116,8 +116,8 @@ regenerated patch is exact with
 A prebuilt image (`ghcr.io/karpeleslab/fullrust`) turns **any** Cargo project
 into a static, libc-free `x86_64-unknown-linux-fullrust` binary with no local
 toolchain setup. It bundles the patched stage1 compiler (the `fullrust` target
-is compiled in) plus the [ecosystem bundle](fullrust-ecosystem/) (getrandom /
-socket2).
+is compiled in) plus the [ecosystem bundle](fullrust-ecosystem/) (getrandom,
+rustix, mio, tokio, socket2).
 
 The compiler, the default target, the ecosystem `[patch.crates-io]`, and
 `RUSTC_BOOTSTRAP` are baked into the image env + cargo config, so **a plain
@@ -136,7 +136,7 @@ docker run --rm -v "$PWD:/src" -it ghcr.io/karpeleslab/fullrust:1.88 bash   # es
 
 The first positional arg is a cargo subcommand (`build`/`test`/`run`/…); anything
 else (e.g. `bash`) runs verbatim. `FULLRUST_NO_ECOSYSTEM=1` builds against
-upstream getrandom/socket2; `CARGO_BUILD_TARGET` overrides the triple. In another
+the pristine upstream crates; `CARGO_BUILD_TARGET` overrides the triple. In another
 repo's workflow this is just `uses: KarpelesLab/fullrust@…` (see `action.yml`).
 
 **2. GitHub `container:` job** — run the whole job inside the image (no

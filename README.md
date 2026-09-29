@@ -89,7 +89,7 @@ jobs:
 | `args` | `--release` | extra cargo args, e.g. `--release --bin myapp --no-default-features` |
 | `working-directory` | `.` | the crate to build |
 | `image` | `ghcr.io/karpeleslab/fullrust:1.88` | pin a Rust version (see [Versions](#versions)) |
-| `no-ecosystem` | `false` | skip the `getrandom`/`socket2` `[patch.crates-io]` injection |
+| `no-ecosystem` | `false` | skip the ecosystem `[patch.crates-io]` injection (getrandom, rustix, mio, tokio, socket2) |
 
 ---
 
@@ -135,6 +135,13 @@ ghcr.io/karpeleslab/fullrust:1.88   …   :1.98   :latest
 changes). Every build is also tagged `:<minor>-<commit>` (e.g. `:1.98-33782b9`),
 which never moves: pin that, or a digest, for reproducible builds.
 
+If you pinned an older build, move to a current one. Earlier 1.88/1.89 builds
+crash on `thread_local!`s with `Drop` when the TLS segment size isn't a multiple
+of 16 (every multi-threaded tokio binary hits this). Earlier 1.95–1.98 builds
+turned `std::process::exit(N)` into an abort. Both are fixed, and the toolchain
+CI now gates publishing on regression tests for them (`test-regress`) and on the
+`os::unix`/`os::linux` suite (`test-osunix`).
+
 They're public — no login to pull. Pin one via the action's `image:` input, the
 `container:` image, or the `docker run` tag. The action currently defaults to
 `:1.88`; for the newest Rust, set
@@ -156,30 +163,40 @@ rewritten on raw syscalls:
 - **Panics unwind** (`catch_unwind`, `Drop` during unwind), and
   `RUST_BACKTRACE=1` prints **symbolized backtraces** — with no libunwind and no
   libc, via an in-tree pure-Rust unwinder.
-- **`std::os::fd`** (`AsFd`/`OwnedFd`/`AsRawFd`/…) for the fd-interop ecosystem.
+- **`std::os::unix` and `std::os::linux`** — the same APIs as on Linux, on every
+  version 1.88–1.98: `unix::fs` (`PermissionsExt`, `MetadataExt`,
+  `OpenOptionsExt`, `FileExt`, `symlink`, `chown`, `chroot`, `mkfifo`, …),
+  `unix::process` (`CommandExt`: `uid`/`gid`/`groups`/`pre_exec`/`exec`/`arg0`/
+  `process_group`/`setsid`; `ExitStatusExt`), `unix::net` (`UnixStream`/
+  `UnixListener`/`UnixDatagram`, abstract addresses, `peer_cred`, fd/credential
+  passing), `unix::{io, ffi, thread, raw, prelude}`, and `linux::{fs, net,
+  process (PidFd), raw}`. Plus **`std::os::fd`** (`AsFd`/`OwnedFd`/`AsRawFd`/…).
 - **Talking to the kernel directly** — see [below](#raw-syscalls-and-exec).
 - **Dependencies** — pure-Rust crates work as-is (e.g. `serde`/`serde_json`). The
   image auto-injects a `[patch.crates-io]` so the common not-quite-pure gateways
-  build libc-free too: `getrandom` (and thus `rand`, `uuid`), `socket2` (and thus
-  `mio`/async stacks). Opt out with `no-ecosystem: true`.
+  build libc-free too: `getrandom` 0.2/0.4 (and thus `rand`, `uuid`), `rustix`
+  1.x, `mio`, `tokio` (incl. `net`), and `socket2` 0.5/0.6 (the full Linux API,
+  plus `Socket::peer_cred`). Opt out with `no-ecosystem: true`. See the
+  [ecosystem README](toolchain/fullrust-ecosystem/README.md).
 
 ### Raw syscalls and `exec`
 
-With no libc, the `libc`/`nix` crates aren't available. fullrust's std provides
-the equivalents under `std::os::fullrust` instead (these need
-`#[cfg(target_os = "fullrust")]` in portable code):
+With no libc, the `libc`/`nix` crates aren't available. Instead:
 
-- **`std::os::fullrust::process`** — the same API as `std::os::unix::process`:
-  `CommandExt` (`exec`, `pre_exec`, `arg0`, `uid`, `gid`, `process_group`),
-  `ExitStatusExt` (`signal`, `core_dumped`, `from_raw`, …) and `parent_id`.
-  Code written against the Unix extensions only needs a different `use`.
-- **`std::os::fullrust::syscall`** — `syscall0`…`syscall6`, which make the raw
-  `syscall` instruction and turn a `-errno` return into an `io::Error`. It also
-  has `nr` (every x86-64 syscall number) and `errno` (the Linux error numbers).
-  Use it for anything std doesn't wrap.
+- **`std::os::unix` / `std::os::linux`** cover what std wraps (see above).
+  `std::os::fullrust::{ffi, process}` are re-exports of the same `os::unix`
+  items, so older code that uses them keeps working.
+- **`std::os::fullrust::syscall`** — the raw escape hatch for *any* syscall:
+  `syscall0`…`syscall6` make the raw `syscall` instruction and turn a `-errno`
+  return into an `io::Error`. It also has `nr` (every x86-64 syscall number) and
+  `errno` (the Linux error numbers). It needs
+  `#[cfg(target_os = "fullrust")]` in portable code.
+- **`rustix`** (1.x, from the bundled ecosystem) — typed, safe wrappers such as
+  `mmap`, `ioctl`, `setsid`, `prctl`, `memfd`, `epoll` and `timerfd`, on its own
+  libc-free backend.
 
 ```rust
-use std::os::fullrust::process::CommandExt;
+use std::os::unix::process::CommandExt;
 use std::os::fullrust::syscall::{self, nr};
 use std::process::Command;
 
@@ -195,10 +212,21 @@ let err = Command::new("/bin/sh").arg0("sh").args(["-c", "echo hi"]).exec();
 - **Linux + x86-64 only** today.
 - **Static only** — no dynamic linking; FFI into a `.so` cannot link (by design).
 - **Not the `unix` target family.** `cfg(unix)` is false — that's exactly what
-  keeps the build graph libc-free — so `std::os::unix` is absent (`std::os::fd`
-  and `std::os::fullrust` are provided instead). A crate whose `unix`-only path
-  is load-bearing may need the ecosystem `[patch]` or a small fix; in practice
-  most pure-Rust crates need nothing.
+  keeps the build graph libc-free. `std::os::unix` *exists*, but a third-party
+  crate that gates its code on `cfg(unix)` won't see it without a cfg
+  broadening (`any(unix, target_os = "fullrust")`). The ecosystem `[patch]`
+  does this for the gateways above. Crates that gate their **own** OS code on
+  `cfg(unix)` stay unsupported until they get the same fix, even when they use
+  rustix: e.g. `tempfile`'s `tempfile()`/`NamedTempFile`, `memmap2`,
+  `polling`/`async-io`, `cap-std`, `procfs`. Most pure-Rust crates need
+  nothing.
+- **Ecosystem gaps:** tokio `process`/`signal`/`net::unix` and mio's Unix-domain
+  sockets are not yet available. `parking_lot` uses a spinning thread parker.
+- **Small std differences:** `JoinHandleExt::as_pthread_t` returns the kernel
+  tid (there is no libpthread), and `io::copy` doesn't use the
+  `copy_file_range`/`sendfile` fast path. APIs that are unstable upstream too
+  (`peer_credentials_unix_socket`, `linux_pidfd`, `unix_socket_ancillary_data`)
+  need their feature gates; the image sets `RUSTC_BOOTSTRAP=1`.
 
 ---
 
