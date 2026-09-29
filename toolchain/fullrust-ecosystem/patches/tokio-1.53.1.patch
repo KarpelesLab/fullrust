@@ -1,0 +1,232 @@
+# fullrust support for tokio 1.53.1 — cfg broadenings only, so feature "net"
+# (TcpListener/TcpStream/TcpSocket/UdpSocket) and tokio::io::unix::AsyncFd build
+# on target_os = "fullrust" via the fd-level (std::os::fd) code paths tokio
+# already has for unix/wasi, and the Linux socket flags. No libc dependency.
+# Needs the bundle's mio (fullrust epoll backend) and a fullrust socket2 0.6.
+# Not covered: process, signal (need libc/signal-hook-registry and
+# std::os::unix::process), net::unix (needs std::os::unix::net).
+# Applied on top of crates.io tokio 1.53.1 (vendored in crates/tokio/).
+diff -ruN a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml	2026-09-29 13:31:06.391424389 +0900
++++ b/Cargo.toml	2026-09-29 13:31:06.404778277 +0900
+@@ -992,4 +992,5 @@
+     "cfg(tokio_no_tuning_tests)",
+     "cfg(tokio_unstable)",
+     'cfg(target_os, values("cygwin"))',
++    'cfg(target_os, values("fullrust"))',
+ ]
+diff -ruN a/src/io/async_fd.rs b/src/io/async_fd.rs
+--- a/src/io/async_fd.rs	2026-09-29 13:31:06.392117409 +0900
++++ b/src/io/async_fd.rs	2026-09-29 13:31:06.399242775 +0900
+@@ -6,7 +6,7 @@
+ use std::error::Error;
+ use std::fmt;
+ use std::io;
+-use std::os::unix::io::{AsRawFd, RawFd};
++use std::os::fd::{AsRawFd, RawFd};
+ use std::task::{ready, Context, Poll};
+ 
+ /// Associates an IO object backed by a Unix file descriptor with the tokio
+@@ -930,9 +930,9 @@
+     }
+ }
+ 
+-impl<T: AsRawFd> std::os::unix::io::AsFd for AsyncFd<T> {
+-    fn as_fd(&self) -> std::os::unix::io::BorrowedFd<'_> {
+-        unsafe { std::os::unix::io::BorrowedFd::borrow_raw(self.as_raw_fd()) }
++impl<T: AsRawFd> std::os::fd::AsFd for AsyncFd<T> {
++    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
++        unsafe { std::os::fd::BorrowedFd::borrow_raw(self.as_raw_fd()) }
+     }
+ }
+ 
+diff -ruN a/src/io/mod.rs b/src/io/mod.rs
+--- a/src/io/mod.rs	2026-09-29 13:31:06.392189891 +0900
++++ b/src/io/mod.rs	2026-09-29 13:31:06.399311011 +0900
+@@ -252,7 +252,7 @@
+     }
+ }
+ 
+-cfg_net_unix! {
++cfg_net_unix_fd! {
+     mod async_fd;
+ 
+     pub mod unix {
+diff -ruN a/src/macros/cfg.rs b/src/macros/cfg.rs
+--- a/src/macros/cfg.rs	2026-09-29 13:31:06.393033743 +0900
++++ b/src/macros/cfg.rs	2026-09-29 13:31:06.400192561 +0900
+@@ -63,7 +63,7 @@
+ macro_rules! cfg_unix_or_wasi {
+     ($($item:item)*) => {
+         $(
+-            #[cfg(any(all(doc, docsrs), unix, target_os = "wasi"))]
++            #[cfg(any(all(doc, docsrs), unix, target_os = "wasi", target_os = "fullrust"))]
+             #[cfg_attr(docsrs, doc(cfg(any(unix, target_os = "wasi"))))]
+             $item
+         )*
+@@ -378,6 +378,18 @@
+             #[cfg_attr(docsrs, doc(cfg(all(unix, feature = "net"))))]
+             $item
+         )*
++    }
++}
++
++/// Like `cfg_net_unix!`, but also for `fullrust`: file-descriptor-level APIs
++/// (e.g. `AsyncFd`) that don't need `std::os::unix`.
++macro_rules! cfg_net_unix_fd {
++    ($($item:item)*) => {
++        $(
++            #[cfg(all(any(unix, target_os = "fullrust"), feature = "net"))]
++            #[cfg_attr(docsrs, doc(cfg(all(unix, feature = "net"))))]
++            $item
++        )*
+     }
+ }
+ 
+diff -ruN a/src/net/tcp/listener.rs b/src/net/tcp/listener.rs
+--- a/src/net/tcp/listener.rs	2026-09-29 13:31:06.393208893 +0900
++++ b/src/net/tcp/listener.rs	2026-09-29 13:31:06.400359368 +0900
+@@ -289,7 +289,7 @@
+                 .map(|raw_socket| unsafe { std::net::TcpListener::from_raw_socket(raw_socket) })
+         }
+ 
+-        #[cfg(target_os = "wasi")]
++        #[cfg(any(target_os = "wasi", target_os = "fullrust"))]
+         {
+             use std::os::fd::{FromRawFd, IntoRawFd};
+             self.io
+@@ -404,10 +404,13 @@
+     }
+ }
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "fullrust"))]
+ mod sys {
+     use super::TcpListener;
++    #[cfg(unix)]
+     use std::os::unix::prelude::*;
++    #[cfg(target_os = "fullrust")]
++    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
+ 
+     impl AsRawFd for TcpListener {
+         fn as_raw_fd(&self) -> RawFd {
+diff -ruN a/src/net/tcp/socket.rs b/src/net/tcp/socket.rs
+--- a/src/net/tcp/socket.rs	2026-09-29 13:31:06.393208893 +0900
++++ b/src/net/tcp/socket.rs	2026-09-29 13:31:06.400359368 +0900
+@@ -169,6 +169,7 @@
+             target_os = "fuchsia",
+             target_os = "illumos",
+             target_os = "linux",
++            target_os = "fullrust",
+             target_os = "netbsd",
+             target_os = "openbsd",
+             target_os = "wasi",
+@@ -182,6 +183,7 @@
+             target_os = "fuchsia",
+             target_os = "illumos",
+             target_os = "linux",
++            target_os = "fullrust",
+             target_os = "netbsd",
+             target_os = "openbsd",
+             target_os = "wasi",
+@@ -282,7 +284,7 @@
+     /// }
+     /// ```
+     #[cfg(all(
+-        unix,
++        any(unix, target_os = "fullrust"),
+         not(target_os = "solaris"),
+         not(target_os = "illumos"),
+         not(target_os = "cygwin"),
+@@ -291,7 +293,7 @@
+     #[cfg_attr(
+         docsrs,
+         doc(cfg(all(
+-            unix,
++            any(unix, target_os = "fullrust"),
+             not(target_os = "solaris"),
+             not(target_os = "illumos"),
+             not(target_os = "cygwin"),
+@@ -329,7 +331,7 @@
+     /// }
+     /// ```
+     #[cfg(all(
+-        unix,
++        any(unix, target_os = "fullrust"),
+         not(target_os = "solaris"),
+         not(target_os = "illumos"),
+         not(target_os = "cygwin"),
+@@ -338,7 +340,7 @@
+     #[cfg_attr(
+         docsrs,
+         doc(cfg(all(
+-            unix,
++            any(unix, target_os = "fullrust"),
+             not(target_os = "solaris"),
+             not(target_os = "illumos"),
+             not(target_os = "cygwin"),
+@@ -840,10 +842,15 @@
+     /// ```
+     pub async fn connect(self, addr: SocketAddr) -> io::Result<TcpStream> {
+         if let Err(err) = self.inner.connect(&addr.into()) {
+-            #[cfg(not(windows))]
++            #[cfg(not(any(windows, target_os = "fullrust")))]
+             if err.raw_os_error() != Some(libc::EINPROGRESS) {
+                 return Err(err);
+             }
++            // No libc on fullrust; Linux `EINPROGRESS` is 115.
++            #[cfg(target_os = "fullrust")]
++            if err.raw_os_error() != Some(115) {
++                return Err(err);
++            }
+             #[cfg(windows)]
+             if err.kind() != io::ErrorKind::WouldBlock {
+                 return Err(err);
+@@ -994,7 +1001,7 @@
+ 
+ // These trait implementations can't be build on Windows, so we completely
+ // ignore them, even when building documentation.
+-#[cfg(any(unix, target_os = "wasi"))]
++#[cfg(any(unix, target_os = "wasi", target_os = "fullrust"))]
+ cfg_unix_or_wasi! {
+     impl AsRawFd for TcpSocket {
+         fn as_raw_fd(&self) -> RawFd {
+diff -ruN a/src/net/tcp/stream.rs b/src/net/tcp/stream.rs
+--- a/src/net/tcp/stream.rs	2026-09-29 13:31:06.393208893 +0900
++++ b/src/net/tcp/stream.rs	2026-09-29 13:31:06.400359368 +0900
+@@ -272,7 +272,7 @@
+                 .map(|raw_socket| unsafe { std::net::TcpStream::from_raw_socket(raw_socket) })
+         }
+ 
+-        #[cfg(target_os = "wasi")]
++        #[cfg(any(target_os = "wasi", target_os = "fullrust"))]
+         {
+             use std::os::fd::{FromRawFd, IntoRawFd};
+             self.io
+@@ -1529,10 +1529,13 @@
+     }
+ }
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "fullrust"))]
+ mod sys {
+     use super::TcpStream;
++    #[cfg(unix)]
+     use std::os::unix::prelude::*;
++    #[cfg(target_os = "fullrust")]
++    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
+ 
+     impl AsRawFd for TcpStream {
+         fn as_raw_fd(&self) -> RawFd {
+diff -ruN a/src/runtime/io/driver.rs b/src/runtime/io/driver.rs
+--- a/src/runtime/io/driver.rs	2026-09-29 13:31:06.393779744 +0900
++++ b/src/runtime/io/driver.rs	2026-09-29 13:31:06.400944932 +0900
+@@ -77,7 +77,7 @@
+     pub(super) is_shutdown: bool,
+ }
+ 
+-cfg_net_unix!(
++cfg_net_unix_fd!(
+     impl ReadyEvent {
+         pub(crate) fn with_ready(&self, ready: Ready) -> Self {
+             Self {
