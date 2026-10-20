@@ -4,7 +4,7 @@ name: action selftest
 # real GitHub Actions, on a REAL proc-macro crate (serde derive — exercises host
 # std + the getrandom/socket2 ecosystem [patch.crates-io]):
 #   1. the composite action  `uses: KarpelesLab/fullrust`  (here `uses: ./`),
-#      tested against both the oldest (1.88) and newest (1.98) published images;
+#      tested against both the oldest (1.88) and newest (1.99) published images;
 #   2. a `container:` job running a raw `cargo build` (the baked env makes it a
 #      fullrust build — this is the "identical build both ways" guarantee).
 # Each asserts the output is a statically-linked, NEEDED-free ELF that runs.
@@ -45,7 +45,7 @@ jobs:
       matrix:
         image:
           - ghcr.io/karpeleslab/fullrust:1.88
-          - ghcr.io/karpeleslab/fullrust:1.98
+          - ghcr.io/karpeleslab/fullrust:1.99
     steps:
       - uses: actions/checkout@v6
 
@@ -89,7 +89,7 @@ jobs:
       matrix:
         image:
           - ghcr.io/karpeleslab/fullrust:1.88
-          - ghcr.io/karpeleslab/fullrust:1.98
+          - ghcr.io/karpeleslab/fullrust:1.99
     steps:
       - uses: actions/checkout@v6
 
