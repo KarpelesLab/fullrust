@@ -1,0 +1,32 @@
+change-id = "ignore"
+
+# fullrust toolchain build config.
+# Goal: a stage-1 compiler + std for x86_64-unknown-linux-fullrust, as fast as
+# possible. Prebuilt CI LLVM avoids the multi-hour LLVM build; rust-lld is the
+# linker our target spec selects.
+
+[llvm]
+# CI LLVM artifacts are expired for this release tag, so build LLVM from source
+# once (cached thereafter). Keep it lean: only the x86 backend is needed.
+download-ci-llvm = false
+targets = "X86"
+ninja = true
+
+[build]
+# Keep it lean: no docs, no extended tools. The fullrust target is added on the
+# x.py command line (--target).
+docs = false
+extended = false
+# Use the pure-Rust compiler-builtins intrinsics, not the C (compiler-rt) ones.
+# This avoids invoking cc-rs (which can't parse the `fullrust` env) and keeps
+# the target genuinely C-free.
+optimized-compiler-builtins = false
+
+[rust]
+channel = "stable"
+# Ship rust-lld and the llvm tools so the fullrust target (linker = "rust-lld")
+# can link without any external/C toolchain.
+lld = true
+llvm-tools = true
+# We patched the compiler, so it must be built from source (no download-rustc).
+download-rustc = false

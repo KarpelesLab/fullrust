@@ -25,7 +25,10 @@ for crate in "${CRATES[@]}"; do
   dir="$HERE/$crate"
   bin="$(sed -n 's/^name = "\(.*\)"/\1/p' "$dir/Cargo.toml" | head -1)"
   ok=1
-  "$CARGO" build --release --target "$TARGET" --manifest-path "$dir/Cargo.toml" || ok=0
+  # Pin the target dir: a user/CI `build.target-dir` would otherwise put the
+  # binary elsewhere and we'd run a stale one left in $dir/target.
+  rm -rf "$dir/target"
+  CARGO_TARGET_DIR="$dir/target" "$CARGO" build --release --target "$TARGET" --manifest-path "$dir/Cargo.toml" || ok=0
   exe="$dir/target/$TARGET/release/$bin"
   if [[ $ok == 1 ]]; then
     if readelf -d "$exe" 2>/dev/null | grep -qi NEEDED; then

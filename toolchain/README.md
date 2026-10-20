@@ -350,7 +350,7 @@ not wrap (`syscall0..syscall6 -> io::Result<usize>`, `nr::*` syscall numbers,
 `errno::*`). Covered by `test-osunix` (which also builds on
 `x86_64-unknown-linux-gnu` for parity) and `test-syscall`.
 
-This surface is carried on every version 1.88–1.98, and each version exposes
+This surface is carried on every version 1.88–1.99, and each version exposes
 exactly the `os::unix`/`os::linux` API that version's Linux std has. Per-version
 glue in the fullrust pal: ≤1.93 use `sys_common::{AsInner,…}` and `AnonPipe` as
 the child pipe type (1.94+ use `ChildPipe = FileDesc`); ≤1.91 define
@@ -363,7 +363,7 @@ the child pipe type (1.94+ use `ChildPipe = FileDesc`); ≤1.91 define
 
 ## Version matrix
 
-The goal is to track `1.88 … 1.98` and observe how `std::sys::pal` shifts across
+The goal is to track `1.88 … 1.99` and observe how `std::sys::pal` shifts across
 versions (the pal interface is deliberately unstable upstream). Each `rust-<v>`
 checkout is gitignored; the overlay of source changes above is what we carry
 forward and re-apply per version (`git apply --reject patches/fullrust-<prev>.patch`,
@@ -382,6 +382,7 @@ fix the rejects, `./regen-overlay.sh <v>`).
 | 1.96 | `patches/fullrust-1.96.patch` | builds + all test crates green |
 | 1.97 | `patches/fullrust-1.97.patch` | builds + all test crates green |
 | 1.98 | `patches/fullrust-1.98.patch` | builds + all test crates green |
+| 1.99 | `patches/fullrust-1.99.patch` | builds + all test crates green (built from 1.99.1; LLVM 23) |
 
 **1.88 → 1.89 drift was small:** only 7 hunks rejected on re-apply — all
 mechanical `Cargo.toml` libc-gate edits (dependency version bumps) + one moved
@@ -404,6 +405,23 @@ gained a `size() -> Option<io::Result<u64>>` (a `read_to_end` size hint), and
   sealed the `os::*::process` extension traits with `pub impl(self) trait`
   instead of `Sealed`, and started denying `implicit_provenance_casts`, so
   syscall pointer arguments are passed as `ptr.expose_provenance()`.
+
+**1.98 → 1.99 drift** (1.99 is on LLVM 23, so no LLVM reuse from 1.95–1.98):
+
+- `library/unwind` dropped its `unwinding.rs` backend; Xous (and now fullrust)
+  use the pure-Rust `unwinding` crate through `libunwind.rs`.
+- The allocator interface became free functions (`sys::alloc::{alloc,
+  alloc_zeroed, dealloc, realloc}`) instead of a per-platform
+  `GlobalAlloc for System` impl.
+- Futexes moved to a `sys/sync/futex` dispatcher (fullrust re-exports its pal
+  futex there).
+- `set_permissions_nofollow` became per-platform (`imp::set_perm_nofollow`):
+  fullrust uses `fchmodat2(AT_SYMLINK_NOFOLLOW)` (Linux 6.6+), falling back to
+  glibc's race-free `O_PATH|O_NOFOLLOW` + `/proc/self/fd` chmod.
+- `io::error` grew its own platform dispatcher.
+
+The toolchain workflow now builds the newest point release of a minor (1.99 →
+1.99.1) unless an exact `version` is given.
 
 **Build tip:** a released tag's CI LLVM is usually expired (`download-ci-llvm`
 404s), so LLVM builds from source (~1–2 h). Adjacent versions often share an LLVM

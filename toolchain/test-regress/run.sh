@@ -16,7 +16,7 @@ fail=0; odd=0
 for variant in plain pad8; do
     flags=""; [ "$variant" = pad8 ] && flags="--cfg tls_pad8"
     rm -rf target
-    RUSTFLAGS="$flags" "${CARGO_CMD[@]}" build --release --target $T >build.log 2>&1 || {
+    RUSTFLAGS="$flags" CARGO_TARGET_DIR=target "${CARGO_CMD[@]}" build --release --target $T >build.log 2>&1 || {
         echo "FAIL build ($variant)"; cat build.log; exit 1; }
     BIN=target/$T/release/regress-fullrust
     if readelf -d "$BIN" 2>/dev/null | grep -q NEEDED; then echo "FAIL $variant: has NEEDED"; fail=1; fi

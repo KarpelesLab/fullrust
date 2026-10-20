@@ -128,7 +128,7 @@ The binary lands in your crate's `target/x86_64-unknown-linux-fullrust/release/`
 Images are published per Rust minor, plus `latest` (the newest):
 
 ```
-ghcr.io/karpeleslab/fullrust:1.88   …   :1.98   :latest
+ghcr.io/karpeleslab/fullrust:1.88   …   :1.99   :latest
 ```
 
 `:<minor>` and `:latest` move to each new build (e.g. when the ecosystem bundle
@@ -145,7 +145,7 @@ CI now gates publishing on regression tests for them (`test-regress`) and on the
 They're public — no login to pull. Pin one via the action's `image:` input, the
 `container:` image, or the `docker run` tag. The action currently defaults to
 `:1.88`; for the newest Rust, set
-`image: ghcr.io/karpeleslab/fullrust:1.98` (or `:latest`).
+`image: ghcr.io/karpeleslab/fullrust:1.99` (or `:latest`).
 
 ---
 
@@ -164,7 +164,7 @@ rewritten on raw syscalls:
   `RUST_BACKTRACE=1` prints **symbolized backtraces** — with no libunwind and no
   libc, via an in-tree pure-Rust unwinder.
 - **`std::os::unix` and `std::os::linux`** — the same APIs as on Linux, on every
-  version 1.88–1.98: `unix::fs` (`PermissionsExt`, `MetadataExt`,
+  version 1.88–1.99: `unix::fs` (`PermissionsExt`, `MetadataExt`,
   `OpenOptionsExt`, `FileExt`, `symlink`, `chown`, `chroot`, `mkfifo`, …),
   `unix::process` (`CommandExt`: `uid`/`gid`/`groups`/`pre_exec`/`exec`/`arg0`/
   `process_group`/`setsid`; `ExitStatusExt`), `unix::net` (`UnixStream`/
@@ -269,7 +269,7 @@ fullrust is a source overlay on the Rust compiler that adds the built-in
 `x86_64-unknown-linux-fullrust` target and a `std::sys` backend on raw syscalls
 (the allocator, native TLS, threads, fs/net/process, the pure-Rust unwinder and
 backtraces), packaged as a thin Docker image around the prebuilt toolchain. It
-tracks released Rust versions (currently 1.88–1.98).
+tracks released Rust versions (currently 1.88–1.99).
 
 See [`toolchain/README.md`](toolchain/README.md) for the design, the
 syscall-backed platform layer, and how the overlay is built and ported across

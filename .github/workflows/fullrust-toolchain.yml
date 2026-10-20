@@ -14,6 +14,11 @@ on:
         required: true
         default: "1.88"
         type: string
+      version:
+        description: "Exact Rust release to build (blank = the newest <minor>.N point release upstream)"
+        required: false
+        default: ""
+        type: string
       publish:
         description: "Publish the toolchain release asset (untick to only build + test)"
         required: false
@@ -35,6 +40,23 @@ jobs:
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v6
+
+      # Point releases (1.99.1, …) carry the regression fixes of their minor, so
+      # build the newest one unless an exact version is asked for.
+      - name: Resolve the Rust release
+        id: ver
+        env:
+          MINOR: ${{ inputs.minor }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "$VERSION" ]; then
+            VERSION="$(git ls-remote --tags --refs https://github.com/rust-lang/rust.git "refs/tags/$MINOR.*" \
+              | sed 's|.*refs/tags/||' | grep -E "^${MINOR//./\\.}\.[0-9]+$" | sort -V | tail -1)"
+          fi
+          [ -n "$VERSION" ] && [ "${VERSION%.*}" = "$MINOR" ] || { echo "::error::no Rust release for $MINOR (got '$VERSION')"; exit 1; }
+          echo "building Rust $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
@@ -62,7 +84,7 @@ jobs:
 
       - name: Build the fullrust toolchain
         working-directory: toolchain
-        run: ./build-fork.sh "${{ inputs.minor }}.0"
+        run: ./build-fork.sh "${{ steps.ver.outputs.version }}"
 
       # Saved even when the build step fails (e.g. a new version's overlay not
       # compiling yet): LLVM + the compiler are the 1–2 h part, and keeping them
@@ -95,7 +117,7 @@ jobs:
           body: |
             Prebuilt fullrust stage1 toolchain (rustc with the built-in
             `x86_64-unknown-linux-fullrust` target + host & fullrust sysroots +
-            rust-lld) and the bootstrap cargo, for Rust ${{ inputs.minor }}.
+            rust-lld) and the bootstrap cargo, for Rust ${{ steps.ver.outputs.version }}.
             Consumed by the `fullrust image` workflow to build
             `ghcr.io/${{ github.repository_owner }}/fullrust`.
 
