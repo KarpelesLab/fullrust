@@ -16,10 +16,14 @@ name: upstream watch
 # body ("… for Rust 1.99.1."); bodies from before point releases were tracked
 # say "Rust 1.91." and count as <minor>.0.
 #
-# A dispatched build is named "fullrust toolchain <minor> <version>" (the
-# toolchain workflow's run-name). If a run with that name exists in any state
-# (queued, running, failed), the version is skipped, so a failing point-release
-# build is not retried every day; re-dispatch it by hand once it's fixed.
+#   - a changed overlay for a published minor (patches/fullrust-<minor>.patch or
+#     bootstrap-<minor>.toml edited, e.g. a std fix): rebuild it. Each release
+#     body records "overlay <hash>" (sha256 of the two files, 12 hex digits).
+#
+# A dispatched build is named "fullrust toolchain <minor> <version> <overlay>"
+# (the toolchain workflow's run-name). If a run with that name exists in any
+# state (queued, running, failed), it is skipped, so a failing build is not
+# retried every day; re-dispatch it by hand once it's fixed.
 
 on:
   workflow_dispatch:
@@ -75,43 +79,46 @@ jobs:
 
           act() { if [ "$DRY_RUN" = "true" ]; then echo "[dry-run] $*"; else "$@"; fi; }
 
-          # 1. Point releases of supported minors.
+          # 1. Supported minors: rebuild on a new point release or a changed
+          #    overlay (patch + bootstrap config); first build of a new port.
           for minor in $ours; do
             want="$(grep -E "^${minor//./\\.}\.[0-9]+$" <<<"$upstream" | tail -n1 || true)"
             [ -n "$want" ] || { echo "$minor: no upstream release (?)"; continue; }
+            if [ ! -f "toolchain/bootstrap-$minor.toml" ]; then
+              echo "::warning::$minor: overlay without toolchain/bootstrap-$minor.toml; not dispatching"
+              continue
+            fi
+            # Same hash as fullrust-toolchain.yml records in the release body.
+            ovl="$(cat "toolchain/patches/fullrust-$minor.patch" "toolchain/bootstrap-$minor.toml" | sha256sum | cut -c1-12)"
 
             body="$(gh release view "toolchain-$minor" -R "$GITHUB_REPOSITORY" --json body -q .body 2>/dev/null || true)"
             have="$(grep -oE 'Rust 1\.[0-9]+(\.[0-9]+)?' <<<"$body" | head -n1 | cut -d' ' -f2 || true)"
-            if [ -z "$have" ]; then
-              # Ported but never published: dispatch its first build.
-              if [ ! -f "toolchain/bootstrap-$minor.toml" ]; then
-                echo "::warning::$minor: overlay without toolchain/bootstrap-$minor.toml; not dispatching"
-              elif grep -qxF "fullrust toolchain $minor $want" <<<"$runs"; then
-                echo "$minor: first build ($want) already dispatched (see its run; re-dispatch by hand if it failed)"
-              else
-                echo "::notice::$minor: newly ported, dispatching its first build ($want)"
-                act gh workflow run fullrust-toolchain.yml -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" \
-                  -f minor="$minor" -f version="$want"
-              fi
-              continue
-            fi
+            have_ovl="$(grep -oE 'overlay [0-9a-f]{12}' <<<"$body" | head -n1 | cut -d' ' -f2 || true)"
             [ "$have" = "$minor" ] && have="$minor.0"
 
-            if [ "$have" = "$want" ]; then
-              echo "$minor: up to date ($have)"
-            elif [ "$(printf '%s\n%s\n' "$have" "$want" | sort -V | tail -n1)" = "$have" ]; then
-              echo "$minor: published $have is newer than upstream $want (?)"
-            elif grep -qxF "fullrust toolchain $minor $want" <<<"$runs"; then
-              echo "$minor: $have → $want already dispatched (see its run; re-dispatch by hand if it failed)"
+            if [ -z "$have" ]; then
+              why="newly ported, first build"
+            elif [ "$(printf '%s\n%s\n' "$have" "$want" | sort -V | tail -n1)" != "$want" ]; then
+              echo "$minor: published $have is newer than upstream $want (?)"; continue
+            elif [ "$have" != "$want" ]; then
+              why="$have → $want"
+            elif [ "$have_ovl" != "$ovl" ]; then
+              why="overlay changed (${have_ovl:-unrecorded} → $ovl)"
             else
-              echo "::notice::$minor: $have → $want, dispatching fullrust toolchain"
+              echo "$minor: up to date ($have, overlay $ovl)"; continue
+            fi
+
+            if grep -qxF "fullrust toolchain $minor $want $ovl" <<<"$runs"; then
+              echo "$minor: $why — already dispatched (see its run; re-dispatch by hand if it failed)"
+            else
+              echo "::notice::$minor: $why, dispatching fullrust toolchain"
               act gh workflow run fullrust-toolchain.yml -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" \
-                -f minor="$minor" -f version="$want"
+                -f minor="$minor" -f version="$want" -f overlay="$ovl"
             fi
           done
 
           # 2. New minors we have no overlay for yet (only those after our newest:
-          #    anything older than 1.88 is out of scope).
+          #    older minors are out of scope).
           for minor in $(sed 's/\.[0-9]*$//' <<<"$upstream" | sort -uV); do
             grep -qxF "$minor" <<<"$ours" && continue
             [ "$(printf '%s\n%s\n' "$newest_ours" "$minor" | sort -V | tail -n1)" = "$minor" ] || continue
@@ -129,7 +136,8 @@ jobs:
           1. \`git clone --depth 1 --branch $minor.0 https://github.com/rust-lang/rust.git toolchain/rust-$minor\` (+ \`git submodule update --init library/backtrace\`)
           2. \`git apply --reject ../patches/fullrust-$newest_ours.patch\` in it and fix the rejects
           3. add \`bootstrap-$minor.toml\`, build (\`x.py build library --stage 1 --target x86_64-unknown-linux-gnu,x86_64-unknown-linux-fullrust\`), \`./run-tests.sh $minor\`
-          4. \`./regen-overlay.sh $minor\` and push to master: this workflow then dispatches the first **fullrust toolchain** build
+          4. \`./regen-overlay.sh $minor\`; fullrust keeps 10 minors, so \`git rm\` the oldest overlay + bootstrap config
+          5. push to master: this workflow then dispatches the first **fullrust toolchain** build
 
           Opened by the upstream-watch workflow.
           EOF

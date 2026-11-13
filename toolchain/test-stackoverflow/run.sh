@@ -5,7 +5,12 @@
 # false overflow message.
 set -u
 cd "$(dirname "$0")"
-cargo +fullrust-1.88 build --release --target x86_64-unknown-linux-fullrust >/dev/null 2>&1 || {
+V="${1:?usage: run.sh <minor, e.g. 1.100>}"
+# With RUSTC (stage1 rustc) and CARGO (bootstrap cargo) exported, as run-tests.sh
+# does, use those; otherwise the rustup-linked fullrust-<minor> toolchain.
+if [ -n "${RUSTC:-}" ] && [ -n "${CARGO:-}" ]; then CARGO_CMD=("$CARGO"); else CARGO_CMD=(cargo "+fullrust-$V"); fi
+rm -rf target
+CARGO_TARGET_DIR=target "${CARGO_CMD[@]}" build --release --target x86_64-unknown-linux-fullrust >/dev/null 2>&1 || {
     echo "build failed"; exit 1; }
 BIN=./target/x86_64-unknown-linux-fullrust/release/stackoverflow-fullrust
 fail=0

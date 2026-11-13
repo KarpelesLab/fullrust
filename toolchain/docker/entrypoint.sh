@@ -8,9 +8,9 @@
 # `container:` job gets). This wrapper only chooses cargo-vs-verbatim and honors
 # the FULLRUST_NO_ECOSYSTEM escape hatch.
 #
-#   docker run --rm -v "$PWD:/src" ghcr.io/karpeleslab/fullrust:1.88            # build --release
-#   docker run --rm -v "$PWD:/src" ghcr.io/karpeleslab/fullrust:1.88 test
-#   docker run --rm -v "$PWD:/src" -it ghcr.io/karpeleslab/fullrust:1.88 bash   # escape hatch
+#   docker run --rm -v "$PWD:/src" ghcr.io/karpeleslab/fullrust:latest            # build --release
+#   docker run --rm -v "$PWD:/src" ghcr.io/karpeleslab/fullrust:latest test
+#   docker run --rm -v "$PWD:/src" -it ghcr.io/karpeleslab/fullrust:latest bash   # escape hatch
 #
 # Env:
 #   FULLRUST_NO_ECOSYSTEM=1   build against unpatched upstream crates (no ecosystem forks)

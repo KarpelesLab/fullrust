@@ -5,12 +5,12 @@
 # same URL-based Dockerfile works unchanged. Run ../build-fork.sh first.
 #
 # Usage:  ./build-image.sh [minor] [tag]
-#   ./build-image.sh 1.88 ghcr.io/karpeleslab/fullrust:1.88
+#   ./build-image.sh 1.100 ghcr.io/karpeleslab/fullrust:1.100
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-MINOR="${1:-1.88}"
+MINOR="${1:-1.100}"
 TAG="${2:-fullrust:$MINOR}"
 PORT="${FULLRUST_HTTP_PORT:-8231}"
 

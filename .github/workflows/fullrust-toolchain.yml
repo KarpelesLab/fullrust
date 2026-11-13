@@ -1,7 +1,7 @@
 name: fullrust toolchain
 # The upstream-watch workflow looks runs up by this name to avoid re-dispatching
-# a point release it already dispatched.
-run-name: fullrust toolchain ${{ inputs.minor }} ${{ inputs.version }}
+# a build it already dispatched.
+run-name: fullrust toolchain ${{ inputs.minor }} ${{ inputs.version }} ${{ inputs.overlay }}
 
 # Build the patched stage1 compiler and attach it (with the bootstrap cargo) as a
 # release asset. This is the slow, rare half (LLVM + rustc from source, ~1–2 h);
@@ -13,12 +13,17 @@ on:
   workflow_dispatch:
     inputs:
       minor:
-        description: "Rust minor to build (e.g. 1.88)"
+        description: "Rust minor to build (e.g. 1.100)"
         required: true
-        default: "1.88"
+        default: "1.100"
         type: string
       version:
         description: "Exact Rust release to build (blank = the newest <minor>.N point release upstream)"
+        required: false
+        default: ""
+        type: string
+      overlay:
+        description: "Expected overlay hash (set by upstream-watch; blank = don't check)"
         required: false
         default: ""
         type: string
@@ -56,6 +61,7 @@ jobs:
         env:
           MINOR: ${{ inputs.minor }}
           VERSION: ${{ inputs.version }}
+          EXPECT_OVERLAY: ${{ inputs.overlay }}
         run: |
           set -euo pipefail
           if [ -z "$VERSION" ]; then
@@ -63,8 +69,15 @@ jobs:
               | sed 's|.*refs/tags/||' | grep -E "^${MINOR//./\\.}\.[0-9]+$" | sort -V | tail -1)"
           fi
           [ -n "$VERSION" ] && [ "${VERSION%.*}" = "$MINOR" ] || { echo "::error::no Rust release for $MINOR (got '$VERSION')"; exit 1; }
-          echo "building Rust $VERSION"
+          # Recorded in the release body; upstream-watch rebuilds a minor whose
+          # overlay (patch + bootstrap config) no longer matches it.
+          OVERLAY="$(cat "toolchain/patches/fullrust-$MINOR.patch" "toolchain/bootstrap-$MINOR.toml" | sha256sum | cut -c1-12)"
+          if [ -n "$EXPECT_OVERLAY" ] && [ "$EXPECT_OVERLAY" != "$OVERLAY" ]; then
+            echo "::warning::overlay is $OVERLAY, dispatch expected $EXPECT_OVERLAY (master moved on); building $OVERLAY"
+          fi
+          echo "building Rust $VERSION, overlay $OVERLAY"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "overlay=$OVERLAY" >> "$GITHUB_OUTPUT"
 
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
@@ -125,7 +138,8 @@ jobs:
           body: |
             Prebuilt fullrust stage1 toolchain (rustc with the built-in
             `x86_64-unknown-linux-fullrust` target + host & fullrust sysroots +
-            rust-lld) and the bootstrap cargo, for Rust ${{ steps.ver.outputs.version }}.
+            rust-lld) and the bootstrap cargo, for Rust ${{ steps.ver.outputs.version }}
+            (overlay ${{ steps.ver.outputs.overlay }}).
             Consumed by the `fullrust image` workflow to build
             `ghcr.io/${{ github.repository_owner }}/fullrust`.
 

@@ -4,7 +4,7 @@
 # a statically-linked, libc-free ELF.
 set -euo pipefail
 
-VER="${1:-1.88}"
+VER="${1:-1.100}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 RUST="$HERE/rust-$VER"
 STAGE1="$RUST/build/x86_64-unknown-linux-gnu/stage1"

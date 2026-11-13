@@ -88,7 +88,7 @@ jobs:
 | `command` | `build` | cargo subcommand: `build`, `test`, `run`, `clippy`, … |
 | `args` | `--release` | extra cargo args, e.g. `--release --bin myapp --no-default-features` |
 | `working-directory` | `.` | the crate to build |
-| `image` | `ghcr.io/karpeleslab/fullrust:1.88` | pin a Rust version (see [Versions](#versions)) |
+| `image` | `ghcr.io/karpeleslab/fullrust:latest` | pin a Rust version (see [Versions](#versions)) |
 | `no-ecosystem` | `false` | skip the ecosystem `[patch.crates-io]` injection (getrandom, rustix, mio, tokio, socket2) |
 
 ---
@@ -128,7 +128,7 @@ The binary lands in your crate's `target/x86_64-unknown-linux-fullrust/release/`
 Images are published per Rust minor, plus `latest` (the newest):
 
 ```
-ghcr.io/karpeleslab/fullrust:1.88   …   :1.100   :latest
+ghcr.io/karpeleslab/fullrust:1.91   …   :1.100   :latest
 ```
 
 `:<minor>` and `:latest` move to each new build (e.g. when the ecosystem bundle
@@ -139,17 +139,22 @@ Each minor is built from its newest upstream point release (e.g. `:1.99` is
 Rust 1.99.1). When upstream ships a new point release, CI rebuilds that minor
 and moves its tag automatically.
 
-If you pinned an older build, move to a current one. Earlier 1.88/1.89 builds
-crash on `thread_local!`s with `Drop` when the TLS segment size isn't a multiple
-of 16 (every multi-threaded tokio binary hits this). Earlier 1.95–1.98 builds
-turned `std::process::exit(N)` into an abort. Both are fixed, and the toolchain
-CI now gates publishing on regression tests for them (`test-regress`) and on the
+fullrust supports the **10 newest Rust minors**. When a new one is added, the
+oldest is dropped: its last `:<minor>` image stays pullable but gets no more
+fixes. 1.88–1.90 were dropped with the 1.100 release.
+
+If you pinned an older build, move to a current one. Earlier 1.95–1.98 builds
+turned `std::process::exit(N)` into an abort, and before the libm fix every
+version failed to link code that LLVM turns into a `sincos` call (`x.sin_cos()`,
+or `sin(x)` and `cos(x)` together). Both are fixed, and the toolchain CI gates
+publishing on regression tests for them (`test-regress`) and on the
 `os::unix`/`os::linux` suite (`test-osunix`).
 
 They're public — no login to pull. Pin one via the action's `image:` input, the
-`container:` image, or the `docker run` tag. The action currently defaults to
-`:1.88`; for the newest Rust, set
-`image: ghcr.io/karpeleslab/fullrust:1.100` (or `:latest`).
+`container:` image, or the `docker run` tag. The action defaults to `:latest`
+(the newest minor, currently 1.100); pin a minor (`image:
+ghcr.io/karpeleslab/fullrust:1.99`) or an immutable `:<minor>-<commit>` tag to
+stay put.
 
 ---
 
@@ -167,8 +172,12 @@ rewritten on raw syscalls:
 - **Panics unwind** (`catch_unwind`, `Drop` during unwind), and
   `RUST_BACKTRACE=1` prints **symbolized backtraces** — with no libunwind and no
   libc, via an in-tree pure-Rust unwinder.
+- **Math** — the full C libm, in pure Rust (rust-lang's `libm`, shipped in
+  compiler-builtins): every function has its C name (`sincos`, `frexp`,
+  `modf`, `remquo`, `lgamma`, `jn`, …), so calls LLVM generates and crates'
+  `extern "C"` declarations link. Only the functions a binary uses are linked in.
 - **`std::os::unix` and `std::os::linux`** — the same APIs as on Linux, on every
-  version 1.88–1.100: `unix::fs` (`PermissionsExt`, `MetadataExt`,
+  version 1.91–1.100: `unix::fs` (`PermissionsExt`, `MetadataExt`,
   `OpenOptionsExt`, `FileExt`, `symlink`, `chown`, `chroot`, `mkfifo`, …),
   `unix::process` (`CommandExt`: `uid`/`gid`/`groups`/`pre_exec`/`exec`/`arg0`/
   `process_group`/`setsid`; `ExitStatusExt`), `unix::net` (`UnixStream`/
@@ -273,7 +282,7 @@ fullrust is a source overlay on the Rust compiler that adds the built-in
 `x86_64-unknown-linux-fullrust` target and a `std::sys` backend on raw syscalls
 (the allocator, native TLS, threads, fs/net/process, the pure-Rust unwinder and
 backtraces), packaged as a thin Docker image around the prebuilt toolchain. It
-tracks released Rust versions (currently 1.88–1.100).
+tracks released Rust versions (the 10 newest minors, currently 1.91–1.100).
 
 See [`toolchain/README.md`](toolchain/README.md) for the design, the
 syscall-backed platform layer, and how the overlay is built and ported across

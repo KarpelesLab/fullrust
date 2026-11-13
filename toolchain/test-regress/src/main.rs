@@ -10,6 +10,13 @@
 //    least one build has memsz % 16 != 0, verified with `readelf -l`.
 // 2. process::exit (1.95): the new sys/exit.rs had no fullrust arm and aborted,
 //    so `std::process::exit(N)` did not exit with N.
+// 3. libm C symbols (all versions, issue #5): LLVM folds a `sin(x)` + `cos(x)`
+//    pair into glibc's `sincos`/`sincosf`, and crates call libm through
+//    `extern "C"`; fullrust provided only part of libm, so these failed to
+//    link. Now every libm function has its C name. Checks the folded pair
+//    (`run.sh` verifies the binary really calls `sincos`/`sincosf`, so this
+//    can't pass vacuously) and a sample of the C-ABI functions, including the
+//    out-pointer ones.
 use std::cell::{Cell, RefCell};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -91,8 +98,67 @@ fn main() {
         check(&format!("process::exit({code}) -> exit status {code}"), st.code() == Some(code));
     }
 
+    // --- libm C symbols ------------------------------------------------------
+    let n = args.len() as f64; // 1: a runtime value, so nothing is const-folded
+    let (s, c) = (n * 0.5).sin_cos();
+    check(
+        "folded sin+cos (sincos) matches libm",
+        (s - 0.479425538604203).abs() < 1e-15 && (c - 0.8775825618903728).abs() < 1e-15,
+    );
+    let y = (n * 0.5) as f32;
+    let (sf, cf) = (y.sin(), y.cos());
+    check(
+        "folded sinf+cosf (sincosf) matches libm",
+        (sf - 0.47942555).abs() < 1e-6 && (cf - 0.87758255).abs() < 1e-6,
+    );
+    check("libm C ABI: sincos/frexp/modf/remquo/scalbn/ilogb/exp10/nextafter/lgamma/j0/acosh/atanh", libm_c_abi(n));
+
     if unsafe { FAILS } != 0 {
         std::process::exit(1);
     }
     println!("ALL OK");
+}
+
+unsafe extern "C" {
+    fn sincos(x: f64, s: *mut f64, c: *mut f64);
+    fn frexp(x: f64, exp: *mut i32) -> f64;
+    fn modf(x: f64, iptr: *mut f64) -> f64;
+    fn modff(x: f32, iptr: *mut f32) -> f32;
+    fn remquo(x: f64, y: f64, quo: *mut i32) -> f64;
+    fn scalbn(x: f64, n: i32) -> f64;
+    fn ilogb(x: f64) -> i32;
+    fn exp10(x: f64) -> f64;
+    fn nextafter(x: f64, y: f64) -> f64;
+    fn lgamma(x: f64) -> f64;
+    fn j0(x: f64) -> f64;
+    fn acosh(x: f64) -> f64;
+    fn atanh(x: f64) -> f64;
+}
+
+/// Calls libm through its C names, the way a crate's `extern "C"` block would.
+/// `one` is 1.0 at run time.
+fn libm_c_abi(one: f64) -> bool {
+    let close = |a: f64, b: f64| (a - b).abs() <= 1e-12 * b.abs().max(1.0);
+    let mut ok = true;
+    unsafe {
+        let (mut s, mut c) = (0.0, 0.0);
+        sincos(one, &mut s, &mut c);
+        ok &= close(s, 0.8414709848078965) && close(c, 0.5403023058681398);
+        let mut e = 0;
+        ok &= frexp(12.0 * one, &mut e) == 0.75 && e == 4;
+        let mut ip = 0.0;
+        ok &= modf(-3.25 * one, &mut ip) == -0.25 && ip == -3.0;
+        let mut ipf = 0.0f32;
+        ok &= modff(2.5 * one as f32, &mut ipf) == 0.5 && ipf == 2.0;
+        let mut q = 0;
+        ok &= remquo(10.0 * one, 3.0, &mut q) == 1.0 && q == 3;
+        ok &= scalbn(3.0 * one, 4) == 48.0;
+        ok &= ilogb(1024.0 * one) == 10;
+        ok &= close(exp10(2.0 * one), 100.0);
+        ok &= nextafter(one, 2.0) == 1.0 + f64::EPSILON;
+        ok &= close(lgamma(5.0 * one), 24f64.ln());
+        ok &= close(j0(one), 0.7651976865579666);
+        ok &= close(acosh(one), 0.0) && close(atanh(0.5 * one), 0.5493061443340549);
+    }
+    ok
 }

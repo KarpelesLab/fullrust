@@ -4,12 +4,12 @@
 # `stage1/` + `cargo` (matching the Dockerfile's `tar -xz -C /opt/fullrust`).
 #
 # Usage:  ./package-toolchain.sh [minor] [out.tar.gz]
-#   ./package-toolchain.sh 1.88 fullrust-toolchain-1.88-x86_64.tar.gz
+#   ./package-toolchain.sh 1.100 fullrust-toolchain-1.100-x86_64.tar.gz
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-MINOR="${1:-1.88}"
+MINOR="${1:-1.100}"
 OUT="${2:-fullrust-toolchain-$MINOR-x86_64.tar.gz}"
 BUILD="$ROOT/rust-$MINOR/build/x86_64-unknown-linux-gnu"
 

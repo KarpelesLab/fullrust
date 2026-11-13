@@ -43,15 +43,21 @@ jobs:
       minors: ${{ steps.plan.outputs.minors }}
       newest: ${{ steps.plan.outputs.newest }}
     steps:
+      - uses: actions/checkout@v6
       - id: plan
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INPUT_MINOR: ${{ inputs.minor }}
         run: |
           set -euo pipefail
-          all="$(gh release list -R "$GITHUB_REPOSITORY" -L 200 --json tagName -q '.[].tagName' \
+          # Supported minors = a published toolchain-<minor> release AND an
+          # overlay still in the repo. Dropped minors keep their last release
+          # and images, but are no longer rebuilt.
+          released="$(gh release list -R "$GITHUB_REPOSITORY" -L 200 --json tagName -q '.[].tagName' \
                  | sed -n 's/^toolchain-//p' | sort -V)"
-          [ -n "$all" ] || { echo "::error::no toolchain-<minor> releases found"; exit 1; }
+          ported="$(ls toolchain/patches | sed -n 's/^fullrust-\(1\.[0-9]*\)\.patch$/\1/p' | sort -V)"
+          all="$(comm -12 <(sort <<<"$released") <(sort <<<"$ported") | sort -V)"
+          [ -n "$all" ] || { echo "::error::no supported toolchain-<minor> releases found"; exit 1; }
           if [ -n "$INPUT_MINOR" ]; then
             grep -qxF "$INPUT_MINOR" <<<"$all" || { echo "::error::no toolchain-$INPUT_MINOR release"; exit 1; }
             minors="$INPUT_MINOR"

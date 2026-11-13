@@ -69,18 +69,18 @@ survive independently of the (gitignored) checkout:
 Automated flow (clone → apply overlay → build):
 
 ```console
-./build-fork.sh 1.88.0          # clones rust-1.88, applies overlay, builds
-./link-and-test.sh 1.88         # links the toolchain, builds + runs test-hello
+./build-fork.sh 1.100.0         # clones rust-1.100, applies overlay, builds
+./link-and-test.sh 1.100        # links the toolchain, builds + runs test-hello
 ```
 
 Manual equivalent:
 
 ```console
-cd rust-1.88
+cd rust-1.100
 BOOTSTRAP_SKIP_TARGET_SANITY=1 \
   python3 x.py build library --target x86_64-unknown-linux-fullrust --stage 1
-rustup toolchain link fullrust-1.88 build/x86_64-unknown-linux-gnu/stage1
-cargo +fullrust-1.88 build --target x86_64-unknown-linux-fullrust --release
+rustup toolchain link fullrust-1.100 build/x86_64-unknown-linux-gnu/stage1
+cargo +fullrust-1.100 build --target x86_64-unknown-linux-fullrust --release
 ```
 
 `BOOTSTRAP_SKIP_TARGET_SANITY=1` is needed because the downloaded stage0 compiler
@@ -99,7 +99,7 @@ BOOTSTRAP_SKIP_TARGET_SANITY=1 python3 x.py build library --stage 1 \
 To regenerate the overlay after editing the rust tree:
 
 ```console
-./regen-overlay.sh 1.88
+./regen-overlay.sh 1.100
 ```
 
 This captures both the main-repo edits **and** the edits inside the vendored
@@ -109,7 +109,7 @@ diffed inside themselves and path-prefixed back to the superproject root; the
 combined patch applies with a single `git apply` (which `build-fork.sh` runs
 after `git submodule update --init`-ing those two submodules). Verify the
 regenerated patch is exact with
-`git -C rust-1.88 apply --check --reverse "$PWD/patches/fullrust-1.88.patch"`.
+`git -C rust-1.100 apply --check --reverse "$PWD/patches/fullrust-1.100.patch"`.
 
 ## Docker image
 
@@ -128,10 +128,10 @@ using the image produce the *identical* build.
 **1. `docker run` (or the reusable action):**
 
 ```console
-docker run --rm -v "$PWD:/src" ghcr.io/karpeleslab/fullrust:1.88            # build --release
+docker run --rm -v "$PWD:/src" ghcr.io/karpeleslab/fullrust:latest            # build --release
 # → target/x86_64-unknown-linux-fullrust/release/<bin>  (statically linked, no libc)
-docker run --rm -v "$PWD:/src" ghcr.io/karpeleslab/fullrust:1.88 test
-docker run --rm -v "$PWD:/src" -it ghcr.io/karpeleslab/fullrust:1.88 bash   # escape hatch
+docker run --rm -v "$PWD:/src" ghcr.io/karpeleslab/fullrust:latest test
+docker run --rm -v "$PWD:/src" -it ghcr.io/karpeleslab/fullrust:latest bash   # escape hatch
 ```
 
 The first positional arg is a cargo subcommand (`build`/`test`/`run`/…); anything
@@ -146,7 +146,7 @@ docker-in-docker; most efficient for a repo's own CI):
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: ghcr.io/karpeleslab/fullrust:1.88
+    container: ghcr.io/karpeleslab/fullrust:latest
     steps:
       - uses: actions/checkout@v6
       - run: cargo build --release        # same fullrust build as `docker run` above
@@ -174,11 +174,14 @@ splits into two CI workflows (repo root `.github/workflows/`):
   `fullrust toolchain` for it (which then rebuilds that minor's image); when it
   ships a new minor with no `patches/fullrust-<minor>.patch`, it opens a
   "Port fullrust to Rust <minor>" issue. It also runs when an overlay lands on
-  master, and dispatches the first build of a newly ported minor. A version it
+  master: it dispatches the first build of a newly ported minor, and rebuilds
+  any published minor whose overlay changed (each `toolchain-<minor>` release
+  body records `overlay <hash>`, a sha256 of the patch + bootstrap config), so
+  a std fix only needs committing. A version it
   already dispatched (any outcome) is never re-dispatched, so a failed build
   waits for a manual re-run.
 
-Locally: `./build-fork.sh 1.88.0`, then `./docker/build-image.sh 1.88 <tag>`
+Locally: `./build-fork.sh 1.100.0`, then `./docker/build-image.sh 1.100 <tag>`
 (packages the stage1 and serves it over localhost so the same URL-based
 Dockerfile works unchanged). See [`docker/`](docker/).
 
@@ -358,30 +361,29 @@ not wrap (`syscall0..syscall6 -> io::Result<usize>`, `nr::*` syscall numbers,
 `errno::*`). Covered by `test-osunix` (which also builds on
 `x86_64-unknown-linux-gnu` for parity) and `test-syscall`.
 
-This surface is carried on every version 1.88–1.100, and each version exposes
+This surface is carried on every version 1.91–1.100, and each version exposes
 exactly the `os::unix`/`os::linux` API that version's Linux std has. Per-version
 glue in the fullrust pal: ≤1.93 use `sys_common::{AsInner,…}` and `AnonPipe` as
 the child pipe type (1.94+ use `ChildPipe = FileDesc`); ≤1.91 define
 `StdioPipes` in `sys::process`, call `Socket::new_raw`, and take `u32`
-`deferaccept`; ≤1.90 keep `Thread` in `sys/pal` and use `cfg_if!` dispatchers;
-1.96+ route `parent_id` through `sys::process::getppid`; 1.97 adds
+`deferaccept`; 1.96+ route `parent_id` through `sys::process::getppid`; 1.97 adds
 `ChildExt::{send_process_group_signal, kill_process_group}`; 1.98 needs
 `BorrowedCursor<'_, u8>`, `PidFd` via `sys::process`, and explicit
 `expose_provenance()` on syscall pointer arguments.
 
 ## Version matrix
 
-The goal is to track `1.88 … 1.100` and observe how `std::sys::pal` shifts across
-versions (the pal interface is deliberately unstable upstream). Each `rust-<v>`
+fullrust keeps the **10 newest Rust minors** (currently `1.91 … 1.100`) and
+follows how `std::sys::pal` shifts across them (the pal interface is
+deliberately unstable upstream). Porting a new minor drops the oldest: `git rm`
+its overlay + bootstrap config. A dropped minor keeps its last
+`toolchain-<minor>` release and `:<minor>` image, but is no longer rebuilt. Each `rust-<v>`
 checkout is gitignored; the overlay of source changes above is what we carry
 forward and re-apply per version (`git apply --reject patches/fullrust-<prev>.patch`,
 fix the rejects, `./regen-overlay.sh <v>`).
 
 | Rust | overlay | status |
 |------|---------|--------|
-| 1.88 | `patches/fullrust-1.88.patch` | builds + all test crates green (the pre-matrix original is frozen on the `1.88` branch) |
-| 1.89 | `patches/fullrust-1.89.patch` | builds + all test crates green |
-| 1.90 | `patches/fullrust-1.90.patch` | builds + all test crates green |
 | 1.91 | `patches/fullrust-1.91.patch` | builds + all test crates green |
 | 1.92 | `patches/fullrust-1.92.patch` | builds + all test crates green |
 | 1.93 | `patches/fullrust-1.93.patch` | builds + all test crates green |
@@ -392,6 +394,10 @@ fix the rejects, `./regen-overlay.sh <v>`).
 | 1.98 | `patches/fullrust-1.98.patch` | builds + all test crates green |
 | 1.99 | `patches/fullrust-1.99.patch` | builds + all test crates green (built from 1.99.1; LLVM 23) |
 | 1.100 | `patches/fullrust-1.100.patch` | builds + all test crates green |
+
+1.88–1.90 were dropped when 1.100 landed (their overlays are in git history;
+the pre-matrix 1.88 original is frozen on the `1.88` branch). The drift notes
+below keep their history.
 
 **1.88 → 1.89 drift was small:** only 7 hunks rejected on re-apply — all
 mechanical `Cargo.toml` libc-gate edits (dependency version bumps) + one moved
@@ -440,10 +446,23 @@ so the pal's errno table writes into the formatter (no allocation). Versions
 sort with `sort -V` everywhere (workflows, `latest`), so 1.100 orders after
 1.99.
 
+**libm (all versions):** fullrust's `sin`/`cos`/`pow`/… come from the pure-Rust
+`libm` that compiler-builtins compiles in, but compiler-builtins gives only part
+of it a C name. With an `x86_64-unknown-linux-gnu` LLVM target, LLVM and crates
+assume glibc's full libm (LLVM folds `sin(x)` + `cos(x)` into `sincos`), so
+those failed to link. `gen-libm-exports.py rust-<minor>` writes a fullrust-only
+block into that tree's `compiler-builtins/src/math/mod.rs` exporting every
+remaining libm function (42–50 depending on the version) with its C signature,
+tuple returns becoming out-pointers (`frexp`, `modf`, `remquo`, `sincos`). It
+reads that version's own libm, so re-run it when porting (it replaces its own
+block), then `./regen-overlay.sh`. `test-regress` checks the folded `sincos`
+and a sample of the C-ABI functions.
+
 **Build tip:** a released tag's CI LLVM is usually expired (`download-ci-llvm`
 404s), so LLVM builds from source (~1–2 h). Adjacent versions often share an LLVM
-major (1.88/1.89 are both 20.1.x) — you can reuse an already-built LLVM via
+major — you can reuse an already-built LLVM via
 `[target.<host>] llvm-config = ".../rust-<prev>/build/.../llvm/bin/llvm-config"`,
 but then bootstrap won't copy `rust-lld` into the sysroot, so copy it (and
-`gcc-ld/`) from the previous stage1 by hand. The canonical from-source build
-needs neither.
+`gcc-ld/`) from the previous stage1 by hand — again after every rebuild, since
+bootstrap re-assembles the sysroot without them. The canonical from-source build
+(what CI does) needs neither.

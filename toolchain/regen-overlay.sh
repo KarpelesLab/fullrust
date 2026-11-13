@@ -7,10 +7,10 @@
 # contents, so each submodule is diffed inside itself and path-prefixed back to
 # the superproject root. New (untracked) files are included via `git add -N`.
 #
-# Usage:  ./regen-overlay.sh 1.88
+# Usage:  ./regen-overlay.sh 1.100
 set -euo pipefail
 
-MINOR="${1:?usage: regen-overlay.sh <minor, e.g. 1.88>}"
+MINOR="${1:?usage: regen-overlay.sh <minor, e.g. 1.100>}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 RUST="$HERE/rust-$MINOR"
 PATCH="$HERE/patches/fullrust-$MINOR.patch"

@@ -23,7 +23,7 @@ inputs:
     default: "."
   image:
     description: "fullrust toolchain image (override to pin a digest or version)."
-    default: "ghcr.io/karpeleslab/fullrust:1.88"
+    default: "ghcr.io/karpeleslab/fullrust:latest"
   no-ecosystem:
     description: "Skip the ecosystem [patch.crates-io] injection (getrandom, rustix, socket2, mio, tokio forks)."
     default: "false"

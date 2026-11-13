@@ -5,12 +5,12 @@
 #   3. drop in the build config (bootstrap-<minor>.toml),
 #   4. build stage1 + std for x86_64-unknown-linux-fullrust.
 #
-# Usage:  ./build-fork.sh 1.88.0
-# Then verify with:  ./link-and-test.sh 1.88
+# Usage:  ./build-fork.sh 1.100.0
+# Then verify with:  ./link-and-test.sh 1.100
 set -euo pipefail
 
-VER="${1:?usage: build-fork.sh <version, e.g. 1.88.0>}"
-MINOR="${VER%.*}"                      # 1.88.0 -> 1.88
+VER="${1:?usage: build-fork.sh <version, e.g. 1.100.0>}"
+MINOR="${VER%.*}"                      # 1.100.0 -> 1.100
 HERE="$(cd "$(dirname "$0")" && pwd)"
 RUST="$HERE/rust-$MINOR"
 PATCH="$HERE/patches/fullrust-$MINOR.patch"
