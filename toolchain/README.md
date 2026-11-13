@@ -169,6 +169,14 @@ splits into two CI workflows (repo root `.github/workflows/`):
   Dockerfile (which `curl`s that release asset via `FULLRUST_TOOLCHAIN_URL`) and
   pushes `ghcr.io/<owner>/fullrust:<minor>`,`:latest`. Re-runs on every ecosystem
   change — a seconds-long repackage, no compiler rebuild.
+- **`upstream watch`** — daily: when upstream ships a new point release of a
+  minor we have an overlay for (e.g. 1.99.1 → 1.99.2), it dispatches
+  `fullrust toolchain` for it (which then rebuilds that minor's image); when it
+  ships a new minor with no `patches/fullrust-<minor>.patch`, it opens a
+  "Port fullrust to Rust <minor>" issue. It also runs when an overlay lands on
+  master, and dispatches the first build of a newly ported minor. A version it
+  already dispatched (any outcome) is never re-dispatched, so a failed build
+  waits for a manual re-run.
 
 Locally: `./build-fork.sh 1.88.0`, then `./docker/build-image.sh 1.88 <tag>`
 (packages the stage1 and serves it over localhost so the same URL-based
@@ -350,7 +358,7 @@ not wrap (`syscall0..syscall6 -> io::Result<usize>`, `nr::*` syscall numbers,
 `errno::*`). Covered by `test-osunix` (which also builds on
 `x86_64-unknown-linux-gnu` for parity) and `test-syscall`.
 
-This surface is carried on every version 1.88–1.99, and each version exposes
+This surface is carried on every version 1.88–1.100, and each version exposes
 exactly the `os::unix`/`os::linux` API that version's Linux std has. Per-version
 glue in the fullrust pal: ≤1.93 use `sys_common::{AsInner,…}` and `AnonPipe` as
 the child pipe type (1.94+ use `ChildPipe = FileDesc`); ≤1.91 define
@@ -363,7 +371,7 @@ the child pipe type (1.94+ use `ChildPipe = FileDesc`); ≤1.91 define
 
 ## Version matrix
 
-The goal is to track `1.88 … 1.99` and observe how `std::sys::pal` shifts across
+The goal is to track `1.88 … 1.100` and observe how `std::sys::pal` shifts across
 versions (the pal interface is deliberately unstable upstream). Each `rust-<v>`
 checkout is gitignored; the overlay of source changes above is what we carry
 forward and re-apply per version (`git apply --reject patches/fullrust-<prev>.patch`,
@@ -383,6 +391,7 @@ fix the rejects, `./regen-overlay.sh <v>`).
 | 1.97 | `patches/fullrust-1.97.patch` | builds + all test crates green |
 | 1.98 | `patches/fullrust-1.98.patch` | builds + all test crates green |
 | 1.99 | `patches/fullrust-1.99.patch` | builds + all test crates green (built from 1.99.1; LLVM 23) |
+| 1.100 | `patches/fullrust-1.100.patch` | builds + all test crates green |
 
 **1.88 → 1.89 drift was small:** only 7 hunks rejected on re-apply — all
 mechanical `Cargo.toml` libc-gate edits (dependency version bumps) + one moved
@@ -422,6 +431,14 @@ gained a `size() -> Option<io::Result<u64>>` (a `read_to_end` size hint), and
 
 The toolchain workflow now builds the newest point release of a minor (1.99 →
 1.99.1) unless an exact `version` is given.
+
+**1.99 → 1.100 drift** was small: the 12 rejected hunks were the formatting of
+upstream's rustfmt'd `cfg_select!` blocks plus bootstrap's `Build` → `Session`
+rename in `cc_detect.rs`. The one API change: `sys::io` now wants
+`format_error(errno, &mut Formatter)` instead of `error_string(errno) -> String`,
+so the pal's errno table writes into the formatter (no allocation). Versions
+sort with `sort -V` everywhere (workflows, `latest`), so 1.100 orders after
+1.99.
 
 **Build tip:** a released tag's CI LLVM is usually expired (`download-ci-llvm`
 404s), so LLVM builds from source (~1–2 h). Adjacent versions often share an LLVM

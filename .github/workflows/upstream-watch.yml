@@ -1,0 +1,137 @@
+name: upstream watch
+
+# Keeps the published toolchains in step with upstream Rust releases:
+#
+#   - a new POINT release of a minor we already support (1.99.1 → 1.99.2):
+#     the minor's overlay applies to it unchanged, so dispatch
+#     `fullrust toolchain` for it. That rebuilds the toolchain-<minor> asset from
+#     the new point release and then the <minor> image (+ `latest`).
+#   - a new MINOR (1.100.0) with no patches/fullrust-<minor>.patch yet: that
+#     needs a port, so open a tracking issue instead (one per minor).
+#   - a freshly ported minor (overlay + bootstrap config on master, no
+#     toolchain-<minor> release yet): dispatch its first build. Pushing a port
+#     triggers this workflow, so landing the overlay is all a port needs.
+#
+# The built version of each minor is read from its toolchain-<minor> release
+# body ("… for Rust 1.99.1."); bodies from before point releases were tracked
+# say "Rust 1.91." and count as <minor>.0.
+#
+# A dispatched build is named "fullrust toolchain <minor> <version>" (the
+# toolchain workflow's run-name). If a run with that name exists in any state
+# (queued, running, failed), the version is skipped, so a failing point-release
+# build is not retried every day; re-dispatch it by hand once it's fixed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Only report what would be dispatched / opened"
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "41 6 * * *"
+  push:
+    branches: [master]
+    paths:
+      - "toolchain/patches/**"
+      - "toolchain/bootstrap-*.toml"
+      - ".github/workflows/upstream-watch.yml"
+
+permissions:
+  contents: read
+  actions: write     # dispatch `fullrust toolchain`
+  issues: write      # open the "port to <minor>" tracking issue
+
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Compare upstream Rust releases with the published toolchains
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DRY_RUN: ${{ inputs.dry-run || false }}
+        run: |
+          set -euo pipefail
+
+          # Every stable release tag upstream (X.Y.Z only; no betas/nightlies).
+          upstream="$(git ls-remote --tags --refs https://github.com/rust-lang/rust.git 'refs/tags/1.*' \
+            | sed 's|.*refs/tags/||' | grep -E '^1\.[0-9]+\.[0-9]+$' | sort -V)"
+          [ -n "$upstream" ] || { echo "::error::no upstream tags listed"; exit 1; }
+
+          # Minors we have an overlay for.
+          ours="$(ls toolchain/patches | sed -n 's/^fullrust-\(1\.[0-9]*\)\.patch$/\1/p' | sort -V)"
+          newest_ours="$(tail -n1 <<<"$ours")"
+
+          # Names of every toolchain run we have ever dispatched (any status).
+          runs="$(gh run list -R "$GITHUB_REPOSITORY" --workflow fullrust-toolchain.yml -L 200 \
+                    --json displayTitle -q '.[].displayTitle')"
+
+          act() { if [ "$DRY_RUN" = "true" ]; then echo "[dry-run] $*"; else "$@"; fi; }
+
+          # 1. Point releases of supported minors.
+          for minor in $ours; do
+            want="$(grep -E "^${minor//./\\.}\.[0-9]+$" <<<"$upstream" | tail -n1 || true)"
+            [ -n "$want" ] || { echo "$minor: no upstream release (?)"; continue; }
+
+            body="$(gh release view "toolchain-$minor" -R "$GITHUB_REPOSITORY" --json body -q .body 2>/dev/null || true)"
+            have="$(grep -oE 'Rust 1\.[0-9]+(\.[0-9]+)?' <<<"$body" | head -n1 | cut -d' ' -f2 || true)"
+            if [ -z "$have" ]; then
+              # Ported but never published: dispatch its first build.
+              if [ ! -f "toolchain/bootstrap-$minor.toml" ]; then
+                echo "::warning::$minor: overlay without toolchain/bootstrap-$minor.toml; not dispatching"
+              elif grep -qxF "fullrust toolchain $minor $want" <<<"$runs"; then
+                echo "$minor: first build ($want) already dispatched (see its run; re-dispatch by hand if it failed)"
+              else
+                echo "::notice::$minor: newly ported, dispatching its first build ($want)"
+                act gh workflow run fullrust-toolchain.yml -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" \
+                  -f minor="$minor" -f version="$want"
+              fi
+              continue
+            fi
+            [ "$have" = "$minor" ] && have="$minor.0"
+
+            if [ "$have" = "$want" ]; then
+              echo "$minor: up to date ($have)"
+            elif [ "$(printf '%s\n%s\n' "$have" "$want" | sort -V | tail -n1)" = "$have" ]; then
+              echo "$minor: published $have is newer than upstream $want (?)"
+            elif grep -qxF "fullrust toolchain $minor $want" <<<"$runs"; then
+              echo "$minor: $have → $want already dispatched (see its run; re-dispatch by hand if it failed)"
+            else
+              echo "::notice::$minor: $have → $want, dispatching fullrust toolchain"
+              act gh workflow run fullrust-toolchain.yml -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" \
+                -f minor="$minor" -f version="$want"
+            fi
+          done
+
+          # 2. New minors we have no overlay for yet (only those after our newest:
+          #    anything older than 1.88 is out of scope).
+          for minor in $(sed 's/\.[0-9]*$//' <<<"$upstream" | sort -uV); do
+            grep -qxF "$minor" <<<"$ours" && continue
+            [ "$(printf '%s\n%s\n' "$newest_ours" "$minor" | sort -V | tail -n1)" = "$minor" ] || continue
+            title="Port fullrust to Rust $minor"
+            if gh issue list -R "$GITHUB_REPOSITORY" --state all --search "\"$title\" in:title" \
+                 --json title -q '.[].title' | grep -qxF "$title"; then
+              echo "$minor: no overlay yet, issue already open"
+              continue
+            fi
+            echo "::warning::$minor: released upstream, no patches/fullrust-$minor.patch yet"
+            act gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body "$(cat <<EOF
+          Rust $minor was released upstream ($(grep -E "^${minor//./\\.}\." <<<"$upstream" | tail -n1)) and fullrust has no overlay for it yet.
+
+          To port (see toolchain/README.md, "Version matrix"):
+          1. \`git clone --depth 1 --branch $minor.0 https://github.com/rust-lang/rust.git toolchain/rust-$minor\` (+ \`git submodule update --init library/backtrace\`)
+          2. \`git apply --reject ../patches/fullrust-$newest_ours.patch\` in it and fix the rejects
+          3. add \`bootstrap-$minor.toml\`, build (\`x.py build library --stage 1 --target x86_64-unknown-linux-gnu,x86_64-unknown-linux-fullrust\`), \`./run-tests.sh $minor\`
+          4. \`./regen-overlay.sh $minor\` and push to master: this workflow then dispatches the first **fullrust toolchain** build
+
+          Opened by the upstream-watch workflow.
+          EOF
+          )"
+          done

@@ -1,4 +1,7 @@
 name: fullrust toolchain
+# The upstream-watch workflow looks runs up by this name to avoid re-dispatching
+# a point release it already dispatched.
+run-name: fullrust toolchain ${{ inputs.minor }} ${{ inputs.version }}
 
 # Build the patched stage1 compiler and attach it (with the bootstrap cargo) as a
 # release asset. This is the slow, rare half (LLVM + rustc from source, ~1–2 h);
@@ -24,6 +27,11 @@ on:
         required: false
         default: true
         type: boolean
+
+# One build per minor at a time (two would race on the release asset).
+concurrency:
+  group: fullrust-toolchain-${{ inputs.minor }}
+  cancel-in-progress: false
 
 permissions:
   contents: write        # create/update the toolchain release + upload the asset

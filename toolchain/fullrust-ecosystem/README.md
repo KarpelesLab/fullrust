@@ -165,7 +165,7 @@ your project's `.cargo/config.toml` (or the workspace-root `Cargo.toml`) with
 paths into this directory, then build:
 
 ```console
-RUSTC_BOOTSTRAP=1 cargo +fullrust-1.99 build --release --target x86_64-unknown-linux-fullrust
+RUSTC_BOOTSTRAP=1 cargo +fullrust-1.100 build --release --target x86_64-unknown-linux-fullrust
 ```
 
 A patch for a crate you don't depend on is only a harmless "not used" warning.
