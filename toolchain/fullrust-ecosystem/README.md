@@ -217,6 +217,6 @@ Each fork is exercised by a static, libc-free probe (no `PT_INTERP`, no
   identical to the same probe on `x86_64-unknown-linux-gnu` with pristine
   socket2. (1.88, 1.98): the `std::os::unix::net` ⇄ `Socket` conversions both
   ways and `SockAddr::as_unix`.
-- CI (`toolchain/test-ecosystem`, through the action on the 1.88 and 1.99
+- CI (`toolchain/test-ecosystem`, through the action on the 1.88 and 1.100
   images): tokio TCP echo, process, signal and Unix sockets, rustix, socket2
   and std `peer_cred`.
